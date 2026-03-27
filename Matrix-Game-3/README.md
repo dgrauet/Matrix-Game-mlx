@@ -69,4 +69,11 @@ This project is licensed under the Apache License, Version 2.0 — see [LICENSE.
 If you find this work useful for your research, please kindly cite our paper:
 
 ```
+  @misc{2026matrix,
+    title={Matrix-Game 3.0: Real-Time and Streaming Interactive World Model with Long-Horizon Memory},
+    author={{Skywork AI Matrix-Game Team}},
+    year={2026},
+    howpublished={Technical report},
+    url={https://github.com/SkyworkAI/Matrix-Game/blob/main/Matrix-Game-3/assets/pdf/report.pdf}
+  }
 ```
