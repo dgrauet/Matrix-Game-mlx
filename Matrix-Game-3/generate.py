@@ -67,7 +67,7 @@ def _parse_args():
     parser.add_argument('--use_async_vae', action='store_true', help='Whether to use asynchronous VAE decoding.')
     parser.add_argument('--async_vae_warmup_iters', type=int, default=0, help='Number of initial iterations to force sync VAE for warmup in async mode.')
     parser.add_argument('--compile_vae', action='store_true', help='Whether to use torch.compile for VAE decoder.')
-    parser.add_argument('--vae_type', type=str, default='mg_lightvae', choices=['wan', 'mg_lightvae'], help='VAE type.')
+    parser.add_argument('--vae_type', type=str, default='mg_lightvae_v2', choices=['wan', 'mg_lightvae', 'mg_lightvae_v2'], help='VAE type.')
     
     # Quantization
     parser.add_argument('--use_int8', action='store_true', help='Whether to use int8 quantization for DiT.')

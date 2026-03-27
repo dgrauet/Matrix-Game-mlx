@@ -52,7 +52,8 @@ torchrun --nproc_per_node=$NUM_GPUS generate.py --size 704*1280 --dit_fsdp --t5_
 # "num_iterations" refers to the number of iterations you want to generate. The total number of frames generated is given by:57 + (num_iterations - 1) * 40 
 ```
 Tips: 
-If you want to use the base model, you can use "--use_base_model --num_inference_steps 50". Otherwise if you want to generating the interactive videos with your own input actions, you can use "--interactive".
+If you want to use the base model, you can use `--use_base_model --num_inference_steps 50`. To run with your own input actions, use `--interactive`.
+For LightVAE, use `--vae_type mg_lightvae` with `--lightvae_pruning_rate 0.5`, or `--vae_type mg_lightvae_v2` with `--lightvae_pruning_rate 0.75`. `mg_lightvae_v2` is faster than `mg_lightvae` while keeping quality close to the latter.
 With multiple GPUs, you can pass `--use_async_vae --async_vae_warmup_iters 1` to speed up inference (see [`test.sh`](test.sh)).
 
 ## ⭐ Acknowledgements

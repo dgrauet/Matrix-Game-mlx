@@ -1199,7 +1199,7 @@ class Wan2_2_VAE:
                     dim_mult=dim_mult, # [1, 2, 4, 4]
                     temperal_downsample=temperal_downsample, # [False, True, True]
                 ).eval().requires_grad_(False).to(device=device, dtype=dtype))
-        elif self.vae_type == "lightvae_wan22":
+        elif self.vae_type == "mg_lightvae":
             resolved_pruning_rate = lightvae_pruning_rate
             if resolved_pruning_rate is None:
                 resolved_pruning_rate = infer_lightvae_pruning_rate_from_ckpt(vae_pth)
@@ -1209,7 +1209,7 @@ class Wan2_2_VAE:
                         "Unable to infer LightVAE pruning rate from checkpoint; fallback to 0.75."
                     )
             logging.info(
-                f"Loading lightvae_wan22 decoder from {vae_pth} (pruning_rate={resolved_pruning_rate}), "
+                f"Loading mg_lightvae decoder from {vae_pth} (pruning_rate={resolved_pruning_rate}), "
                 f"while keeping teacher encoder from {lightvae_encoder_vae_pth}."
             )
             # Teacher encoder branch (for conditioning latents): standard Wan2.2 VAE.
@@ -1240,7 +1240,7 @@ class Wan2_2_VAE:
         try:
             if not isinstance(videos, list):
                 raise TypeError("videos should be a list")
-            encode_model = self.encoder_model if self.vae_type == "lightvae_wan22" and self.encoder_model is not None else self.model
+            encode_model = self.encoder_model if self.vae_type == "mg_lightvae" and self.encoder_model is not None else self.model
             return [
                 encode_model.encode(
                     u.unsqueeze(0).to(device=self.device, dtype=self.dtype),

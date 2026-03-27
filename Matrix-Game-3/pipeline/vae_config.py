@@ -15,6 +15,10 @@ def _parse_lightvae_pruning_rate(value):
 def get_vae_config(args=None):
     if args.vae_type == 'mg_lightvae':
         vae_path = os.path.join(args.ckpt_dir, "MG-LightVAE.pth")
+        args.lightvae_pruning_rate = 0.5
+    elif args.vae_type == 'mg_lightvae_v2':
+        vae_path = os.path.join(args.ckpt_dir, "MG-LightVAE_v2.pth")
+        args.lightvae_pruning_rate = 0.75
     else:
         vae_path = os.path.join(args.ckpt_dir, "Wan2.2_VAE.pth")
     return {
@@ -40,7 +44,7 @@ def load_vae(device_id=0, args=None, metadata=None,):
 
     if lightvae_pruning_rate is None:
         lightvae_pruning_rate = 0.0
-    vae_type = "wan2.2" if float(lightvae_pruning_rate) <= 0.0 else "lightvae_wan22"
+    vae_type = "wan2.2" if float(lightvae_pruning_rate) <= 0.0 else "mg_lightvae"
     device = torch.device(f"cuda:{device_id}")
     # print(f"Loading VAE from {vae_path} with pruning rate {lightvae_pruning_rate}", flush=True)
     vae = Wan2_2_VAE(
