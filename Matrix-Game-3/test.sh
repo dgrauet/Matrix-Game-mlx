@@ -19,7 +19,7 @@ ARGS=(
   --num_iterations 12
   --num_inference_steps 3
   --image demo_images/001/image.png
-  --prompt "a vintage gas station with a classic car parked under a canopy, set against a desert landscape."
+  --prompt "A colorful, animated cityscape with a gas station and various buildings."
   --save_name test
   --seed 42
   --interactive
