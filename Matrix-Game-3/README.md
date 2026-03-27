@@ -5,6 +5,7 @@
 
 <font size=7><div align='center' >  [[🤗 HuggingFace](https://huggingface.co/Skywork/Matrix-Game-3.0)] [[📖 Technical Report](assets/pdf/report.pdf)] [[🚀 Project Website](https://matrix-game-v3.github.io/)] </div></font>
 
+https://github.com/user-attachments/assets/dd50802c-05dc-4a68-9ca2-68cdc2e31ab9
 
 ## 📝 Overview
 **Matrix-Game-3.0** is an open-sourced, memory-augmented interactive world model designed for 720p real-time long-form video generation.
@@ -18,7 +19,7 @@ we provide two pretrained model weights including base model and distilled model
 
 ## Requirements
 It supports one gpu or multi-gpu inference. We tested this repo on the following setup:
-* A800/H800/H200 are tested.
+* A/H series GPUs are tested.
 * Linux operating system.
 * 64 GB RAM.
 
