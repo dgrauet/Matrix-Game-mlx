@@ -5,7 +5,8 @@
 
 <font size=7><div align='center' >  [[🤗 HuggingFace](https://huggingface.co/Skywork/Matrix-Game-3.0)] [[📖 Technical Report](assets/pdf/report.pdf)] [[🚀 Project Website](https://matrix-game-v3.github.io/)] </div></font>
 
-https://github.com/user-attachments/assets/958cbdba-cae5-4b9c-afa2-33db3ec2757c
+
+https://github.com/user-attachments/assets/5b95bb21-bc77-4bb5-bc2b-7b12de2d3f21
 
 ## 📝 Overview
 **Matrix-Game-3.0** is an open-sourced, memory-augmented interactive world model designed for 720p real-time long-form video generation.
@@ -15,7 +16,9 @@ https://github.com/user-attachments/assets/958cbdba-cae5-4b9c-afa2-33db3ec2757c
 - **Scale Up 28B-MoE Model**: Scaling up to a 2×14B model further improves generation quality, dynamics, and generalization. 
 
 ## 🤗 Matrix-Game-3.0 Model
-we provide two pretrained model weights including base model and distilled model. Please refer to our HuggingFace page to reach these resources.
+We provide two pretrained 5B model weights, including the base model and the distilled model, for first-person generation in unreal scenes. These resources are available on our HuggingFace page. 
+
+In addition, the model trained on a combination of unreal and real-world data, as well as the 28B large model, will be released soon! 🚀🚀
 
 ## Requirements
 It supports one gpu or multi-gpu inference. We tested this repo on the following setup:
