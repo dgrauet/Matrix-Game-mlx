@@ -22,6 +22,10 @@ class CausalConv3d(nn.Module):
     """Causal 3D convolution with left-only temporal padding.
 
     Input/output layout: (B, T, H, W, C) — channels-last.
+
+    Stores weight and bias as direct attributes (like PyTorch nn.Conv3d)
+    so that state_dict keys are ``weight`` / ``bias`` without an extra
+    ``.conv.`` level.  MLX weight layout: (O, D, H, W, I).
     """
 
     def __init__(
@@ -45,15 +49,16 @@ class CausalConv3d(nn.Module):
         # Causal: double the temporal padding, applied only on the left
         self.temporal_padding = 2 * padding[0]
 
-        # Conv3d with no temporal padding (we pad manually)
-        self.conv = nn.Conv3d(
-            in_channels,
-            out_channels,
-            kernel_size=kernel_size,
-            stride=stride,
-            padding=(0, padding[1], padding[2]),
-            bias=bias,
-        )
+        # Store conv parameters for the functional call
+        self._kernel_size = kernel_size
+        self._stride = stride
+        # Spatial-only padding (temporal is handled manually)
+        self._padding = (0, padding[1], padding[2])
+
+        # Weight: MLX Conv3d layout (O, D, H, W, I)
+        self.weight = mx.zeros((out_channels, *kernel_size, in_channels))
+        if bias:
+            self.bias = mx.zeros((out_channels,))
 
     def __call__(self, x: mx.array, cache_x: Optional[mx.array] = None) -> mx.array:
         """Forward pass.
@@ -74,7 +79,15 @@ class CausalConv3d(nn.Module):
             # Pad temporal dim (axis=1) on the left only
             x = mx.pad(x, [(0, 0), (pad_t, 0), (0, 0), (0, 0), (0, 0)])
 
-        return self.conv(x)
+        y = mx.conv3d(
+            x,
+            self.weight,
+            stride=self._stride,
+            padding=self._padding,
+        )
+        if "bias" in self:
+            y = y + self.bias
+        return y
 
 
 # ---------------------------------------------------------------------------
@@ -232,20 +245,49 @@ class Resample(nn.Module):
 # ResidualBlock
 # ---------------------------------------------------------------------------
 
+class _SiLU_placeholder(nn.Module):
+    """Non-parametric SiLU placeholder for Sequential-like lists."""
+    def __call__(self, x: mx.array) -> mx.array:
+        return nn.silu(x)
+
+
+class _Dropout_placeholder(nn.Module):
+    """Non-parametric Dropout placeholder for Sequential-like lists."""
+    def __init__(self, p: float = 0.0):
+        super().__init__()
+        self._p = p
+    def __call__(self, x: mx.array) -> mx.array:
+        return x  # no-op at inference
+
+
 class ResidualBlock(nn.Module):
-    """Residual block with CausalConv3d and RMS normalization."""
+    """Residual block with CausalConv3d and RMS normalization.
+
+    Uses a list ``self.residual`` to mirror PyTorch ``nn.Sequential`` indexing:
+      0 — RMS_norm      (has gamma)
+      1 — SiLU          (no params)
+      2 — CausalConv3d  (has weight/bias)
+      3 — RMS_norm      (has gamma)
+      4 — SiLU          (no params)
+      5 — Dropout       (no params)
+      6 — CausalConv3d  (has weight/bias)
+    """
 
     def __init__(self, in_dim: int, out_dim: int, dropout: float = 0.0):
         super().__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
 
-        # Build residual path as a list of layers
-        self.norm1 = RMS_norm(in_dim, images=False)
-        self.conv1 = CausalConv3d(in_dim, out_dim, 3, padding=1)
-        self.norm2 = RMS_norm(out_dim, images=False)
-        self.conv2 = CausalConv3d(out_dim, out_dim, 3, padding=1)
-        self._dropout = dropout
+        # Residual path as a list matching PyTorch nn.Sequential indices
+        self.residual = [
+            RMS_norm(in_dim, images=False),        # 0
+            _SiLU_placeholder(),                   # 1
+            CausalConv3d(in_dim, out_dim, 3, padding=1),  # 2
+            RMS_norm(out_dim, images=False),        # 3
+            _SiLU_placeholder(),                   # 4
+            _Dropout_placeholder(dropout),         # 5
+            CausalConv3d(out_dim, out_dim, 3, padding=1),  # 6
+        ]
 
         self.shortcut = (
             CausalConv3d(in_dim, out_dim, 1)
@@ -268,20 +310,11 @@ class ResidualBlock(nn.Module):
         else:
             h = x
 
-        # Residual path: norm1 -> silu -> conv1 -> norm2 -> silu -> dropout -> conv2
-        # Process each layer, handling caching for CausalConv3d layers
-        residual_layers = [
-            ("norm", self.norm1),
-            ("silu", None),
-            ("conv", self.conv1),
-            ("norm", self.norm2),
-            ("silu", None),
-            ("dropout", None),
-            ("conv", self.conv2),
-        ]
-
-        for layer_type, layer in residual_layers:
-            if layer_type == "conv" and feat_cache is not None:
+        # Residual path: iterate through the Sequential-like list
+        # Conv layers (indices 2, 6) need cache handling
+        conv_indices = {2, 6}
+        for i, layer in enumerate(self.residual):
+            if i in conv_indices and feat_cache is not None:
                 idx = feat_idx[0]
                 cache_x = x[:, -CACHE_T:, :, :, :]
                 if cache_x.shape[1] < 2 and feat_cache[idx] is not None:
@@ -292,14 +325,7 @@ class ResidualBlock(nn.Module):
                 x = layer(x, feat_cache[idx])
                 feat_cache[idx] = cache_x
                 feat_idx[0] += 1
-            elif layer_type == "norm":
-                x = layer(x)
-            elif layer_type == "silu":
-                x = nn.silu(x)
-            elif layer_type == "dropout":
-                if self._dropout > 0.0:
-                    x = nn.Dropout(self._dropout)(x)
-            elif layer_type == "conv":
+            else:
                 x = layer(x)
 
         return x + h
@@ -679,14 +705,20 @@ class Encoder3d(nn.Module):
             out_dim = out_dim_i
         self.downsamples = downsamples
 
-        # Middle blocks
-        self.middle_res1 = ResidualBlock(out_dim, out_dim, dropout)
-        self.middle_attn = AttentionBlock(out_dim)
-        self.middle_res2 = ResidualBlock(out_dim, out_dim, dropout)
+        # Middle: list matching nn.Sequential(ResidualBlock, AttentionBlock, ResidualBlock)
+        self.middle = [
+            ResidualBlock(out_dim, out_dim, dropout),   # 0
+            AttentionBlock(out_dim),                     # 1
+            ResidualBlock(out_dim, out_dim, dropout),   # 2
+        ]
 
-        # Head
-        self.head_norm = RMS_norm(out_dim, images=False)
-        self.head_conv = CausalConv3d(out_dim, z_dim, 3, padding=1)
+        # Head: list matching nn.Sequential(RMS_norm, SiLU, CausalConv3d)
+        # SiLU at index 1 has no params; use placeholder
+        self.head = [
+            RMS_norm(out_dim, images=False),             # 0
+            _SiLU_placeholder(),                         # 1
+            CausalConv3d(out_dim, z_dim, 3, padding=1),  # 2
+        ]
 
     def __call__(
         self,
@@ -719,20 +751,20 @@ class Encoder3d(nn.Module):
             else:
                 x = layer(x)
 
-        # Middle blocks
+        # Middle blocks: middle[0]=ResidualBlock, middle[1]=AttentionBlock, middle[2]=ResidualBlock
         if feat_cache is not None:
-            x = self.middle_res1(x, feat_cache, feat_idx)
+            x = self.middle[0](x, feat_cache, feat_idx)
         else:
-            x = self.middle_res1(x)
-        x = self.middle_attn(x)
+            x = self.middle[0](x)
+        x = self.middle[1](x)
         if feat_cache is not None:
-            x = self.middle_res2(x, feat_cache, feat_idx)
+            x = self.middle[2](x, feat_cache, feat_idx)
         else:
-            x = self.middle_res2(x)
+            x = self.middle[2](x)
 
-        # Head
-        x = self.head_norm(x)
-        x = nn.silu(x)
+        # Head: head[0]=RMS_norm, head[1]=SiLU, head[2]=CausalConv3d
+        x = self.head[0](x)
+        x = self.head[1](x)
         if feat_cache is not None:
             idx = feat_idx[0]
             cache_x = x[:, -CACHE_T:, :, :, :]
@@ -741,11 +773,11 @@ class Encoder3d(nn.Module):
                     feat_cache[idx][:, -1:, :, :, :],
                     cache_x,
                 ], axis=1)
-            x = self.head_conv(x, feat_cache[idx])
+            x = self.head[2](x, feat_cache[idx])
             feat_cache[idx] = cache_x
             feat_idx[0] += 1
         else:
-            x = self.head_conv(x)
+            x = self.head[2](x)
 
         return x
 
@@ -780,10 +812,12 @@ class Decoder3d(nn.Module):
         # Init block
         self.conv1 = CausalConv3d(z_dim, dims[0], 3, padding=1)
 
-        # Middle blocks
-        self.middle_res1 = ResidualBlock(dims[0], dims[0], dropout)
-        self.middle_attn = AttentionBlock(dims[0])
-        self.middle_res2 = ResidualBlock(dims[0], dims[0], dropout)
+        # Middle: list matching nn.Sequential(ResidualBlock, AttentionBlock, ResidualBlock)
+        self.middle = [
+            ResidualBlock(dims[0], dims[0], dropout),   # 0
+            AttentionBlock(dims[0]),                     # 1
+            ResidualBlock(dims[0], dims[0], dropout),   # 2
+        ]
 
         # Upsample blocks
         upsamples = []
@@ -799,10 +833,13 @@ class Decoder3d(nn.Module):
             ))
         self.upsamples = upsamples
 
-        # Head (output 12 channels for unpatchify with patch_size=2)
+        # Head: list matching nn.Sequential(RMS_norm, SiLU, CausalConv3d)
         out_dim = dims[-1]
-        self.head_norm = RMS_norm(out_dim, images=False)
-        self.head_conv = CausalConv3d(out_dim, 12, 3, padding=1)
+        self.head = [
+            RMS_norm(out_dim, images=False),             # 0
+            _SiLU_placeholder(),                         # 1
+            CausalConv3d(out_dim, 12, 3, padding=1),     # 2
+        ]
 
     def __call__(
         self,
@@ -829,16 +866,16 @@ class Decoder3d(nn.Module):
         else:
             x = self.conv1(x)
 
-        # Middle blocks
+        # Middle blocks: middle[0]=ResidualBlock, middle[1]=AttentionBlock, middle[2]=ResidualBlock
         if feat_cache is not None:
-            x = self.middle_res1(x, feat_cache, feat_idx)
+            x = self.middle[0](x, feat_cache, feat_idx)
         else:
-            x = self.middle_res1(x)
-        x = self.middle_attn(x)
+            x = self.middle[0](x)
+        x = self.middle[1](x)
         if feat_cache is not None:
-            x = self.middle_res2(x, feat_cache, feat_idx)
+            x = self.middle[2](x, feat_cache, feat_idx)
         else:
-            x = self.middle_res2(x)
+            x = self.middle[2](x)
 
         # Upsample blocks
         for layer in self.upsamples:
@@ -847,9 +884,9 @@ class Decoder3d(nn.Module):
             else:
                 x = layer(x)
 
-        # Head
-        x = self.head_norm(x)
-        x = nn.silu(x)
+        # Head: head[0]=RMS_norm, head[1]=SiLU, head[2]=CausalConv3d
+        x = self.head[0](x)
+        x = self.head[1](x)
         if feat_cache is not None:
             idx = feat_idx[0]
             cache_x = x[:, -CACHE_T:, :, :, :]
@@ -858,11 +895,11 @@ class Decoder3d(nn.Module):
                     feat_cache[idx][:, -1:, :, :, :],
                     cache_x,
                 ], axis=1)
-            x = self.head_conv(x, feat_cache[idx])
+            x = self.head[2](x, feat_cache[idx])
             feat_cache[idx] = cache_x
             feat_idx[0] += 1
         else:
-            x = self.head_conv(x)
+            x = self.head[2](x)
 
         return x
 
@@ -880,7 +917,9 @@ def _count_conv3d(model: nn.Module) -> int:
             count += 1
         elif isinstance(child, list):
             for item in child:
-                if isinstance(item, nn.Module):
+                if isinstance(item, CausalConv3d):
+                    count += 1
+                elif isinstance(item, nn.Module):
                     count += _count_conv3d(item)
         elif isinstance(child, nn.Module):
             count += _count_conv3d(child)

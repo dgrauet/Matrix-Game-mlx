@@ -86,7 +86,7 @@ class ActionModule(nn.Module):
             c = mouse_hidden_dim
             mouse_mlp_in = mouse_dim_in * vae_time_compression_ratio * windows_size + img_hidden_size
             self.mouse_mlp_linear1 = nn.Linear(mouse_mlp_in, c, bias=True)
-            self.mouse_mlp_linear2 = nn.Linear(c, c, bias=False)
+            self.mouse_mlp_linear2 = nn.Linear(c, c, bias=True)
             self.mouse_mlp_layernorm = nn.LayerNorm(c)
 
             head_dim = c // heads_num

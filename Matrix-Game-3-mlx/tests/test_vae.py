@@ -243,8 +243,12 @@ def transfer_conv2d_weights(pt_conv, mlx_conv):
 
 
 def transfer_causal_conv3d(pt_cc, mlx_cc):
-    """Transfer CausalConv3d weights."""
-    transfer_conv3d_weights(pt_cc, mlx_cc.conv)
+    """Transfer CausalConv3d weights (direct weight/bias, no .conv wrapper)."""
+    w = pt_cc.weight.detach().numpy()
+    w_mlx = np.transpose(w, (0, 2, 3, 4, 1))
+    mlx_cc.weight = mx.array(w_mlx)
+    if pt_cc.bias is not None:
+        mlx_cc.bias = mx.array(pt_cc.bias.detach().numpy())
 
 
 def transfer_rms_norm(pt_norm, mlx_norm):
@@ -256,9 +260,9 @@ def transfer_rms_norm(pt_norm, mlx_norm):
 def transfer_resample(pt_res, mlx_res):
     """Transfer Resample weights."""
     mode = pt_res.mode
-    if mode in ("upsample2d", "upsample3d"):
-        transfer_conv2d_weights(pt_res.resample[1], mlx_res.conv)
-    elif mode in ("downsample2d", "downsample3d"):
+    # PyTorch uses nn.Sequential with Upsample/ZeroPad at [0] and Conv2d at [1]
+    # MLX uses self.conv = nn.Conv2d directly
+    if mode in ("upsample2d", "upsample3d", "downsample2d", "downsample3d"):
         transfer_conv2d_weights(pt_res.resample[1], mlx_res.conv)
 
     if mode in ("upsample3d", "downsample3d"):
@@ -267,10 +271,10 @@ def transfer_resample(pt_res, mlx_res):
 
 def transfer_residual_block(pt_block, mlx_block):
     """Transfer ResidualBlock weights."""
-    transfer_rms_norm(pt_block.residual[0], mlx_block.norm1)
-    transfer_causal_conv3d(pt_block.residual[2], mlx_block.conv1)
-    transfer_rms_norm(pt_block.residual[3], mlx_block.norm2)
-    transfer_causal_conv3d(pt_block.residual[6], mlx_block.conv2)
+    transfer_rms_norm(pt_block.residual[0], mlx_block.residual[0])
+    transfer_causal_conv3d(pt_block.residual[2], mlx_block.residual[2])
+    transfer_rms_norm(pt_block.residual[3], mlx_block.residual[3])
+    transfer_causal_conv3d(pt_block.residual[6], mlx_block.residual[6])
 
     if not isinstance(pt_block.shortcut, pt_nn.Identity):
         transfer_causal_conv3d(pt_block.shortcut, mlx_block.shortcut)

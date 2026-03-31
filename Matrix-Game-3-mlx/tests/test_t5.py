@@ -195,7 +195,7 @@ def test_t5_feed_forward():
     mlx_ffn = mlx_t5.T5FeedForward(dim, dim_ffn, dropout=0.0)
 
     # Copy weights: gate is nn.Sequential(Linear, GELU) in PyTorch
-    _copy_linear_weights(pt_ffn.gate[0], mlx_ffn.gate_linear)
+    _copy_linear_weights(pt_ffn.gate[0], mlx_ffn.gate[0])
     _copy_linear_weights(pt_ffn.fc1, mlx_ffn.fc1)
     _copy_linear_weights(pt_ffn.fc2, mlx_ffn.fc2)
 
@@ -287,7 +287,7 @@ def test_t5_encoder_block():
     _copy_linear_weights(pt_block.attn.v, mlx_block.attn.v)
     _copy_linear_weights(pt_block.attn.o, mlx_block.attn.o)
     mlx_block.norm2.weight = mx.array(pt_block.norm2.weight.detach().cpu().float().numpy())
-    _copy_linear_weights(pt_block.ffn.gate[0], mlx_block.ffn.gate_linear)
+    _copy_linear_weights(pt_block.ffn.gate[0], mlx_block.ffn.gate[0])
     _copy_linear_weights(pt_block.ffn.fc1, mlx_block.ffn.fc1)
     _copy_linear_weights(pt_block.ffn.fc2, mlx_block.ffn.fc2)
 
@@ -325,7 +325,7 @@ def test_t5_encoder_block():
     _copy_linear_weights(pt_block2.attn.v, mlx_block2.attn.v)
     _copy_linear_weights(pt_block2.attn.o, mlx_block2.attn.o)
     mlx_block2.norm2.weight = mx.array(pt_block2.norm2.weight.detach().cpu().float().numpy())
-    _copy_linear_weights(pt_block2.ffn.gate[0], mlx_block2.ffn.gate_linear)
+    _copy_linear_weights(pt_block2.ffn.gate[0], mlx_block2.ffn.gate[0])
     _copy_linear_weights(pt_block2.ffn.fc1, mlx_block2.ffn.fc1)
     _copy_linear_weights(pt_block2.ffn.fc2, mlx_block2.ffn.fc2)
     _copy_embedding_weights(pt_block2.pos_embedding.embedding,

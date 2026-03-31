@@ -125,14 +125,15 @@ class T5FeedForward(nn.Module):
         self.dim = dim
         self.dim_ffn = dim_ffn
 
-        # layers — gate is Linear + GELU
-        self.gate_linear = nn.Linear(dim, dim_ffn, bias=False)
-        self.gate_act = GELU()
+        # layers — gate is nn.Sequential(nn.Linear, GELU) in PyTorch
+        # Store as list so weight key is "gate.0.weight" matching PyTorch
+        self.gate = [nn.Linear(dim, dim_ffn, bias=False)]
+        self._gate_act = GELU()
         self.fc1 = nn.Linear(dim, dim_ffn, bias=False)
         self.fc2 = nn.Linear(dim_ffn, dim, bias=False)
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = self.fc1(x) * self.gate_act(self.gate_linear(x))
+        x = self.fc1(x) * self._gate_act(self.gate[0](x))
         x = self.fc2(x)
         return x
 
