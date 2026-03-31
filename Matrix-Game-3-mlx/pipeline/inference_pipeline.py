@@ -96,8 +96,9 @@ class MatrixGame3Pipeline:
             sigma_theta=getattr(config, "sigma_theta", 0.0),
         )
         weights = mx.load(dit_path)
-        # Strip component prefix if present
-        clean_weights = {k.replace("dit.", "", 1): v for k, v in weights.items()}
+        # Strip component prefix if present (dit. or dit_distilled.)
+        prefix = "dit_distilled." if use_distilled else "dit."
+        clean_weights = {k.replace(prefix, "", 1): v for k, v in weights.items()}
         self.model.load_weights(list(clean_weights.items()))
         mx.eval(self.model.parameters())  # materialize weights
         logger.info("DiT model loaded (%d layers).", config.num_layers)
