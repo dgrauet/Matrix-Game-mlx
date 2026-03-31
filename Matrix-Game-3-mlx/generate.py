@@ -88,6 +88,7 @@ def generate(args):
     pipeline = MatrixGame3Pipeline(
         config=cfg,
         model_path=args.model_path,
+        use_distilled=not args.use_base_model,
     )
 
     logging.info("Generating video...")

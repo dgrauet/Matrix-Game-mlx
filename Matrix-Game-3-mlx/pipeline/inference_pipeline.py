@@ -52,6 +52,7 @@ class MatrixGame3Pipeline:
         config,
         model_path: str,
         dtype: mx.Dtype = mx.bfloat16,
+        use_distilled: bool = True,
     ):
         self.config = config
         self.dtype = dtype
@@ -71,7 +72,8 @@ class MatrixGame3Pipeline:
         )
 
         # --- DiT backbone ---
-        dit_path = os.path.join(model_path, "dit.safetensors")
+        dit_filename = "dit_distilled.safetensors" if use_distilled else "dit.safetensors"
+        dit_path = os.path.join(model_path, dit_filename)
         logger.info("Loading DiT model from %s", dit_path)
         self.model = WanModel(
             model_type=getattr(config, "model_type", "ti2v"),
