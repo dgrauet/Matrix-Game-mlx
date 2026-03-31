@@ -393,6 +393,99 @@ def zoomed_in(
     return result_frames
 
 
+def select_memory_idx_fov(
+    extrinsics_all: np.ndarray,
+    current_start_frame_idx: int,
+    selected_index_base: List[int],
+    return_confidence: bool = False,
+) -> List[int]:
+    """Select memory frame indices by FOV overlap similarity.
+
+    For each reference frame in ``selected_index_base``, find the candidate
+    frame (from indices 1..current_start_frame_idx-1) whose frustum overlaps
+    the reference frustum the most. This is a numpy-only implementation
+    (no GPU needed on Apple Silicon).
+
+    Args:
+        extrinsics_all: All extrinsic matrices, shape (N, 4, 4).
+        current_start_frame_idx: Start of the current clip.
+        selected_index_base: Reference frame indices to match against.
+        return_confidence: If True, also return overlap ratios.
+
+    Returns:
+        List of selected frame indices. If ``return_confidence``, returns
+        ``(indices, confidences)`` tuple.
+    """
+    video_w, video_h = 1280, 720
+    fov_rad = np.deg2rad(90)
+    fx = video_w / (2 * np.tan(fov_rad / 2))
+    fy = video_h / (2 * np.tan(fov_rad / 2))
+
+    if current_start_frame_idx <= 1:
+        zeros = [0] * len(selected_index_base)
+        if return_confidence:
+            return zeros, [0.0] * len(selected_index_base)
+        return zeros
+
+    candidate_indices = np.arange(1, current_start_frame_idx)
+
+    # Precompute candidate inverse transforms
+    R_cand = extrinsics_all[candidate_indices, :3, :3]  # (N, 3, 3)
+    t_cand = extrinsics_all[candidate_indices, :3, 3:4]  # (N, 3, 1)
+    R_cand_inv = np.transpose(R_cand, (0, 2, 1))  # (N, 3, 3)
+    t_cand_inv = -np.einsum("nij,njk->nik", R_cand_inv, t_cand)  # (N, 3, 1)
+
+    # Build frustum sample points in camera space
+    near, far = 0.1, 30.0
+    num_side = 10
+    z_samples = np.linspace(near, far, num_side)
+    x_samples = np.linspace(-1, 1, num_side)
+    y_samples = np.linspace(-1, 1, num_side)
+    grid_x, grid_y, grid_z = np.meshgrid(x_samples, y_samples, z_samples, indexing="ij")
+
+    points_cam_base = np.stack([
+        grid_x.ravel() * grid_z.ravel() * (video_w / (2 * fx)),
+        grid_y.ravel() * grid_z.ravel() * (video_h / (2 * fy)),
+        grid_z.ravel(),
+    ], axis=0)  # (3, M)
+
+    selected_index: List[int] = []
+    selected_confidence: List[float] = []
+
+    for i in selected_index_base:
+        E_base = extrinsics_all[i]
+        points_world = E_base[:3, :3] @ points_cam_base + E_base[:3, 3:4]  # (3, M)
+
+        # Transform world points into each candidate camera frame
+        # R_cand_inv: (N, 3, 3), points_world: (3, M) -> (N, 3, M)
+        points_in_cands = np.einsum(
+            "nij,jk->nik", R_cand_inv, points_world
+        ) + t_cand_inv  # (N, 3, M)
+
+        x = points_in_cands[:, 0, :]
+        y = points_in_cands[:, 1, :]
+        z = points_in_cands[:, 2, :]
+
+        u = (x * fx / np.maximum(z, 1e-6)) + video_w / 2
+        v = (y * fy / np.maximum(z, 1e-6)) + video_h / 2
+
+        in_view = (
+            (z > near) & (z < far) &
+            (u >= 0) & (u <= video_w) &
+            (v >= 0) & (v <= video_h)
+        )
+
+        ratios = in_view.astype(np.float32).mean(axis=1)
+        best_idx = int(np.argmax(ratios))
+
+        selected_index.append(int(candidate_indices[best_idx]))
+        selected_confidence.append(float(ratios[best_idx]))
+
+    if return_confidence:
+        return selected_index, selected_confidence
+    return selected_index
+
+
 def normalize_to_neg_one_to_one(x: mx.array) -> mx.array:
     """Map values from [0, 1] to [-1, 1]."""
     return 2.0 * x - 1.0
