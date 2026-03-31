@@ -10,15 +10,37 @@ matrix_game3.vae_stride = (4, 16, 16)
 matrix_game3.patch_size = (1, 2, 2)
 matrix_game3.in_dim = 48
 matrix_game3.out_dim = 48
-matrix_game3.dim = 5120
-matrix_game3.ffn_dim = 13824
+matrix_game3.dim = 3072
+matrix_game3.ffn_dim = 14336
 matrix_game3.freq_dim = 256
-matrix_game3.num_heads = 40
-matrix_game3.num_layers = 40
+matrix_game3.num_heads = 24
+matrix_game3.num_layers = 30
 matrix_game3.window_size = (-1, -1)
 matrix_game3.qk_norm = True
 matrix_game3.cross_attn_norm = True
 matrix_game3.eps = 1e-6
+matrix_game3.sigma_theta = 0.8
+matrix_game3.action_config = {
+    'blocks': list(range(15)),
+    'enable_keyboard': True,
+    'enable_mouse': True,
+    'heads_num': 16,
+    'hidden_size': 128,
+    'img_hidden_size': 3072,
+    'keyboard_dim_in': 6,
+    'keyboard_hidden_dim': 1024,
+    'mouse_dim_in': 2,
+    'mouse_hidden_dim': 1024,
+    'mouse_qk_dim_list': [8, 28, 28],
+    'patch_size': [1, 2, 2],
+    'qk_norm': True,
+    'qkv_bias': False,
+    'rope_dim_list': [8, 28, 28],
+    'rope_theta': 256,
+    'vae_time_compression_ratio': 4,
+    'windows_size': 3,
+}
+matrix_game3.use_text_crossattn = True
 matrix_game3.sample_shift = 5.0
 matrix_game3.num_inference_steps = 50
 matrix_game3.sample_guide_scale = 5.0

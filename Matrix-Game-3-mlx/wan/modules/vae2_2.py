@@ -145,16 +145,19 @@ class Resample(nn.Module):
         self.mode = mode
 
         if mode == "upsample2d":
-            self.conv = nn.Conv2d(dim, dim, 3, padding=1)
+            # Index 0: Upsample (no params), Index 1: Conv2d — matches PyTorch nn.Sequential
+            self.resample = [None, nn.Conv2d(dim, dim, 3, padding=1)]
         elif mode == "upsample3d":
-            self.conv = nn.Conv2d(dim, dim, 3, padding=1)
+            self.resample = [None, nn.Conv2d(dim, dim, 3, padding=1)]
             self.time_conv = CausalConv3d(dim, dim * 2, (3, 1, 1), padding=(1, 0, 0))
         elif mode == "downsample2d":
-            # ZeroPad2d(0,1,0,1) + Conv2d(stride=2) — pad right and bottom
-            self.conv = nn.Conv2d(dim, dim, 3, stride=2, padding=0)
+            # Index 0: ZeroPad2d (no params), Index 1: Conv2d
+            self.resample = [None, nn.Conv2d(dim, dim, 3, stride=2, padding=0)]
         elif mode == "downsample3d":
-            self.conv = nn.Conv2d(dim, dim, 3, stride=2, padding=0)
+            self.resample = [None, nn.Conv2d(dim, dim, 3, stride=2, padding=0)]
             self.time_conv = CausalConv3d(dim, dim, (3, 1, 1), stride=(2, 1, 1), padding=(0, 0, 0))
+        else:
+            self.resample = None
 
     def __call__(
         self,
@@ -213,11 +216,11 @@ class Resample(nn.Module):
 
         if self.mode.startswith("upsample"):
             x_2d = _upsample_nearest_2x(x_2d)
-            x_2d = self.conv(x_2d)
+            x_2d = self.resample[1](x_2d)
         elif self.mode.startswith("downsample"):
             # ZeroPad: pad right=1, bottom=1 -> (B*T, H+1, W+1, C)
             x_2d = mx.pad(x_2d, [(0, 0), (0, 1), (0, 1), (0, 0)])
-            x_2d = self.conv(x_2d)
+            x_2d = self.resample[1](x_2d)
         else:
             pass  # mode == "none"
 

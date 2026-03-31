@@ -261,9 +261,9 @@ def transfer_resample(pt_res, mlx_res):
     """Transfer Resample weights."""
     mode = pt_res.mode
     # PyTorch uses nn.Sequential with Upsample/ZeroPad at [0] and Conv2d at [1]
-    # MLX uses self.conv = nn.Conv2d directly
+    # MLX uses self.resample = [None, nn.Conv2d] matching PyTorch nn.Sequential indexing
     if mode in ("upsample2d", "upsample3d", "downsample2d", "downsample3d"):
-        transfer_conv2d_weights(pt_res.resample[1], mlx_res.conv)
+        transfer_conv2d_weights(pt_res.resample[1], mlx_res.resample[1])
 
     if mode in ("upsample3d", "downsample3d"):
         transfer_causal_conv3d(pt_res.time_conv, mlx_res.time_conv)
@@ -515,7 +515,7 @@ class TestResample:
 
         pt = PtResample(dim, "downsample2d")
         mlx_res = MlxResample(dim, "downsample2d")
-        transfer_conv2d_weights(pt.resample[1], mlx_res.conv)
+        transfer_conv2d_weights(pt.resample[1], mlx_res.resample[1])
 
         x_np = np.random.randn(1, 3, 8, 8, dim).astype(np.float32)
         x_pt = torch.tensor(x_np.transpose(0, 4, 1, 2, 3))
@@ -533,7 +533,7 @@ class TestResample:
 
         pt = PtResample(dim, "upsample2d")
         mlx_res = MlxResample(dim, "upsample2d")
-        transfer_conv2d_weights(pt.resample[1], mlx_res.conv)
+        transfer_conv2d_weights(pt.resample[1], mlx_res.resample[1])
 
         x_np = np.random.randn(1, 3, 4, 4, dim).astype(np.float32)
         x_pt = torch.tensor(x_np.transpose(0, 4, 1, 2, 3))
