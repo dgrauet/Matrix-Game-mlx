@@ -1,0 +1,13 @@
+mlx>=0.31.0
+numpy
+Pillow
+imageio
+imageio-ffmpeg
+huggingface_hub
+safetensors
+tokenizers
+transformers
+scipy
+ftfy
+regex
+easydict
