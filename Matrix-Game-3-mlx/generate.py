@@ -94,7 +94,9 @@ def generate(args):
     pipeline.generate(
         text=args.prompt,
         pil_image=pil_image,
-        max_area=MAX_AREA_CONFIGS[args.size],
+        height=MAX_AREA_CONFIGS[args.size][1],
+        width=MAX_AREA_CONFIGS[args.size][0],
+        max_area=MAX_AREA_CONFIGS[args.size][0] * MAX_AREA_CONFIGS[args.size][1],
         shift=args.sample_shift,
         num_inference_steps=args.num_inference_steps,
         guide_scale=args.sample_guide_scale,

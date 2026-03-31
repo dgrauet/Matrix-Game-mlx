@@ -150,7 +150,7 @@ def process_video(input_video, output_video, config, mouse_icon_path, mouse_scal
     frame_height = input_video[0].shape[0]
     frame_count = len(input_video)
 
-    mouse_icon = cv2.imread(mouse_icon_path, cv2.IMREAD_UNCHANGED)
+    mouse_icon = cv2.imread(mouse_icon_path, cv2.IMREAD_UNCHANGED) if mouse_icon_path else None
 
     out_video = []
     frame_idx = 0
@@ -160,7 +160,8 @@ def process_video(input_video, output_video, config, mouse_icon_path, mouse_scal
         mouse_position = mouse_data.get(frame_idx, (frame_width // 2, frame_height // 2))
 
         draw_keys_on_frame(frame, keys, key_size=(50, 50), spacing=10, bottom_margin=20)
-        overlay_icon(frame, mouse_icon, mouse_position, scale=mouse_scale, rotation=mouse_rotation)
+        if mouse_icon is not None:
+            overlay_icon(frame, mouse_icon, mouse_position, scale=mouse_scale, rotation=mouse_rotation)
         out_video.append(frame / 255)
         frame_idx += 1
         # print(f"Processing frame {frame_idx}/{frame_count}", end="\r")

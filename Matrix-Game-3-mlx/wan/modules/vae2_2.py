@@ -1038,24 +1038,27 @@ class WanVAE_(nn.Module):
         iter_ = z.shape[1]  # temporal dim
         x = self.conv2(z)
 
-        out = None
+        chunks = []
         for i in range(iter_):
             self._conv_idx = [0]
             if i == 0:
-                out = self.decoder(
+                chunk = self.decoder(
                     x[:, i:i + 1, :, :, :],
                     feat_cache=self._feat_map,
                     feat_idx=self._conv_idx,
                     first_chunk=True,
                 )
             else:
-                out_ = self.decoder(
+                chunk = self.decoder(
                     x[:, i:i + 1, :, :, :],
                     feat_cache=self._feat_map,
                     feat_idx=self._conv_idx,
                 )
-                out = mx.concatenate([out, out_], axis=1)
+            # Materialize each chunk to control peak memory
+            mx.eval(chunk)  # noqa: S307 — mx.eval materializes lazy MLX arrays
+            chunks.append(chunk)
 
+        out = mx.concatenate(chunks, axis=1) if len(chunks) > 1 else chunks[0]
         out = unpatchify(out, patch_size=2)
         out = mx.clip(out, -1, 1)
         self.clear_cache()
@@ -1104,6 +1107,7 @@ class Wan2_2_VAE:
         self,
         z_dim: int = 48,
         c_dim: int = 160,
+        dec_dim: int = 256,
         vae_pth: Optional[str] = None,
         dim_mult: List[int] = [1, 2, 4, 4],
         temperal_downsample: List[bool] = [False, True, True],
@@ -1119,7 +1123,7 @@ class Wan2_2_VAE:
         # Build model
         self.model = WanVAE_(
             dim=c_dim,
-            dec_dim=c_dim,  # Will be overridden by actual config
+            dec_dim=dec_dim,
             z_dim=z_dim,
             dim_mult=dim_mult,
             num_res_blocks=2,
@@ -1134,7 +1138,9 @@ class Wan2_2_VAE:
             if os.path.exists(vae_pth):
                 logging.info(f"Loading VAE weights from {vae_pth}")
                 weights = mx.load(vae_pth)
-                self.model.load_weights(list(weights.items()))
+                # Strip component prefix if present (e.g. "vae.encoder..." -> "encoder...")
+                clean = {k.replace("vae.", "", 1): v for k, v in weights.items()}
+                self.model.load_weights(list(clean.items()))
 
     def encode(self, videos: List[mx.array]) -> List[mx.array]:
         """Encode a list of videos to latent space.

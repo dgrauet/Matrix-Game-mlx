@@ -74,13 +74,14 @@ class MatrixGame3Pipeline:
         dit_path = os.path.join(model_path, "dit.safetensors")
         logger.info("Loading DiT model from %s", dit_path)
         self.model = WanModel(
-            model_type="s2v",
+            model_type=getattr(config, "model_type", "ti2v"),
             patch_size=config.patch_size,
             text_len=config.text_len,
             in_dim=config.in_dim,
             dim=config.dim,
             ffn_dim=config.ffn_dim,
             freq_dim=config.freq_dim,
+            text_dim=getattr(config, "text_dim", 4096),
             out_dim=config.out_dim,
             num_heads=config.num_heads,
             num_layers=config.num_layers,
@@ -88,9 +89,14 @@ class MatrixGame3Pipeline:
             qk_norm=config.qk_norm,
             cross_attn_norm=config.cross_attn_norm,
             eps=config.eps,
+            action_config=getattr(config, "action_config", {}),
+            use_memory=getattr(config, "use_memory", True),
+            sigma_theta=getattr(config, "sigma_theta", 0.0),
         )
         weights = mx.load(dit_path)
-        self.model.load_weights(list(weights.items()))
+        # Strip component prefix if present
+        clean_weights = {k.replace("dit.", "", 1): v for k, v in weights.items()}
+        self.model.load_weights(list(clean_weights.items()))
         mx.eval(self.model.parameters())  # materialize weights
         logger.info("DiT model loaded (%d layers).", config.num_layers)
 
@@ -188,8 +194,8 @@ class MatrixGame3Pipeline:
 
         # --- Encode input image with VAE ---
         logger.info("Encoding input image with VAE...")
-        # current_image[0, 0] is (H, W, C) channels-last
-        img_cond = self.vae.encode([current_image[0, 0]])[0]  # (T, lat_h, lat_w, 48)
+        # current_image[0] is (1, H, W, C) channels-last — VAE encode expects (T, H, W, C)
+        img_cond = self.vae.encode([current_image[0]])[0]  # (T, lat_h, lat_w, 48)
         img_cond = mx.expand_dims(img_cond, axis=0)  # (1, T, lat_h, lat_w, 48)
         img_cond = img_cond.astype(self.dtype)
         mx.eval(img_cond)

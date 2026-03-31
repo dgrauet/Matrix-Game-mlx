@@ -454,7 +454,9 @@ class T5EncoderModel:
         logging.info(f'loading {checkpoint_path}')
         if checkpoint_path:
             weights = mx.load(checkpoint_path)
-            model.load_weights(list(weights.items()))
+            # Strip component prefix if present (e.g. "t5_encoder.blocks..." -> "blocks...")
+            clean = {k.replace("t5_encoder.", "", 1): v for k, v in weights.items()}
+            model.load_weights(list(clean.items()))
         self.model = model
 
         # init tokenizer

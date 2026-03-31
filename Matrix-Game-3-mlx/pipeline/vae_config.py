@@ -27,6 +27,7 @@ def get_vae_config(args: Any = None) -> Dict[str, Any]:
     config: Dict[str, Any] = {
         "z_dim": 48,
         "c_dim": 160,
+        "dec_dim": 256,
         "dim_mult": [1, 2, 4, 4],
         "temperal_downsample": [False, True, True],
         "vae_type": "wan",
@@ -61,6 +62,7 @@ def load_vae(
     vae = Wan2_2_VAE(
         z_dim=config["z_dim"],
         c_dim=config["c_dim"],
+        dec_dim=config["dec_dim"],
         dim_mult=config["dim_mult"],
         temperal_downsample=config["temperal_downsample"],
         dtype=dtype,
