@@ -483,9 +483,12 @@ class AvgDown3D(nn.Module):
 
         B, T, H, W, C = x.shape
 
-        # PyTorch: (B, C, T, H, W) -> view -> permute -> view -> view -> mean
-        # MLX channels-last: (B, T, H, W, C)
-        # Reshape to separate factors
+        # PyTorch (channels-first): (B, C, T, H, W)
+        #   -> view(B, C, T', ft, H', fs, W', fs)
+        #   -> permute(0, 1, 3, 5, 7, 2, 4, 6) = (B, C, ft, fs, fs, T', H', W')
+        #   -> view(B, C*factor, T', H', W')
+        # MLX (channels-last): (B, T, H, W, C)
+        #   Must produce same channel grouping: C interleaved with factors
         x = x.reshape(
             B,
             T // self.factor_t, self.factor_t,
@@ -493,9 +496,10 @@ class AvgDown3D(nn.Module):
             W // self.factor_s, self.factor_s,
             C,
         )
-        # Move factor dims next to C: (B, T', H', W', factor_t, factor_s, factor_s, C)
-        x = x.transpose(0, 1, 3, 5, 2, 4, 6, 7)
-        # Merge factors with C: (B, T', H', W', C * factor)
+        # (B, T', ft, H', fs, W', fs, C)
+        # Move to: (B, T', H', W', C, ft, fs, fs) — C BEFORE factors to match PyTorch
+        x = x.transpose(0, 1, 3, 5, 7, 2, 4, 6)
+        # Merge: (B, T', H', W', C * factor)
         x = x.reshape(
             B,
             T // self.factor_t,
@@ -532,21 +536,25 @@ class DupUp3D(nn.Module):
 
     def __call__(self, x: mx.array, first_chunk: bool = False) -> mx.array:
         """Forward pass. Input: (B, T, H, W, C)."""
-        # repeat_interleave along C (last dim)
-        # In PyTorch: repeat_interleave(repeats, dim=1) on (B,C,T,H,W)
-        # In MLX channels-last: repeat_interleave along dim=-1 on (B,T,H,W,C)
+        # PyTorch (channels-first): x = x.repeat_interleave(repeats, dim=1) on (B,C,T,H,W)
+        # then view(B, out_C, ft, fs, fs, T, H, W)
+        # then permute(0, 1, 5, 2, 6, 3, 7, 4) = (B, out_C, T, ft, H, fs, W, fs)
+        # then reshape(B, out_C, T*ft, H*fs, W*fs)
+        #
+        # MLX (channels-last): must match the same C grouping
         B, T, H, W, C = x.shape
         x = mx.repeat(x, self.repeats, axis=-1)  # (B, T, H, W, C*repeats)
 
-        # Reshape to separate spatial/temporal factors
-        # PyTorch had: (B, out_C, factor_t, factor_s, factor_s, T, H, W) then permute
-        # MLX: (B, T, H, W, out_C, factor_t, factor_s, factor_s)
+        # Reshape: put out_C and factors in PyTorch order (out_C first, then factors)
+        # (B, T, H, W, out_C, ft, fs, fs)
         x = x.reshape(B, T, H, W, self.out_channels, self.factor_t, self.factor_s, self.factor_s)
 
-        # Permute to interleave: (B, T, factor_t, H, factor_s, W, factor_s, out_C)
+        # Permute to interleave spatial/temporal dims:
+        # From: (B, T, H, W, out_C, ft, fs, fs) = (0, 1, 2, 3, 4, 5, 6, 7)
+        # To:   (B, T, ft, H, fs, W, fs, out_C) = (0, 1, 5, 2, 6, 3, 7, 4)
         x = x.transpose(0, 1, 5, 2, 6, 3, 7, 4)
 
-        # Final reshape: (B, T*factor_t, H*factor_s, W*factor_s, out_C)
+        # Final reshape: (B, T*ft, H*fs, W*fs, out_C)
         x = x.reshape(B, T * self.factor_t, H * self.factor_s, W * self.factor_s, self.out_channels)
 
         if first_chunk:
