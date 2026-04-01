@@ -106,6 +106,19 @@ class MatrixGame3Pipeline:
         # Strip component prefix if present (dit. or dit_distilled.)
         prefix = "dit_distilled." if use_distilled else "dit."
         clean_weights = {k.replace(prefix, "", 1): v for k, v in weights.items()}
+
+        # Detect quantized weights and convert Linear -> QuantizedLinear
+        has_scales = any(k.endswith(".scales") for k in clean_weights)
+        if has_scales:
+            # Infer quantization config from weight shapes
+            for k, v in clean_weights.items():
+                if k.endswith(".scales"):
+                    bits = 8 if clean_weights[k.replace(".scales", ".weight")].dtype == mx.uint8 else 4
+                    group_size = v.shape[-1]
+                    break
+            logger.info("Detected quantized weights (bits=%d, group_size=%d)", bits, group_size)
+            nn.quantize(self.model, bits=bits, group_size=group_size)
+
         self.model.load_weights(list(clean_weights.items()))
         mx.eval(self.model.parameters())  # materialize weights
         logger.info("DiT model loaded (%d layers).", config.num_layers)
