@@ -9,12 +9,10 @@ via stdin at each clip iteration.
 """
 
 import logging
-import math
 import os
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import mlx.core as mx
-import mlx.nn as nn
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
@@ -170,46 +168,8 @@ class MatrixGame3Pipeline:
         # Strip component prefix if present (dit. or dit_distilled.)
         prefix = "dit_distilled." if use_distilled else "dit."
         clean_weights = {k.replace(prefix, "", 1): v for k, v in weights.items()}
-
-        # Detect quantized weights and convert Linear -> QuantizedLinear
-        quantized_layers = set()
-        for k in clean_weights:
-            if k.endswith(".scales"):
-                quantized_layers.add(k.rsplit(".scales", 1)[0])
-        if quantized_layers:
-            from mlx.utils import tree_flatten
-            from mlx.nn.layers.quantized import QuantizedLinear
-
-            first = next(iter(quantized_layers))
-            w = clean_weights[f"{first}.weight"]
-            s = clean_weights[f"{first}.scales"]
-            model_params = dict(tree_flatten(self.model.parameters()))
-            orig_in = model_params[f"{first}.weight"].shape[-1]
-            bits = 32 // (orig_in // w.shape[-1])
-            group_size = orig_in // s.shape[-1]
-            logger.info("Quantized weights: %d layers, bits=%d, group_size=%d",
-                        len(quantized_layers), bits, group_size)
-
-            for path in quantized_layers:
-                parts = path.split(".")
-                parent = self.model
-                for p in parts[:-1]:
-                    if p.isdigit():
-                        parent = parent[int(p)]
-                    else:
-                        parent = getattr(parent, p)
-                attr = parts[-1]
-                module = getattr(parent, attr)
-                if isinstance(module, nn.Linear) and module.weight.shape[-1] % group_size == 0:
-                    ql = QuantizedLinear(
-                        module.weight.shape[-1], module.weight.shape[0],
-                        bias="bias" in module, group_size=group_size, bits=bits,
-                    )
-                    setattr(parent, attr, ql)
-
         self.model.load_weights(list(clean_weights.items()))
-        mx.eval(self.model.parameters())  # materialize weights
-        # Note: mx.compile does not improve DiT inference speed (bottleneck is matmuls/attention)
+        mx.eval(self.model.parameters())
         logger.info("DiT model loaded (%d layers).", config.num_layers)
 
         # --- VAE ---
@@ -275,7 +235,6 @@ class MatrixGame3Pipeline:
         num_frames = first_clip_frame + (num_iterations - 1) * 40
 
         # --- Prepare input image ---
-        from utils.utils import get_data
         current_image, _, _, _ = get_data(num_frames, height, width, pil_image)
 
         # --- Encode text ---

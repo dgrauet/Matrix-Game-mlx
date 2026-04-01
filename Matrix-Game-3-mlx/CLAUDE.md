@@ -114,7 +114,6 @@ Matrix-Game-3-mlx/
 | `flash_attn` | `mx.fast.scaled_dot_product_attention` |
 | `torch.view_as_complex` / `torch.polar` | Real arithmetic (cos/sin multiply) |
 | `einops.rearrange` | Explicit `mx.reshape` / `mx.transpose` |
-| `torch.compile` | `mx.compile` where beneficial |
 | `diffusers.ModelMixin` | Plain `nn.Module` + `mx.load` |
 
 ### Conv3d Layout
@@ -143,7 +142,7 @@ Replace patchify `Conv3d(in_dim, dim, patch_size, stride=patch_size)` with
 ## What NOT to Port
 
 - `wan/distributed/` — no multi-GPU needed on Apple Silicon
-- `wan/triton_kernels.py` — quantization via mlx-forge
+- `wan/triton_kernels.py` — Triton kernels not applicable on Apple Silicon
 - `pipeline/vae_worker.py` — no async multi-GPU VAE
 - `pipeline/inference_interactive_pipeline.py` — now ported (interactive mode)
 
