@@ -237,11 +237,8 @@ class MatrixGame3Pipeline:
         num_frames = first_clip_frame + (num_iterations - 1) * 40
 
         # --- Prepare input image ---
-        from utils.transform import get_video_transform
-        transform = get_video_transform(height, width)
-        img_np = np.array(pil_image)
-        current_image = transform(img_np)  # (1, H, W, C) channels-last, float32 [-1, 1]
-        current_image = np.expand_dims(current_image, axis=0)  # (1, 1, H, W, C)
+        from utils.utils import get_data
+        current_image, _, _, _ = get_data(num_frames, height, width, pil_image)
 
         # --- Encode text ---
         logger.info("Encoding text prompt...")
