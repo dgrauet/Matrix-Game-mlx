@@ -64,7 +64,8 @@ Always consult the official docs for API signatures, conventions, and best pract
 Matrix-Game-3-mlx/
 ├── generate.py                    # CLI entry point
 ├── pipeline/
-│   ├── inference_pipeline.py      # MatrixGame3Pipeline
+│   ├── inference_pipeline.py      # MatrixGame3Pipeline (batch)
+│   ├── inference_interactive_pipeline.py  # MatrixGame3Pipeline (interactive)
 │   └── vae_config.py              # VAE loading config
 ├── utils/
 │   ├── cam_utils.py               # Camera math (numpy)
@@ -144,7 +145,7 @@ Replace patchify `Conv3d(in_dim, dim, patch_size, stride=patch_size)` with
 - `wan/distributed/` — no multi-GPU needed on Apple Silicon
 - `wan/triton_kernels.py` — quantization via mlx-forge
 - `pipeline/vae_worker.py` — no async multi-GPU VAE
-- `pipeline/inference_interactive_pipeline.py` — batch mode only (for now)
+- `pipeline/inference_interactive_pipeline.py` — now ported (interactive mode)
 
 ## Model Weights
 

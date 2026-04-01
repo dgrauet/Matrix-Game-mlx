@@ -10,7 +10,6 @@ import mlx.core as mx
 from PIL import Image
 
 from wan.configs import WAN_CONFIGS, MAX_AREA_CONFIGS
-from pipeline.inference_pipeline import MatrixGame3Pipeline
 from utils.misc import set_seed
 
 
@@ -54,6 +53,9 @@ def _parse_args():
     parser.add_argument(
         "--use_base_model", action="store_true",
         help="Use base model (50 steps with CFG) instead of distilled.")
+    parser.add_argument(
+        "--interactive", action="store_true",
+        help="Use interactive mode: prompt for mouse/keyboard actions at each clip iteration.")
 
     args = parser.parse_args()
 
@@ -85,6 +87,11 @@ def generate(args):
     pil_image = Image.open(args.image).convert("RGB")
 
     logging.info("Creating Matrix-Game-3 pipeline (MLX).")
+    if args.interactive:
+        from pipeline.inference_interactive_pipeline import MatrixGame3Pipeline
+    else:
+        from pipeline.inference_pipeline import MatrixGame3Pipeline
+
     pipeline = MatrixGame3Pipeline(
         config=cfg,
         model_path=args.model_path,
