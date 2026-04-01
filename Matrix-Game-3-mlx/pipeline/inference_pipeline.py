@@ -154,8 +154,7 @@ class MatrixGame3Pipeline:
 
         self.model.load_weights(list(clean_weights.items()))
         mx.eval(self.model.parameters())
-        self.compiled_model = mx.compile(self.model)
-        logger.info("DiT model loaded and compiled (%d layers).", config.num_layers)
+        logger.info("DiT model loaded (%d layers).", config.num_layers)
 
     def _load_vae(self) -> None:
         """Load VAE model."""
@@ -530,8 +529,8 @@ class MatrixGame3Pipeline:
                         "seq_len": max_seq_len,
                         **conditions_null,
                     }
-                    noise_pred_full = self.compiled_model(**model_kwargs)
-                    noise_pred_null = self.compiled_model(**model_kwargs_null)
+                    noise_pred_full = self.model(**model_kwargs)
+                    noise_pred_null = self.model(**model_kwargs_null)
                     # CFG: null + scale * (full - null)
                     noise_pred_combined = [
                         n + guide_scale * (f - n)
@@ -539,7 +538,7 @@ class MatrixGame3Pipeline:
                     ]
                     noise_pred = noise_pred_combined[0]
                 else:
-                    noise_pred_list = self.compiled_model(**model_kwargs)
+                    noise_pred_list = self.model(**model_kwargs)
                     noise_pred = noise_pred_list[0]
 
                 # noise_pred is channels-last (F, H, W, C) per the model output

@@ -209,6 +209,7 @@ class MatrixGame3Pipeline:
 
         self.model.load_weights(list(clean_weights.items()))
         mx.eval(self.model.parameters())  # materialize weights
+        # Note: mx.compile does not improve DiT inference speed (bottleneck is matmuls/attention)
         logger.info("DiT model loaded (%d layers).", config.num_layers)
 
         # --- VAE ---
