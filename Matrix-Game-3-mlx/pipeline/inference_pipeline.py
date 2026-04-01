@@ -60,6 +60,13 @@ class MatrixGame3Pipeline:
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
 
+        # Resolve model_path: if it's a HuggingFace repo ID, download to cache
+        if not os.path.isdir(model_path) and "/" in model_path:
+            from huggingface_hub import snapshot_download
+            logger.info("Downloading model from HuggingFace: %s", model_path)
+            model_path = snapshot_download(model_path)
+            logger.info("Model cached at: %s", model_path)
+
         # --- T5 text encoder ---
         t5_ckpt = os.path.join(model_path, "t5_encoder.safetensors")
         t5_tokenizer = getattr(config, "t5_tokenizer", "google/umt5-xxl")

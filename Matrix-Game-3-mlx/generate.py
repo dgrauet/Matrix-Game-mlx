@@ -19,8 +19,8 @@ def _parse_args():
         description="Generate a video from an image, text prompt and actions using Matrix-Game-3 (MLX)."
     )
     parser.add_argument(
-        "--model_path", type=str, required=True,
-        help="Path to mlx-forge converted model directory or HuggingFace repo ID.")
+        "--model_path", type=str, default="dgrauet/matrix-game-3.0-mlx",
+        help="Path to model directory or HuggingFace repo ID (default: dgrauet/matrix-game-3.0-mlx).")
     parser.add_argument(
         "--size", type=str, default="1280*704",
         help="Output video size (e.g. '1280*704').")

@@ -8,7 +8,7 @@ and keyboard/mouse actions. Built on a 5B Diffusion Transformer (DiT) backbone b
 
 This is the **inference-only** MLX runtime. Model conversion/quantization is handled by
 [mlx-forge](https://github.com/dgrauet/mlx-forge). Converted models are hosted at
-[huggingface.co/dgrauet/Matrix-Game-3.0-mlx](https://huggingface.co/dgrauet/Matrix-Game-3.0-mlx).
+[huggingface.co/dgrauet/matrix-game-3.0-mlx](https://huggingface.co/dgrauet/matrix-game-3.0-mlx).
 
 ## Guiding Principles
 
@@ -149,7 +149,7 @@ Replace patchify `Conv3d(in_dim, dim, patch_size, stride=patch_size)` with
 ## Model Weights
 
 - Source: `Skywork/Matrix-Game-3.0` on HuggingFace
-- Converted: `dgrauet/Matrix-Game-3.0-mlx` on HuggingFace
+- Converted: `dgrauet/matrix-game-3.0-mlx` on HuggingFace
 - Conversion tool: [mlx-forge](https://github.com/dgrauet/mlx-forge)
 - Format: per-component safetensors (`dit.safetensors`, `t5_encoder.safetensors`, etc.)
 
