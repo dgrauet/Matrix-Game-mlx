@@ -107,29 +107,37 @@ class MatrixGame3Pipeline:
         prefix = "dit_distilled." if use_distilled else "dit."
         clean_weights = {k.replace(prefix, "", 1): v for k, v in weights.items()}
 
-        # Detect quantized weights and convert Linear -> QuantizedLinear
-        has_scales = any(k.endswith(".scales") for k in clean_weights)
-        if has_scales:
-            # Infer quantization config from weight shapes
-            # weight: (out, packed_in) as uint32, scales: (out, num_groups)
-            # bits: 4 if uint32, 8 if uint8
-            # group_size = (packed_in * elem_per_word) / num_groups
-            for k, v in clean_weights.items():
-                if k.endswith(".scales"):
-                    w_key = k.replace(".scales", ".weight")
-                    w = clean_weights[w_key]
-                    if w.dtype == mx.uint32:
-                        bits = 4
-                        elems_per_word = 8  # 32 / 4
-                    else:
-                        bits = 8
-                        elems_per_word = 4  # 32 / 8
-                    num_groups = v.shape[-1]
-                    total_elems = w.shape[-1] * elems_per_word
-                    group_size = total_elems // num_groups
-                    break
-            logger.info("Detected quantized weights (bits=%d, group_size=%d)", bits, group_size)
-            nn.quantize(self.model, bits=bits, group_size=group_size)
+        # Detect quantized weights and selectively convert Linear -> QuantizedLinear
+        quantized_layers = set()
+        for k in clean_weights:
+            if k.endswith(".scales"):
+                # e.g. "blocks.0.self_attn.q.scales" -> "blocks.0.self_attn.q"
+                quantized_layers.add(k.rsplit(".scales", 1)[0])
+        if quantized_layers:
+            # Infer bits and group_size from the first quantized layer
+            first = next(iter(quantized_layers))
+            w = clean_weights[f"{first}.weight"]
+            s = clean_weights[f"{first}.scales"]
+            if w.dtype == mx.uint32:
+                bits = 4
+                elems_per_word = 8
+            else:
+                bits = 8
+                elems_per_word = 4
+            group_size = (w.shape[-1] * elems_per_word) // s.shape[-1]
+            logger.info(
+                "Detected %d quantized layers (bits=%d, group_size=%d)",
+                len(quantized_layers), bits, group_size,
+            )
+            # Quantize only the layers that have quantized weights
+            nn.quantize(
+                self.model,
+                bits=bits,
+                group_size=group_size,
+                class_predicate=lambda path, m: (
+                    isinstance(m, nn.Linear) and path in quantized_layers
+                ),
+            )
 
         self.model.load_weights(list(clean_weights.items()))
         mx.eval(self.model.parameters())  # materialize weights

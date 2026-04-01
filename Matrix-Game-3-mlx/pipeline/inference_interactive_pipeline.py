@@ -172,24 +172,25 @@ class MatrixGame3Pipeline:
         clean_weights = {k.replace(prefix, "", 1): v for k, v in weights.items()}
 
         # Detect quantized weights and convert Linear -> QuantizedLinear
-        has_scales = any(k.endswith(".scales") for k in clean_weights)
-        if has_scales:
-            for k, v in clean_weights.items():
-                if k.endswith(".scales"):
-                    w_key = k.replace(".scales", ".weight")
-                    w = clean_weights[w_key]
-                    if w.dtype == mx.uint32:
-                        bits = 4
-                        elems_per_word = 8
-                    else:
-                        bits = 8
-                        elems_per_word = 4
-                    num_groups = v.shape[-1]
-                    total_elems = w.shape[-1] * elems_per_word
-                    group_size = total_elems // num_groups
-                    break
-            logger.info("Detected quantized weights (bits=%d, group_size=%d)", bits, group_size)
-            nn.quantize(self.model, bits=bits, group_size=group_size)
+        quantized_layers = set()
+        for k in clean_weights:
+            if k.endswith(".scales"):
+                quantized_layers.add(k.rsplit(".scales", 1)[0])
+        if quantized_layers:
+            first = next(iter(quantized_layers))
+            w = clean_weights[f"{first}.weight"]
+            s = clean_weights[f"{first}.scales"]
+            bits = 4 if w.dtype == mx.uint32 else 8
+            elems_per_word = 8 if bits == 4 else 4
+            group_size = (w.shape[-1] * elems_per_word) // s.shape[-1]
+            logger.info("Detected %d quantized layers (bits=%d, group_size=%d)",
+                        len(quantized_layers), bits, group_size)
+            nn.quantize(
+                self.model, bits=bits, group_size=group_size,
+                class_predicate=lambda path, m: (
+                    isinstance(m, nn.Linear) and path in quantized_layers
+                ),
+            )
 
         self.model.load_weights(list(clean_weights.items()))
         mx.eval(self.model.parameters())  # materialize weights
