@@ -111,10 +111,22 @@ class MatrixGame3Pipeline:
         has_scales = any(k.endswith(".scales") for k in clean_weights)
         if has_scales:
             # Infer quantization config from weight shapes
+            # weight: (out, packed_in) as uint32, scales: (out, num_groups)
+            # bits: 4 if uint32, 8 if uint8
+            # group_size = (packed_in * elem_per_word) / num_groups
             for k, v in clean_weights.items():
                 if k.endswith(".scales"):
-                    bits = 8 if clean_weights[k.replace(".scales", ".weight")].dtype == mx.uint8 else 4
-                    group_size = v.shape[-1]
+                    w_key = k.replace(".scales", ".weight")
+                    w = clean_weights[w_key]
+                    if w.dtype == mx.uint32:
+                        bits = 4
+                        elems_per_word = 8  # 32 / 4
+                    else:
+                        bits = 8
+                        elems_per_word = 4  # 32 / 8
+                    num_groups = v.shape[-1]
+                    total_elems = w.shape[-1] * elems_per_word
+                    group_size = total_elems // num_groups
                     break
             logger.info("Detected quantized weights (bits=%d, group_size=%d)", bits, group_size)
             nn.quantize(self.model, bits=bits, group_size=group_size)
