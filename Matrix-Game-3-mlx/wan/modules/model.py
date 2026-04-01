@@ -979,12 +979,11 @@ class WanModel(nn.Module):
             f_p, h_p, w_p = v[0], v[1], v[2]
             total = f_p * h_p * w_p
             u = x[i, :total]
-            # Reshape to [f_p, h_p, w_p, pt, ph, pw, c]
-            u = u.reshape(f_p, h_p, w_p, pt, ph, pw, c)
-            # PyTorch einsum 'fhwpqrc->cfphqwr' produces [c, f_p*pt, h_p*ph, w_p*pw]
-            # For channels-last output [f_p*pt, h_p*ph, w_p*pw, c]:
-            # Transpose to [f_p, pt, h_p, ph, w_p, pw, c] then reshape
-            u = u.transpose(0, 3, 1, 4, 2, 5, 6)
+            # Head output is flattened as (c, pt, ph, pw) per patch — matching Conv3d layout
+            # Reshape to [f_p, h_p, w_p, c, pt, ph, pw]
+            u = u.reshape(f_p, h_p, w_p, c, pt, ph, pw)
+            # Transpose to interleave: [f_p, pt, h_p, ph, w_p, pw, c]
+            u = u.transpose(0, 4, 1, 5, 2, 6, 3)
             u = u.reshape(f_p * pt, h_p * ph, w_p * pw, c)
             out.append(u)
         return out
@@ -1052,8 +1051,10 @@ class WanModel(nn.Module):
             f_p, h_p, w_p = f // pt, h // ph, w // pw
             grid_sizes_list.append([f_p, h_p, w_p])
             u = u.reshape(f_p, pt, h_p, ph, w_p, pw, c)
-            u = u.transpose(0, 2, 4, 1, 3, 5, 6)
-            u = u.reshape(1, f_p * h_p * w_p, pt * ph * pw * c)
+            # Order: (f_p, h_p, w_p, C, pt, ph, pw) — C before spatial patch dims
+            # to match Conv3d weight layout (out, in_C, kF, kH, kW)
+            u = u.transpose(0, 2, 4, 6, 1, 3, 5)
+            u = u.reshape(1, f_p * h_p * w_p, c * pt * ph * pw)
             u = self.patch_embedding(u)
             x_list.append(u)
 
