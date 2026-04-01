@@ -67,7 +67,7 @@ class MatrixGame3Pipeline:
             model_path = snapshot_download(model_path)
             logger.info("Model cached at: %s", model_path)
 
-        # --- T5 text encoder ---
+        # --- T5 text encoder (loaded first, freed after encoding) ---
         t5_ckpt = os.path.join(model_path, "t5_encoder.safetensors")
         t5_tokenizer = getattr(config, "t5_tokenizer", "google/umt5-xxl")
         logger.info("Loading T5 text encoder from %s", t5_ckpt)
@@ -78,10 +78,21 @@ class MatrixGame3Pipeline:
             tokenizer_path=t5_tokenizer,
         )
 
-        # --- DiT backbone ---
-        dit_filename = "dit_distilled.safetensors" if use_distilled else "dit.safetensors"
-        dit_path = os.path.join(model_path, dit_filename)
-        logger.info("Loading DiT model from %s", dit_path)
+        # Store paths for lazy loading of DiT and VAE (after T5 is freed)
+        self._dit_path = os.path.join(
+            model_path,
+            "dit_distilled.safetensors" if use_distilled else "dit.safetensors",
+        )
+        self._dit_prefix = "dit_distilled." if use_distilled else "dit."
+        self._vae_path = os.path.join(model_path, "vae.safetensors")
+        self.model = None
+        self.compiled_model = None
+        self.vae = None
+
+    def _load_dit(self) -> None:
+        """Load DiT model (called after T5 is freed to save memory)."""
+        config = self.config
+        logger.info("Loading DiT model from %s", self._dit_path)
         self.model = WanModel(
             model_type=getattr(config, "model_type", "ti2v"),
             patch_size=config.patch_size,
@@ -102,10 +113,8 @@ class MatrixGame3Pipeline:
             use_memory=getattr(config, "use_memory", True),
             sigma_theta=getattr(config, "sigma_theta", 0.0),
         )
-        weights = mx.load(dit_path)
-        # Strip component prefix if present (dit. or dit_distilled.)
-        prefix = "dit_distilled." if use_distilled else "dit."
-        clean_weights = {k.replace(prefix, "", 1): v for k, v in weights.items()}
+        weights = mx.load(self._dit_path)
+        clean_weights = {k.replace(self._dit_prefix, "", 1): v for k, v in weights.items()}
 
         # Detect quantized weights and selectively convert Linear -> QuantizedLinear
         quantized_layers = set()
@@ -116,7 +125,6 @@ class MatrixGame3Pipeline:
             from mlx.utils import tree_flatten
             from mlx.nn.layers.quantized import QuantizedLinear
 
-            # Infer bits/group_size from first quantized layer
             first = next(iter(quantized_layers))
             w = clean_weights[f"{first}.weight"]
             s = clean_weights[f"{first}.scales"]
@@ -127,7 +135,6 @@ class MatrixGame3Pipeline:
             logger.info("Quantized weights: %d layers, bits=%d, group_size=%d",
                         len(quantized_layers), bits, group_size)
 
-            # Convert each quantized Linear individually
             for path in quantized_layers:
                 parts = path.split(".")
                 parent = self.model
@@ -146,16 +153,14 @@ class MatrixGame3Pipeline:
                     setattr(parent, attr, ql)
 
         self.model.load_weights(list(clean_weights.items()))
-        mx.eval(self.model.parameters())  # materialize weights
-        logger.info("DiT model loaded (%d layers).", config.num_layers)
+        mx.eval(self.model.parameters())
+        self.compiled_model = mx.compile(self.model)
+        logger.info("DiT model loaded and compiled (%d layers).", config.num_layers)
 
-        # --- VAE ---
-        vae_path = os.path.join(model_path, "vae.safetensors")
-        logger.info("Loading VAE from %s", vae_path)
-        self.vae = load_vae(
-            model_path=vae_path,
-            dtype=mx.float32,
-        )
+    def _load_vae(self) -> None:
+        """Load VAE model."""
+        logger.info("Loading VAE from %s", self._vae_path)
+        self.vae = load_vae(model_path=self._vae_path, dtype=mx.float32)
 
     def generate(
         self,
@@ -219,12 +224,15 @@ class MatrixGame3Pipeline:
         cond = self.text_encoder([text])
         neg_cond = self.text_encoder([self.config.sample_neg_prompt])
         mx.eval(cond[0], neg_cond[0])
-        # Free T5 memory — it's no longer needed
+        # Free T5 memory, then load DiT and VAE
         del self.text_encoder
         import gc
         gc.collect()
         mx.clear_cache()
         logger.info("T5 encoder released to free memory.")
+
+        self._load_dit()
+        self._load_vae()
 
         # --- Compute latent dimensions ---
         # current_image shape: (1, 1, H, W, C) channels-last
@@ -522,8 +530,8 @@ class MatrixGame3Pipeline:
                         "seq_len": max_seq_len,
                         **conditions_null,
                     }
-                    noise_pred_full = self.model(**model_kwargs)
-                    noise_pred_null = self.model(**model_kwargs_null)
+                    noise_pred_full = self.compiled_model(**model_kwargs)
+                    noise_pred_null = self.compiled_model(**model_kwargs_null)
                     # CFG: null + scale * (full - null)
                     noise_pred_combined = [
                         n + guide_scale * (f - n)
@@ -531,7 +539,7 @@ class MatrixGame3Pipeline:
                     ]
                     noise_pred = noise_pred_combined[0]
                 else:
-                    noise_pred_list = self.model(**model_kwargs)
+                    noise_pred_list = self.compiled_model(**model_kwargs)
                     noise_pred = noise_pred_list[0]
 
                 # noise_pred is channels-last (F, H, W, C) per the model output
