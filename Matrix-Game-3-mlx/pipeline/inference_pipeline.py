@@ -115,16 +115,27 @@ class MatrixGame3Pipeline:
                 quantized_layers.add(k.rsplit(".scales", 1)[0])
         if quantized_layers:
             # Infer bits and group_size from the first quantized layer
+            # by comparing packed weight size with original model Linear size
             first = next(iter(quantized_layers))
             w = clean_weights[f"{first}.weight"]
             s = clean_weights[f"{first}.scales"]
-            if w.dtype == mx.uint32:
-                bits = 4
-                elems_per_word = 8
+            packed_in = w.shape[-1]
+            num_groups = s.shape[-1]
+
+            # Get original input dim from the model's Linear layer
+            from mlx.utils import tree_flatten
+            model_params = dict(tree_flatten(self.model.parameters()))
+            orig_weight = model_params.get(f"{first}.weight")
+            if orig_weight is not None:
+                orig_in = orig_weight.shape[-1]
             else:
-                bits = 8
-                elems_per_word = 4
-            group_size = (w.shape[-1] * elems_per_word) // s.shape[-1]
+                # Fallback: assume group_size=64 and compute
+                orig_in = num_groups * 64
+
+            # bits = 32 / (orig_in / packed_in)
+            elems_per_word = orig_in // packed_in
+            bits = 32 // elems_per_word
+            group_size = orig_in // num_groups
             logger.info(
                 "Detected %d quantized layers (bits=%d, group_size=%d)",
                 len(quantized_layers), bits, group_size,

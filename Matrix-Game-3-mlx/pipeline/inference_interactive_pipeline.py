@@ -180,9 +180,15 @@ class MatrixGame3Pipeline:
             first = next(iter(quantized_layers))
             w = clean_weights[f"{first}.weight"]
             s = clean_weights[f"{first}.scales"]
-            bits = 4 if w.dtype == mx.uint32 else 8
-            elems_per_word = 8 if bits == 4 else 4
-            group_size = (w.shape[-1] * elems_per_word) // s.shape[-1]
+            packed_in = w.shape[-1]
+            num_groups = s.shape[-1]
+            from mlx.utils import tree_flatten
+            model_params = dict(tree_flatten(self.model.parameters()))
+            orig_weight = model_params.get(f"{first}.weight")
+            orig_in = orig_weight.shape[-1] if orig_weight is not None else num_groups * 64
+            elems_per_word = orig_in // packed_in
+            bits = 32 // elems_per_word
+            group_size = orig_in // num_groups
             logger.info("Detected %d quantized layers (bits=%d, group_size=%d)",
                         len(quantized_layers), bits, group_size)
             nn.quantize(
