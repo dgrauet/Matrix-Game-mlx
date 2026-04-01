@@ -266,6 +266,12 @@ class MatrixGame3Pipeline:
         logger.info("Encoding text prompt...")
         cond = self.text_encoder([text])
         neg_cond = self.text_encoder([self.config.sample_neg_prompt])
+        mx.eval(cond[0], neg_cond[0])
+        del self.text_encoder
+        import gc
+        gc.collect()
+        mx.clear_cache()
+        logger.info("T5 encoder released to free memory.")
 
         # --- Compute latent dimensions ---
         h_orig = current_image.shape[2]
