@@ -979,11 +979,13 @@ class WanModel(nn.Module):
             f_p, h_p, w_p = v[0], v[1], v[2]
             total = f_p * h_p * w_p
             u = x[i, :total]
-            # Head output is flattened as (c, pt, ph, pw) per patch — matching Conv3d layout
-            # Reshape to [f_p, h_p, w_p, c, pt, ph, pw]
-            u = u.reshape(f_p, h_p, w_p, c, pt, ph, pw)
-            # Transpose to interleave: [f_p, pt, h_p, ph, w_p, pw, c]
-            u = u.transpose(0, 4, 1, 5, 2, 6, 3)
+            # Head output per patch is (pt * ph * pw * c) = (pt, ph, pw, c) flattened
+            # This matches PyTorch's einsum 'fhwpqrc->cfphqwr' convention
+            # Reshape to [f_p, h_p, w_p, pt, ph, pw, c]
+            u = u.reshape(f_p, h_p, w_p, pt, ph, pw, c)
+            # Transpose to interleave spatial and patch dims:
+            # [f_p, pt, h_p, ph, w_p, pw, c] for channels-last output
+            u = u.transpose(0, 3, 1, 4, 2, 5, 6)
             u = u.reshape(f_p * pt, h_p * ph, w_p * pw, c)
             out.append(u)
         return out
