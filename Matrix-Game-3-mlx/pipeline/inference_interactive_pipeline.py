@@ -177,26 +177,35 @@ class MatrixGame3Pipeline:
             if k.endswith(".scales"):
                 quantized_layers.add(k.rsplit(".scales", 1)[0])
         if quantized_layers:
+            from mlx.utils import tree_flatten
+            from mlx.nn.layers.quantized import QuantizedLinear
+
             first = next(iter(quantized_layers))
             w = clean_weights[f"{first}.weight"]
             s = clean_weights[f"{first}.scales"]
-            packed_in = w.shape[-1]
-            num_groups = s.shape[-1]
-            from mlx.utils import tree_flatten
             model_params = dict(tree_flatten(self.model.parameters()))
-            orig_weight = model_params.get(f"{first}.weight")
-            orig_in = orig_weight.shape[-1] if orig_weight is not None else num_groups * 64
-            elems_per_word = orig_in // packed_in
-            bits = 32 // elems_per_word
-            group_size = orig_in // num_groups
-            logger.info("Detected %d quantized layers (bits=%d, group_size=%d)",
+            orig_in = model_params[f"{first}.weight"].shape[-1]
+            bits = 32 // (orig_in // w.shape[-1])
+            group_size = orig_in // s.shape[-1]
+            logger.info("Quantized weights: %d layers, bits=%d, group_size=%d",
                         len(quantized_layers), bits, group_size)
-            nn.quantize(
-                self.model, bits=bits, group_size=group_size,
-                class_predicate=lambda path, m: (
-                    isinstance(m, nn.Linear) and path in quantized_layers
-                ),
-            )
+
+            for path in quantized_layers:
+                parts = path.split(".")
+                parent = self.model
+                for p in parts[:-1]:
+                    if p.isdigit():
+                        parent = parent[int(p)]
+                    else:
+                        parent = getattr(parent, p)
+                attr = parts[-1]
+                module = getattr(parent, attr)
+                if isinstance(module, nn.Linear) and module.weight.shape[-1] % group_size == 0:
+                    ql = QuantizedLinear(
+                        module.weight.shape[-1], module.weight.shape[0],
+                        bias="bias" in module, group_size=group_size, bits=bits,
+                    )
+                    setattr(parent, attr, ql)
 
         self.model.load_weights(list(clean_weights.items()))
         mx.eval(self.model.parameters())  # materialize weights
