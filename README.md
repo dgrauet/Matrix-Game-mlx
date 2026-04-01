@@ -13,7 +13,7 @@
 
 **Matrix-Game** is a series of open-source world models launched by Skywork AI.
 
-This repository provides the official implementations of Matrix-Game-1.0, Matrix-Game-2.0 and Matrix-Game-3.0
+This repository provides an implementation of Matrix-Game-3.0 for Apple Silicon
 
 https://github.com/user-attachments/assets/f5387c64-1d18-414a-935f-00a1f6eec8de
 
