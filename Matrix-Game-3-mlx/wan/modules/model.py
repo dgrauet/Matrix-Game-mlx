@@ -297,6 +297,10 @@ class WanRMSNorm(nn.Module):
         self.dim = dim
         self.eps = eps
         self.weight = mx.ones(dim)
+        # Set by wan.distributed.tensor_parallel when the surrounding
+        # projection is sharded: the RMS statistic must then be computed
+        # over the full (global) dim, not the local shard.
+        self.tp_group: Optional[mx.distributed.Group] = None
 
     def __call__(self, x: mx.array) -> mx.array:
         """Apply RMS normalization.
@@ -310,6 +314,12 @@ class WanRMSNorm(nn.Module):
         return self._norm(x.astype(mx.float32)).astype(x.dtype) * self.weight
 
     def _norm(self, x: mx.array) -> mx.array:
+        if self.tp_group is not None:
+            # Sharded input: reduce local sums of squares across ranks and
+            # divide by the full dim to recover the global RMS statistic.
+            sum_sq = mx.sum(x * x, axis=-1, keepdims=True)
+            sum_sq = mx.distributed.all_sum(sum_sq, group=self.tp_group)
+            return x * mx.rsqrt(sum_sq / self.dim + self.eps)
         return x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + self.eps)
 
 
@@ -388,6 +398,10 @@ class WanSelfAttention(nn.Module):
         self.o = nn.Linear(dim, dim)
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else None
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else None
+        # Set by wan.distributed.tensor_parallel when heads are sharded:
+        # partial outputs of the (input-sharded) o projection are summed
+        # across ranks.
+        self.tp_group: Optional[mx.distributed.Group] = None
 
     def __call__(
         self,
@@ -489,6 +503,8 @@ class WanSelfAttention(nn.Module):
         x = attention(q=q, k=k, v=v, k_lens=seq_lens)
         x = x.reshape(b, s, -1)
         x = self.o(x)
+        if self.tp_group is not None:
+            x = mx.distributed.all_sum(x, group=self.tp_group)
         return x
 
 
@@ -529,6 +545,8 @@ class WanCrossAttention(WanSelfAttention):
         x = attention(q, k, v, k_lens=context_lens)
         x = x.reshape(b, -1, n * d)
         x = self.o(x)
+        if self.tp_group is not None:
+            x = mx.distributed.all_sum(x, group=self.tp_group)
         return x
 
 
@@ -594,6 +612,11 @@ class WanAttentionBlock(nn.Module):
         self.ffn_linear1 = nn.Linear(dim, ffn_dim)
         self.ffn_linear2 = nn.Linear(ffn_dim, dim)
 
+        # Set by wan.distributed.tensor_parallel when the FFN is sharded:
+        # partial outputs of the (input-sharded) ffn_linear2 are summed
+        # across ranks.
+        self.tp_group: Optional[mx.distributed.Group] = None
+
         self.modulation = mx.random.normal((1, 6, dim)) / (dim ** 0.5)
 
         if use_memory:
@@ -607,6 +630,8 @@ class WanAttentionBlock(nn.Module):
         x = self.ffn_linear1(x)
         x = nn.gelu_approx(x)
         x = self.ffn_linear2(x)
+        if self.tp_group is not None:
+            x = mx.distributed.all_sum(x, group=self.tp_group)
         return x
 
     def __call__(

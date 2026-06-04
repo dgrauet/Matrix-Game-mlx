@@ -68,6 +68,35 @@ python3 generate.py \
   --num_inference_steps 3
 ```
 
+### Distributed inference (experimental, multi-Mac)
+
+The DiT can be sharded across 2+ Macs with head-wise tensor parallelism over
+`mx.distributed` (24 attention heads and the FFN split per rank, combined with
+`all_sum` after each block). Launch with `mlx.launch`:
+
+```bash
+# 2 Macs over Thunderbolt/Ethernet (ring backend)
+mlx.launch --hosts mac1,mac2 --backend ring python generate.py \
+  --prompt "Your prompt" \
+  --image your_image.png \
+  --num_inference_steps 3
+```
+
+Notes:
+
+- The number of ranks must divide 24 (heads) and 14336 (ffn_dim): 2, 4, or 8.
+- On macOS 26.2+ with a direct Thunderbolt cable, use `--backend jaccl`
+  (RDMA, much lower latency than the TCP ring).
+- Requires fp16/bf16 weights — quantized weights cannot be sharded.
+- `--interactive` is not supported distributed.
+- The video is written by rank 0.
+- Communication is ~2 `all_sum` (~77 MB each at 720p) per block per step —
+  a few seconds per clip on Thunderbolt, negligible next to compute. Expect
+  near-linear speedup of the DiT forward pass, which dominates clip time.
+
+This replaces the reference's Ulysses sequence parallelism (`mx.distributed`
+has no `all_to_all` collective); see `Matrix-Game-3-mlx/wan/distributed/`.
+
 ## ⚠️ Performance & Limitations
 
 ### Not real-time
@@ -86,7 +115,7 @@ Typical generation times per 2-second clip (3 denoising steps, distilled model):
 
 1. **Attention is O(n²)**: 13,200 patches at 720p, computed across 24 heads and 30 transformer blocks. NVIDIA GPUs use Flash Attention (custom CUDA kernels) which is significantly faster than MLX's `scaled_dot_product_attention`.
 
-2. **No multi-device parallelism**: The PyTorch reference uses Ulysses sequence parallelism to split patches across multiple GPUs. MLX runs on a single device. Network-based parallelism (e.g., Exo Labs) would be bottlenecked by inter-machine communication at every attention block (30x per denoising step).
+2. **Limited multi-device parallelism**: The PyTorch reference uses Ulysses sequence parallelism across 8 datacenter GPUs linked by NVLink (900 GB/s). The experimental tensor-parallel mode (above) gives near-linear speedup across Macs, but Thunderbolt bandwidth and realistic Mac counts (2–4) keep it far from a 40fps target.
 
 3. **Memory bandwidth**: Even an M5 Ultra (~1.2 TB/s) has ~5x less memory bandwidth than an H100 (3.35 TB/s), and the compute gap is larger.
 

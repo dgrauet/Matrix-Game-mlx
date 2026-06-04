@@ -10,6 +10,7 @@ import mlx.core as mx
 from PIL import Image
 
 from wan.configs import WAN_CONFIGS, MAX_AREA_CONFIGS
+from wan.distributed.util import init_distributed_group
 from utils.misc import set_seed
 
 
@@ -72,10 +73,29 @@ def generate(args):
     """Load the pipeline and generate a video."""
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # Tensor-parallel inference when launched via `mlx.launch` (ring or
+    # jaccl backend); falls back to a singleton group single-device.
+    group = init_distributed_group()
+    rank, world_size = group.rank(), group.size()
+
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.INFO if rank == 0 else logging.WARNING,
         format="[%(asctime)s] %(levelname)s: %(message)s",
         handlers=[logging.StreamHandler(stream=sys.stdout)])
+
+    if world_size > 1:
+        if args.interactive:
+            raise NotImplementedError(
+                "Interactive mode is not supported with distributed "
+                "inference (stdin is only attached to rank 0)."
+            )
+        # All ranks must use identical seeds: rank 0's seed wins (relevant
+        # when --seed -1 drew a random one per process).
+        seed_arr = mx.array([args.seed if rank == 0 else 0])
+        args.seed = int(mx.distributed.all_sum(seed_arr, group=group).item())
+        logging.info(
+            f"Distributed inference: {world_size} ranks (tensor parallel)."
+        )
 
     set_seed(args.seed)
 
@@ -96,6 +116,7 @@ def generate(args):
         config=cfg,
         model_path=args.model_path,
         use_distilled=not args.use_base_model,
+        tp_group=group if world_size > 1 else None,
     )
 
     logging.info("Generating video...")

@@ -139,9 +139,28 @@ Replace patchify `Conv3d(in_dim, dim, patch_size, stride=patch_size)` with
 - Chunk VAE decode along temporal dimension for large sequences
 - No model offloading — unified memory handles everything
 
+## Distributed Inference (Tensor Parallelism)
+
+`wan/distributed/` provides multi-Mac tensor parallelism over `mx.distributed`
+(ring backend over TCP/Thunderbolt, or JACCL RDMA on macOS 26.2+). It deviates
+from the reference's Ulysses sequence parallelism because `mx.distributed` has
+no `all_to_all` collective; head-wise tensor parallelism only needs `all_sum`
+(2 per block) and is communication-cheap relative to compute on Apple Silicon.
+
+- `util.py` — group init + Linear row/col sharding helpers
+- `tensor_parallel.py` — `shard_model()`: q/k/v output-sharded by heads,
+  o input-sharded + all_sum, FFN likewise, norm_q/norm_k use a distributed
+  (global-dim) RMS statistic, per-head RoPE tables sliced per rank
+- Launch: `mlx.launch -n 2 --backend ring python generate.py ...`
+- Quantized weights are NOT supported sharded (packed-weight slicing)
+- Interactive mode is NOT supported distributed (stdin on rank 0 only)
+- Parity test: `tests/test_tensor_parallel.py` runs a real 2-rank comparison
+  on localhost via `mlx.launch` — no second machine needed
+
 ## What NOT to Port
 
-- `wan/distributed/` — no multi-GPU needed on Apple Silicon
+- `wan/distributed/ulysses.py` / `fsdp.py` / `sequence_parallel.py` — replaced
+  by tensor parallelism (see above); FSDP is training-only
 - `wan/triton_kernels.py` — Triton kernels not applicable on Apple Silicon
 - `pipeline/vae_worker.py` — no async multi-GPU VAE
 - `pipeline/inference_interactive_pipeline.py` — now ported (interactive mode)

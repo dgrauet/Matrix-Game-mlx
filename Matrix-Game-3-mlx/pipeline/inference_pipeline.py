@@ -43,6 +43,9 @@ class MatrixGame3Pipeline:
         model_path: Path to directory containing mlx-forge converted weights
             (``dit.safetensors``, ``t5_encoder.safetensors``, ``vae.safetensors``).
         dtype: Model precision (default ``mx.bfloat16``).
+        tp_group: Distributed group for tensor-parallel DiT inference
+            (see ``wan.distributed``). None or a singleton group means
+            single-device inference.
     """
 
     def __init__(
@@ -51,9 +54,14 @@ class MatrixGame3Pipeline:
         model_path: str,
         dtype: mx.Dtype = mx.bfloat16,
         use_distilled: bool = True,
+        tp_group: Optional[mx.distributed.Group] = None,
     ):
         self.config = config
         self.dtype = dtype
+        if tp_group is not None and tp_group.size() == 1:
+            tp_group = None
+        self.tp_group = tp_group
+        self.tp_rank = tp_group.rank() if tp_group is not None else 0
         self.num_train_timesteps = config.num_train_timesteps
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
@@ -113,7 +121,17 @@ class MatrixGame3Pipeline:
         weights = mx.load(self._dit_path)
         clean_weights = {k.replace(self._dit_prefix, "", 1): v for k, v in weights.items()}
         self.model.load_weights(list(clean_weights.items()))
-        mx.eval(self.model.parameters())
+        if self.tp_group is not None:
+            # Shard before mx.eval so each rank only materializes its slice
+            # of the lazily loaded weights (shard_model evals internally).
+            from wan.distributed.tensor_parallel import shard_model
+            shard_model(self.model, self.tp_group)
+            logger.info(
+                "DiT sharded across %d ranks (tensor parallel).",
+                self.tp_group.size(),
+            )
+        else:
+            mx.eval(self.model.parameters())
         logger.info("DiT model loaded (%d layers).", config.num_layers)
 
     def _load_vae(self) -> None:
@@ -169,6 +187,12 @@ class MatrixGame3Pipeline:
 
         if seed == -1:
             seed = int(np.random.randint(0, 2**31))
+        if self.tp_group is not None:
+            # All ranks must sample identical noise: rank 0's seed wins.
+            seed_arr = mx.array([seed if self.tp_rank == 0 else 0])
+            seed = int(
+                mx.distributed.all_sum(seed_arr, group=self.tp_group).item()
+            )
         mx.random.seed(seed)
 
         num_frames = first_clip_frame + (num_iterations - 1) * 40
@@ -453,6 +477,7 @@ class MatrixGame3Pipeline:
             for t in tqdm(
                 timesteps.tolist(),
                 desc=f"Clip {clip_idx + 1}/{num_iterations}",
+                disable=self.tp_rank != 0,
             ):
                 latent_model_input = latents
 
@@ -542,27 +567,28 @@ class MatrixGame3Pipeline:
         # Truncate to actual frame count
         video_np = video_np[:current_end_frame_idx]
 
-        # Save video with overlays
-        os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, f"{save_name}.mp4")
+        # Save video with overlays (rank 0 only in distributed mode)
+        if self.tp_rank == 0:
+            os.makedirs(output_dir, exist_ok=True)
+            output_path = os.path.join(output_dir, f"{save_name}.mp4")
 
-        keyboard_np = np.array(
-            keyboard_condition_all[0, :current_end_frame_idx].astype(mx.float32)
-        )
-        mouse_np = np.array(
-            mouse_condition_all[0, :current_end_frame_idx].astype(mx.float32)
-        )
+            keyboard_np = np.array(
+                keyboard_condition_all[0, :current_end_frame_idx].astype(mx.float32)
+            )
+            mouse_np = np.array(
+                mouse_condition_all[0, :current_end_frame_idx].astype(mx.float32)
+            )
 
-        process_video(
-            video_np,
-            output_path,
-            (keyboard_np, mouse_np),
-            mouse_icon,
-            mouse_scale=0.2,
-            default_frame_res=(height, width),
-        )
-        logger.info(
-            "Saved video with %d frames to %s", len(video_np), output_path
-        )
+            process_video(
+                video_np,
+                output_path,
+                (keyboard_np, mouse_np),
+                mouse_icon,
+                mouse_scale=0.2,
+                default_frame_res=(height, width),
+            )
+            logger.info(
+                "Saved video with %d frames to %s", len(video_np), output_path
+            )
 
         return video_np
