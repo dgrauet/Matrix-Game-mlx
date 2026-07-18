@@ -43,6 +43,21 @@ python3 generate.py \
 
 Use `--use_base_model` for the 50-step base model with classifier-free guidance (higher quality, slower).
 
+### VAE variants
+
+`--vae_type` selects the VAE decoder, mirroring the reference's choices and
+default:
+
+| `--vae_type` | Weights | Decoder | Decode speed | Quality |
+|--------------|---------|---------|--------------|---------|
+| `mg_lightvae_v2` (default) | `vae_lightvae_v2.safetensors` | MG-LightVAE v2, pruned 75% | fastest (~30x vs full) | good |
+| `mg_lightvae` | `vae_lightvae.safetensors` | MG-LightVAE, pruned 50% | fast | better |
+| `wan` | `vae.safetensors` | full Wan2.2 VAE | slow (dominates clip time) | best |
+
+With the LightVAE variants, encoding (image conditioning) still goes through
+the full Wan2.2 VAE "teacher" encoder, exactly like the reference. The VAE
+runs in bfloat16.
+
 ### Interactive mode
 
 ```bash
@@ -103,13 +118,14 @@ has no `all_to_all` collective); see `Matrix-Game-3-mlx/wan/distributed/`.
 
 The original Matrix-Game-3.0 achieves real-time performance (40fps) on NVIDIA A100/H100 GPUs using Flash Attention, multi-GPU parallelism, and Distribution Matching Distillation. **This MLX port does not achieve real-time performance on Apple Silicon.**
 
-Typical generation times per 2-second clip (3 denoising steps, distilled model):
+Typical generation times per 2-second clip (3 denoising steps, distilled
+model, default `mg_lightvae_v2` VAE):
 
 | Machine | Resolution | Time per clip |
 |---------|-----------|--------------|
-| M4 Max 32GB | 480p (960x544) | ~5 min |
+| M4 Max 32GB | 480p (960x544) | ~3 min |
 | M4 Max 32GB | 720p (1280x704) | OOM |
-| M4 Max 64GB+ | 720p (1280x704) | ~15 min |
+| M4 Max 64GB+ | 720p (1280x704) | ~15 min (measured with the full VAE) |
 
 ### Why it can't be real-time on Apple Silicon
 
