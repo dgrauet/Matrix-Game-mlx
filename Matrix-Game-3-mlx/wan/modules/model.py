@@ -403,6 +403,14 @@ class WanSelfAttention(nn.Module):
         # across ranks.
         self.tp_group: Optional[mx.distributed.Group] = None
 
+    @property
+    def _param_dtype(self) -> mx.Dtype:
+        """Dtype the projections compute in (scales dtype when quantized)."""
+        weight = self.q.weight
+        if mx.issubdtype(weight.dtype, mx.floating):
+            return weight.dtype
+        return self.q.scales.dtype
+
     def __call__(
         self,
         x: mx.array,
@@ -429,6 +437,12 @@ class WanSelfAttention(nn.Module):
             Output tensor [B, L, C].
         """
         b, s, n, d = x.shape[0], x.shape[1], self.num_heads, self.head_dim
+
+        # Matmul-boundary cast: the reference runs under torch autocast,
+        # which casts every Linear/attention input to the param dtype. The
+        # residual stream is float32 (time modulation), so without this cast
+        # every projection would upcast the weights to float32.
+        x = x.astype(self._param_dtype)
 
         # Convert grid_sizes to list if needed
         if isinstance(grid_sizes, mx.array):
@@ -500,6 +514,12 @@ class WanSelfAttention(nn.Module):
             q = rope_apply(q, grid_sizes_list, freqs)
             k = rope_apply(k, grid_sizes_list, freqs)
 
+        # rope_apply returns float32 (mirroring the reference); cast back so
+        # attention runs in the param dtype like the reference flash_attention
+        # wrapper's half() cast.
+        q = q.astype(v.dtype)
+        k = k.astype(v.dtype)
+
         x = attention(q=q, k=k, v=v, k_lens=seq_lens)
         x = x.reshape(b, s, -1)
         x = self.o(x)
@@ -529,6 +549,11 @@ class WanCrossAttention(WanSelfAttention):
             Output tensor [B, L1, C].
         """
         b, n, d = x.shape[0], self.num_heads, self.head_dim
+
+        # Matmul-boundary cast, mirroring the reference's explicit
+        # x.to(torch.bfloat16) / context.to(torch.bfloat16) (model.py:500-502).
+        x = x.astype(self._param_dtype)
+        context = context.astype(self._param_dtype)
 
         q = self.q(x)
         if self.norm_q is not None:
@@ -808,8 +833,12 @@ class Head(nn.Module):
         e0 = e_mod[:, :, 0, :]  # shift
         e1 = e_mod[:, :, 1, :]  # scale
 
+        # Modulation runs in float32 (mirroring the reference); cast back to
+        # the param dtype at the matmul boundary like torch autocast does.
         x = self.head(
-            self.norm(x).astype(mx.float32) * (1 + e1) + e0
+            (self.norm(x).astype(mx.float32) * (1 + e1) + e0).astype(
+                self.head.weight.dtype
+            )
         )
         return x
 
