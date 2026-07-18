@@ -52,6 +52,10 @@ def _parse_args():
         "--save_name", type=str, default="generated_video",
         help="Output filename (without extension).")
     parser.add_argument(
+        "--vae_type", type=str, default="mg_lightvae_v2",
+        choices=["wan", "mg_lightvae", "mg_lightvae_v2"],
+        help="VAE type (default: mg_lightvae_v2, like the reference).")
+    parser.add_argument(
         "--use_base_model", action="store_true",
         help="Use base model (50 steps with CFG) instead of distilled.")
     parser.add_argument(
@@ -116,6 +120,7 @@ def generate(args):
         config=cfg,
         model_path=args.model_path,
         use_distilled=not args.use_base_model,
+        vae_type=args.vae_type,
         tp_group=group if world_size > 1 else None,
     )
 

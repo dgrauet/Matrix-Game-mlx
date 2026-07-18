@@ -1086,6 +1086,41 @@ class WanVAE_(nn.Module):
 # Wan2_2_VAE (high-level wrapper)
 # ---------------------------------------------------------------------------
 
+def infer_lightvae_pruning_rate_from_ckpt(
+    vae_pth: Optional[str], full_decoder_conv1_out: int = 1024
+) -> Optional[float]:
+    """Infer LightVAE pruning rate from decoder conv1 out-channels.
+
+    For the Wan2.2 VAE decoder, the full (unpruned) decoder.conv1
+    out-channels is 1024. Mirrors the reference helper, reading mlx-forge
+    converted safetensors instead of a torch checkpoint.
+    """
+    import os
+    if vae_pth is None or not os.path.exists(vae_pth):
+        return None
+    try:
+        weights = mx.load(vae_pth)
+    except Exception as e:
+        logging.warning(f"Failed to load checkpoint for pruning-rate inference: {e}")
+        return None
+
+    weight = None
+    for key, value in weights.items():
+        if key.endswith("decoder.conv1.weight"):
+            weight = value
+            break
+    if weight is None or len(weight.shape) < 1:
+        return None
+
+    student_out = int(weight.shape[0])
+    if full_decoder_conv1_out <= 0:
+        return None
+    pruning_rate = 1.0 - (float(student_out) / float(full_decoder_conv1_out))
+    # keep within reasonable range and stable text representation
+    pruning_rate = max(0.0, min(0.99, pruning_rate))
+    return round(pruning_rate, 6)
+
+
 class Wan2_2_VAE:
     """High-level VAE wrapper with normalization scale.
 
@@ -1120,35 +1155,72 @@ class Wan2_2_VAE:
         dim_mult: List[int] = [1, 2, 4, 4],
         temperal_downsample: List[bool] = [False, True, True],
         dtype: mx.Dtype = mx.float32,
+        vae_type: str = "wan2.2",
+        lightvae_pruning_rate: Optional[float] = None,
+        lightvae_encoder_vae_pth: Optional[str] = None,
     ):
         self.dtype = dtype
         self.z_dim = z_dim
+        self.vae_type = vae_type
+        self.encoder_model: Optional[WanVAE_] = None
 
         mean = mx.array(self.MEAN, dtype=dtype)
         std = mx.array(self.STD, dtype=dtype)
         self.scale = [mean, 1.0 / std]
 
-        # Build model
-        self.model = WanVAE_(
-            dim=c_dim,
-            dec_dim=dec_dim,
-            z_dim=z_dim,
-            dim_mult=dim_mult,
-            num_res_blocks=2,
-            attn_scales=[],
-            temperal_downsample=temperal_downsample,
-            dropout=0.0,
-        )
+        def _build(pruning_rate: float, pth: Optional[str]) -> WanVAE_:
+            model = WanVAE_(
+                dim=c_dim,
+                dec_dim=dec_dim,
+                z_dim=z_dim,
+                dim_mult=dim_mult,
+                num_res_blocks=2,
+                attn_scales=[],
+                temperal_downsample=temperal_downsample,
+                dropout=0.0,
+                pruning_rate=pruning_rate,
+            )
+            if pth is not None:
+                import os
+                if not os.path.exists(pth):
+                    raise FileNotFoundError(f"VAE checkpoint not found at {pth}!")
+                logging.info(f"Loading VAE weights from {pth}")
+                weights = mx.load(pth)
+                # Strip the mlx-forge component prefix ("vae.",
+                # "vae_lightvae.", "vae_lightvae_v2.", ...) and cast floats
+                # to the runtime dtype (mirrors reference .to(dtype)).
+                clean = {}
+                for key, value in weights.items():
+                    head, dot, _rest = key.partition(".")
+                    if dot and head.startswith("vae"):
+                        key = key[len(head) + 1:]
+                    if mx.issubdtype(value.dtype, mx.floating):
+                        value = value.astype(dtype)
+                    clean[key] = value
+                model.load_weights(list(clean.items()))
+            return model
 
-        # Load weights if provided
-        if vae_pth is not None:
-            import os
-            if os.path.exists(vae_pth):
-                logging.info(f"Loading VAE weights from {vae_pth}")
-                weights = mx.load(vae_pth)
-                # Strip component prefix if present (e.g. "vae.encoder..." -> "encoder...")
-                clean = {k.replace("vae.", "", 1): v for k, v in weights.items()}
-                self.model.load_weights(list(clean.items()))
+        if self.vae_type == "wan2.2":
+            self.model = _build(0.0, vae_pth)
+        elif self.vae_type == "mg_lightvae":
+            resolved_pruning_rate = lightvae_pruning_rate
+            if resolved_pruning_rate is None:
+                resolved_pruning_rate = infer_lightvae_pruning_rate_from_ckpt(vae_pth)
+                if resolved_pruning_rate is None:
+                    resolved_pruning_rate = 0.75
+                    logging.warning(
+                        "Unable to infer LightVAE pruning rate from checkpoint; fallback to 0.75."
+                    )
+            logging.info(
+                f"Loading mg_lightvae decoder from {vae_pth} (pruning_rate={resolved_pruning_rate}), "
+                f"while keeping teacher encoder from {lightvae_encoder_vae_pth}."
+            )
+            # Teacher encoder branch (for conditioning latents): standard Wan2.2 VAE.
+            self.encoder_model = _build(0.0, lightvae_encoder_vae_pth)
+            # Student decoder branch (for reconstruction): pruned LightVAE checkpoint.
+            self.model = _build(resolved_pruning_rate, vae_pth)
+        else:
+            raise ValueError(f"Unsupported vae_type: {self.vae_type}")
 
     def encode(self, videos: List[mx.array]) -> List[mx.array]:
         """Encode a list of videos to latent space.
@@ -1156,8 +1228,13 @@ class Wan2_2_VAE:
         Args:
             videos: List of video tensors, each (T, H, W, C).
         """
+        encode_model = (
+            self.encoder_model
+            if self.vae_type == "mg_lightvae" and self.encoder_model is not None
+            else self.model
+        )
         return [
-            self.model.encode(
+            encode_model.encode(
                 mx.expand_dims(v, axis=0).astype(self.dtype),
                 self.scale,
             ).squeeze(0)

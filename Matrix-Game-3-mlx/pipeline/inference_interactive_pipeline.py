@@ -116,6 +116,7 @@ class MatrixGame3Pipeline:
         model_path: str,
         dtype: mx.Dtype = mx.bfloat16,
         use_distilled: bool = True,
+        vae_type: str = "mg_lightvae_v2",
     ):
         self.config = config
         self.dtype = dtype
@@ -171,12 +172,12 @@ class MatrixGame3Pipeline:
         mx.eval(self.model.parameters())
         logger.info("DiT model loaded (%d layers).", config.num_layers)
 
-        # --- VAE ---
-        vae_path = os.path.join(model_path, "vae.safetensors")
-        logger.info("Loading VAE from %s", vae_path)
+        # --- VAE (bfloat16, like the reference vae_config) ---
+        logger.info("Loading VAE (%s) from %s", vae_type, model_path)
         self.vae = load_vae(
-            model_path=vae_path,
-            dtype=mx.float32,
+            model_path=model_path,
+            vae_type=vae_type,
+            dtype=mx.bfloat16,
         )
 
     def generate(
