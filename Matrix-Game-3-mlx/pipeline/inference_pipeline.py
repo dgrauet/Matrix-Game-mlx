@@ -29,7 +29,26 @@ from pipeline.vae_config import load_vae
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["MatrixGame3Pipeline"]
+__all__ = ["MatrixGame3Pipeline", "load_dit_weights"]
+
+
+def load_dit_weights(
+    model, checkpoint_path: str, prefix: str, dtype: mx.Dtype
+) -> None:
+    """Load DiT weights, stripping ``prefix`` and casting floats to ``dtype``.
+
+    The official distilled checkpoint is distributed in float32; the PyTorch
+    reference casts the model to bfloat16 at load time (``model.to(dtype)``).
+    Casting the lazily-loaded weights before ``load_weights`` mirrors that
+    without ever materializing the float32 copy.
+    """
+    weights = mx.load(checkpoint_path)
+    clean_weights = {}
+    for key, value in weights.items():
+        if mx.issubdtype(value.dtype, mx.floating):
+            value = value.astype(dtype)
+        clean_weights[key.replace(prefix, "", 1)] = value
+    model.load_weights(list(clean_weights.items()))
 
 
 class MatrixGame3Pipeline:
@@ -118,9 +137,9 @@ class MatrixGame3Pipeline:
             use_memory=getattr(config, "use_memory", True),
             sigma_theta=getattr(config, "sigma_theta", 0.0),
         )
-        weights = mx.load(self._dit_path)
-        clean_weights = {k.replace(self._dit_prefix, "", 1): v for k, v in weights.items()}
-        self.model.load_weights(list(clean_weights.items()))
+        load_dit_weights(
+            self.model, self._dit_path, self._dit_prefix, self.dtype
+        )
         if self.tp_group is not None:
             # Shard before mx.eval so each rank only materializes its slice
             # of the lazily loaded weights (shard_model evals internally).

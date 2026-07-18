@@ -34,6 +34,7 @@ from utils.utils import (
     get_extrinsics,
 )
 from utils.visualize import process_video
+from pipeline.inference_pipeline import load_dit_weights
 from pipeline.vae_config import load_vae
 
 logger = logging.getLogger(__name__)
@@ -164,11 +165,9 @@ class MatrixGame3Pipeline:
             use_memory=getattr(config, "use_memory", True),
             sigma_theta=getattr(config, "sigma_theta", 0.0),
         )
-        weights = mx.load(dit_path)
         # Strip component prefix if present (dit. or dit_distilled.)
         prefix = "dit_distilled." if use_distilled else "dit."
-        clean_weights = {k.replace(prefix, "", 1): v for k, v in weights.items()}
-        self.model.load_weights(list(clean_weights.items()))
+        load_dit_weights(self.model, dit_path, prefix, self.dtype)
         mx.eval(self.model.parameters())
         logger.info("DiT model loaded (%d layers).", config.num_layers)
 
