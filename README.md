@@ -123,8 +123,8 @@ model, default `mg_lightvae_v2` VAE):
 
 | Machine | Resolution | Time per clip |
 |---------|-----------|--------------|
-| M4 Max 32GB | 480p (960x544) | ~3 min |
-| M4 Max 32GB | 720p (1280x704) | ~7 min (used to OOM before the bf16/LightVAE fixes) |
+| M2 Pro 32GB | 480p (960x544) | ~3 min |
+| M2 Pro 32GB | 720p (1280x704) | ~7 min (used to OOM before the bf16/LightVAE fixes) |
 | M4 Max 64GB+ | 720p (1280x704) | ~15 min (measured with the full VAE) |
 
 ### Why it can't be real-time on Apple Silicon
