@@ -9,6 +9,28 @@ import mlx.core as mx
 
 __all__ = ['attention']
 
+# The PyTorch reference uses flash-attention varlen (cu_seqlens packing) and
+# never materializes a mask; this port has to build a [B, 1, 1, Lk] boolean
+# mask instead. seq_lens is constant across the ~30 layers of a forward, so
+# memoize the mask by value instead of rebuilding it at every attention call.
+# k_lens is tiny ([B]) and host-initialized — tolist() is cheap.
+_MASK_CACHE: dict = {}
+_MASK_CACHE_MAX = 8
+
+
+def _k_lens_mask(b: int, lk: int, k_lens: mx.array) -> mx.array:
+    """Cached [B, 1, 1, Lk] padding mask: position < k_lens[b]."""
+    k_lens_arr = mx.array(k_lens) if not isinstance(k_lens, mx.array) else k_lens
+    key = (b, lk, tuple(int(x) for x in k_lens_arr.tolist()))
+    mask = _MASK_CACHE.get(key)
+    if mask is None:
+        k_pos = mx.arange(lk).reshape(1, 1, 1, lk)
+        mask = k_pos < k_lens_arr.reshape(b, 1, 1, 1)
+        if len(_MASK_CACHE) >= _MASK_CACHE_MAX:
+            _MASK_CACHE.clear()
+        _MASK_CACHE[key] = mask
+    return mask
+
 
 def attention(
     q: mx.array,
@@ -75,11 +97,7 @@ def attention(
     elif causal:
         mask = "causal"
     elif k_lens is not None:
-        b = q.shape[0]
-        lk = k.shape[2]
-        k_pos = mx.arange(lk).reshape(1, 1, 1, lk)
-        k_lens_arr = mx.array(k_lens) if not isinstance(k_lens, mx.array) else k_lens
-        mask = k_pos < k_lens_arr.reshape(b, 1, 1, 1)  # [B, 1, 1, Lk]
+        mask = _k_lens_mask(q.shape[0], k.shape[2], k_lens)  # [B, 1, 1, Lk]
 
     # Call MLX SDPA
     out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
