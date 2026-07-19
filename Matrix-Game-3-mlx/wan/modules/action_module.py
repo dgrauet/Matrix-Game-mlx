@@ -14,6 +14,63 @@ from .posemb_layers import apply_rotary_emb, get_nd_rotary_pos_embed
 
 __all__ = ["ActionModule"]
 
+_INDEX_TABLE_CACHE: dict = {}
+
+# get_rotary_pos_embed is a pure table of its arguments + instance config;
+# rebuilt at every DiT block call it accounted for ~7.4k fp32 copy dispatches
+# per denoise step (smeltr session mg3-localize-2). Config-keyed value cache:
+# same values, same objects — bit-identical.
+_ROPE_TABLE_CACHE: dict = {}
+
+
+def _window_index_table(n_feats: int, ratio: int, windows_size: int) -> mx.array:
+    """Cached [N_feats, ratio*windows_size] gather indices into the padded
+    condition: row i = range(ratio*(i - windows_size) + pad_t, ratio*i + pad_t)
+    with pad_t = ratio*windows_size. Mirrors the reference sliding window."""
+    key = (n_feats, ratio, windows_size)
+    table = _INDEX_TABLE_CACHE.get(key)
+    if table is None:
+        pad_t = ratio * windows_size
+        rows = [
+            list(range(ratio * (i - windows_size) + pad_t, i * ratio + pad_t))
+            for i in range(n_feats)
+        ]
+        table = mx.array(rows, dtype=mx.int32)
+        if len(_INDEX_TABLE_CACHE) >= 8:
+            _INDEX_TABLE_CACHE.clear()
+        _INDEX_TABLE_CACHE[key] = table
+    return table
+
+
+def _expand_spatial(g: mx.array, s: int) -> mx.array:
+    """[B, T, W, D] -> [B*S, T, W*D], value-identical to the reference
+    broadcast(S last) + 5-D transpose + reshape chain, but with S expanded
+    as a leading-adjacent axis: the materialization is a contiguous
+    replication (one large copy) instead of ~T*W strided 1-D copies per
+    call (the dominant share of ~99k gg1_copyfloat32float32 dispatches per
+    standard run — smeltr sessions mg3-copies-gather / bisect2-*)."""
+    b, t, w, d = g.shape
+    g = mx.broadcast_to(mx.expand_dims(g, 1), (b, s, t, w, d))
+    return g.reshape(b * s, t, w * d)
+
+
+def _tile_batch(x: mx.array, s: int) -> mx.array:
+    """[B, ...] -> [S*B, ...], value-identical to mx.concatenate([x]*S,
+    axis=0) (s-major row order) without an S-input concatenate per call."""
+    tiled = mx.broadcast_to(mx.expand_dims(x, 0), (s, *x.shape))
+    return tiled.reshape(s * x.shape[0], *x.shape[1:])
+
+
+def _group_windows(cond: mx.array, n_feats: int, ratio: int, windows_size: int) -> mx.array:
+    """[B, T_padded, C] -> [B, N_feats, ratio*windows_size, C].
+
+    Single-gather replacement for the reference loop of strided slices +
+    mx.stack (2 x N_feats small copies per DiT block per step, ~99k
+    dispatches on a standard run). Same elements, same order, no
+    arithmetic — bit-identical output.
+    """
+    return mx.take(cond, _window_index_table(n_feats, ratio, windows_size), axis=1)
+
 
 class ActionModule(nn.Module):
     """Action module from https://arxiv.org/pdf/2501.08325.
@@ -212,15 +269,28 @@ class ActionModule(nn.Module):
             "sum(rope_dim_list) should equal to head_dim of attention layer"
         )
 
-        freqs_cos, freqs_sin = get_nd_rotary_pos_embed(
-            rope_dim_list,
-            rope_sizes,
-            theta=self.rope_theta,
-            use_real=True,
-            theta_rescale_factor=1,
+        key = (
+            tuple(rope_dim_list),
+            tuple(rope_sizes),
+            self.rope_theta,
+            video_length,
+            self.patch_size[0] if isinstance(self.patch_size, list) else self.patch_size,
         )
-        cutoff = video_length * rope_sizes[1] * rope_sizes[2] // self.patch_size[0]
-        return freqs_cos[-cutoff:], freqs_sin[-cutoff:]
+        cached = _ROPE_TABLE_CACHE.get(key)
+        if cached is None:
+            freqs_cos, freqs_sin = get_nd_rotary_pos_embed(
+                rope_dim_list,
+                rope_sizes,
+                theta=self.rope_theta,
+                use_real=True,
+                theta_rescale_factor=1,
+            )
+            cutoff = video_length * rope_sizes[1] * rope_sizes[2] // self.patch_size[0]
+            cached = (freqs_cos[-cutoff:], freqs_sin[-cutoff:])
+            if len(_ROPE_TABLE_CACHE) >= 8:
+                _ROPE_TABLE_CACHE.clear()
+            _ROPE_TABLE_CACHE[key] = cached
+        return cached
 
     def __call__(
         self,
@@ -285,13 +355,10 @@ class ActionModule(nn.Module):
                 pad = mx.broadcast_to(mouse_condition[:, 0:1, :], (B, pad_t - 4, C_m))
                 mouse_condition = mx.concatenate([pad, mouse_condition], axis=1)
 
-            # Group mouse conditions per temporal block
-            group_mouse_list = []
-            for i in range(N_feats):
-                start_idx = self.vae_time_compression_ratio * (i - self.windows_size) + pad_t
-                end_idx = i * self.vae_time_compression_ratio + pad_t
-                group_mouse_list.append(mouse_condition[:, start_idx:end_idx, :])
-            group_mouse = mx.stack(group_mouse_list, axis=1)  # [B, N_feats, window, D]
+            # Group mouse conditions per temporal block (single gather)
+            group_mouse = _group_windows(
+                mouse_condition, N_feats, self.vae_time_compression_ratio, self.windows_size
+            )  # [B, N_feats, window, D]
 
             if mouse_cond_memory is not None:
                 memory_length = mouse_cond_memory.shape[1]
@@ -302,16 +369,9 @@ class ActionModule(nn.Module):
                 )
                 group_mouse = mx.concatenate([mouse_cond_memory, group_mouse], axis=1)
 
-            # [B, T, window, D] -> [B, T, window, D, 1] -> [B, T, window, D, S]
-            group_mouse = mx.broadcast_to(
-                mx.expand_dims(group_mouse, -1),
-                (*group_mouse.shape, S),
-            )
-
-            # rearrange('b t window d s -> (b s) t (window d)')
-            # [B, T, window, D, S] -> [B, S, T, window, D] -> [B*S, T, window*D]
-            group_mouse = group_mouse.transpose(0, 4, 1, 2, 3)
-            group_mouse = group_mouse.reshape(B * S, group_mouse.shape[2], -1)
+            # rearrange('b t window d -> (b s) t (window d)') with S replicas —
+            # contiguous expand, value-identical to broadcast-last + transpose.
+            group_mouse = _expand_spatial(group_mouse, S)
 
             # Concatenate with hidden states and pass through MLP
             group_mouse = mx.concatenate([hidden_states, group_mouse], axis=-1)
@@ -406,12 +466,10 @@ class ActionModule(nn.Module):
 
             keyboard_condition = self._keyboard_embed(keyboard_condition)
 
-            group_keyboard_list = []
-            for i in range(N_feats):
-                start_idx = self.vae_time_compression_ratio * (i - self.windows_size) + pad_t
-                end_idx = i * self.vae_time_compression_ratio + pad_t
-                group_keyboard_list.append(keyboard_condition[:, start_idx:end_idx, :])
-            group_keyboard = mx.stack(group_keyboard_list, axis=1)  # [B, N_feats, window, D]
+            # Group keyboard conditions per temporal block (single gather)
+            group_keyboard = _group_windows(
+                keyboard_condition, N_feats, self.vae_time_compression_ratio, self.windows_size
+            )  # [B, N_feats, window, D]
 
             if keyboard_cond_memory is not None:
                 memory_length = keyboard_cond_memory.shape[1]
@@ -487,9 +545,9 @@ class ActionModule(nn.Module):
                 qq, kk = apply_rotary_emb(q, k, (freqs_cos, freqs_sin), head_first=False)
                 q, k = qq, kk
 
-            # Repeat k, v for each spatial position: [B, L, H, D] -> [B*S, L, H, D]
-            k = mx.concatenate([k] * S, axis=0)
-            v = mx.concatenate([v] * S, axis=0)
+            # Repeat k, v for each spatial position: [B, L, H, D] -> [S*B, L, H, D]
+            k = _tile_batch(k, S)
+            v = _tile_batch(v, S)
 
             # Attention
             scale = 1.0 / math.sqrt(q.shape[-1])
