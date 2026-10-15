@@ -3,8 +3,9 @@
 Run manually from Matrix-Game-4-mlx/ (not collected by pytest):
     MATRIX_GAME_4_MLX_WEIGHTS_DIR=... python -m tests.parity.gen_fixtures --device auto [--long]
 
-Writes `$MG4_FIXTURES_DIR/egypt_quality/`: inputs.npz, chunk_{i}.npz, floor_chunk_{i}.npz, meta.json
-(and long_*.npz with --long). `--floor-only` regenerates only the floor files from the saved inputs.
+Writes `$MG4_FIXTURES_DIR/egypt_quality/`: inputs.npz, chunk_{i}.npz, floor_chunk_{i}.npz, calls_chunk{i}.npz,
+meta.json (and long_*.npz plus calls_long22.npz with --long). `--floor-only` / `--calls-only` regenerate only the
+floor / per-call files from the saved fixtures.
 """
 import argparse
 import contextlib
@@ -29,6 +30,8 @@ UPSTREAM_COMMIT = "5446525"
 LATENT_SHAPE = (1, 1, 48, 30, 54)
 STEPS = (1000, 500)
 PAN_STEP = 8
+LONG_CALL_CHUNK = 22    # position 23 > 21-frame window: rolling eviction and fixed-sink re-RoPE run
+KV_LAYERS = (0, 29)
 
 
 def log(msg: str) -> None:
@@ -110,12 +113,13 @@ def injected_renoise(torch, tensors):
 
 
 @contextlib.contextmanager
-def cpu_bf16_emulation(torch, sdpa: bool = True):
+def cpu_bf16_emulation(torch, sdpa: bool = True, acc=None):
     """Run CPU bf16 GEMM/conv/attention in fp32 and round the output to bf16 (fp32-accumulate kernel semantics).
 
     Native CPU bf16 kernels run at ~1 GFLOPS on Apple Silicon (a 5B forward would take ~1 h); every other op,
     including the float64 RoPE / timestep / x0 islands, runs unchanged. MPS and fp32 calls are untouched.
-    `sdpa=False` keeps the native bf16 SDPA kernel (torch-vs-torch floor variant).
+    `sdpa=False` keeps the native bf16 SDPA kernel and `acc=torch.float64` accumulates in float64 (torch-vs-torch
+    floor variants).
     """
     F = torch.nn.functional
     names = ("linear", "conv1d", "conv2d", "conv3d") + (("scaled_dot_product_attention",) if sdpa else ())
@@ -126,7 +130,7 @@ def cpu_bf16_emulation(torch, sdpa: bool = True):
             if not any(torch.is_tensor(a) and a.dtype == torch.bfloat16 and a.device.type == "cpu"
                        for a in (*args, *kw.values())):
                 return fn(*args, **kw)
-            cast = lambda a: a.float() if torch.is_tensor(a) and a.dtype == torch.bfloat16 else a  # noqa: E731
+            cast = lambda a: a.to(acc or torch.float32) if torch.is_tensor(a) and a.dtype == torch.bfloat16 else a  # noqa: E731
             return fn(*map(cast, args), **{k: cast(v) for k, v in kw.items()}).to(torch.bfloat16)
         return call
 
@@ -288,6 +292,194 @@ def run_chunks(torch, stream, pixels, noises, renoises, n_chunks, on_chunk):
     return recorder.seconds
 
 
+def from_bits(u: np.ndarray) -> np.ndarray:
+    """uint16 bf16 payload (bf16_bits) -> float32, exactly."""
+    return (u.astype(np.uint32) << 16).view(np.float32)
+
+
+def written_slot(a: np.ndarray, tokens: int = 405) -> np.ndarray:
+    """The latent frame a generator call writes: the last `tokens` rows of a cache's filled part [B, n, H, D]."""
+    return a[:, -tokens:]
+
+
+def bf16_bits(t) -> np.ndarray:
+    """Exact bf16 payload of a torch tensor as uint16 (decoded by from_bits); a copy, never a view of a live cache."""
+    import torch
+    return t.detach().to("cpu", torch.bfloat16).contiguous().view(torch.int16).numpy().view(np.uint16).copy()
+
+
+def kv_state(kv) -> dict:
+    """All-layer KV cache state (filled part, k_sink_raw, end indices) as stored in the per-call fixtures."""
+    state = {}
+    for i, c in enumerate(kv):
+        n = int(c["local_end_index"].item())
+        state.update({f"state_k{i}": bf16_bits(c["k"][:, :n]), f"state_v{i}": bf16_bits(c["v"][:, :n]),
+                      f"state_ksr{i}": bf16_bits(c["k_sink_raw"]),
+                      f"state_gei{i}": np.array(int(c["global_end_index"].item())), f"state_lei{i}": np.array(n)})
+    return state
+
+
+def load_kv_state(torch, gen, state: dict):
+    """Fresh upstream caches filled from a stored KV state (inverse of kv_state)."""
+    from matrix_game.inference.wrappers import init_crossattn_cache, init_kv_cache
+    bits = lambda u: torch.from_numpy(u.view(np.int16)).view(torch.bfloat16)  # noqa: E731
+    kv = init_kv_cache(gen, 1, 21 * 405, torch.bfloat16, "cpu")
+    for i, c in enumerate(kv):
+        n = int(state[f"state_lei{i}"])
+        c["k"][:, :n], c["v"][:, :n] = bits(state[f"state_k{i}"]), bits(state[f"state_v{i}"])
+        c["k_sink_raw"] = bits(state[f"state_ksr{i}"]).clone()
+        c["global_end_index"].fill_(int(state[f"state_gei{i}"]))
+        c["local_end_index"].fill_(n)
+    return kv, init_crossattn_cache(gen, 1, torch.bfloat16, "cpu")
+
+
+class CallRecorder:
+    """Wrap the upstream generator: record each call's inputs, pred_x0 and the layer 0/29 KV after the call."""
+
+    def __init__(self, gen, kv):
+        self.gen, self.kv, self.calls = gen, kv, []
+
+    def __call__(self, **kw):
+        out = self.gen(**kw)
+        call = dict(x=bf16_bits(kw["noisy_image_or_video"]), t=kw["timestep"].float().cpu().numpy(),
+                    start=np.array(kw["current_start"]), drop=np.array(bool(kw.get("drop_control"))),
+                    pred=bf16_bits(out[1]))
+        for layer in KV_LAYERS:
+            c = self.kv[layer]
+            n = int(c["local_end_index"].item())
+            call.update({f"k{layer}": bf16_bits(c["k"][:, :n]), f"v{layer}": bf16_bits(c["v"][:, :n])})
+        self.calls.append(call)
+        return out
+
+    def parameters(self):
+        return self.gen.parameters()
+
+
+def record_push(torch, stream, pixels, frame_start, noise, renoise):
+    """One upstream push with every generator call recorded; returns (chunk, state before, control, calls)."""
+    state = kv_state(stream.kv)
+    real, recorder = stream.gen, CallRecorder(stream.gen, stream.kv)
+    stream.gen = recorder
+    try:
+        with injected_renoise(torch, [torch.from_numpy(renoise)]) as left:
+            chunk = stream.push(torch.from_numpy(pixels), frame_start=frame_start, initial_noise=torch.from_numpy(noise))
+    finally:
+        stream.gen = real
+    if left:
+        raise RuntimeError("Prepared renoise tensor was not consumed by the upstream stream")
+    return chunk, state, bf16_bits(chunk.control), recorder.calls
+
+
+def save_calls(path: Path, state: dict, control: np.ndarray, calls: list) -> None:
+    np.savez(path, control=control, n_calls=np.array(len(calls)), **state,
+             **{f"c{j}_{k}": v for j, call in enumerate(calls) for k, v in call.items()})
+
+
+def call_floor(torch, gen, prompt, fixture) -> list:
+    """Torch-vs-torch floor per call: rel L2 of pred and of the layer 0/29 KV slot it writes, for two other kernels."""
+    variants = {"native_sdpa": lambda: cpu_bf16_emulation(torch, sdpa=False), "native_cpu_bf16": contextlib.nullcontext,
+                "fp64_acc": lambda: cpu_bf16_emulation(torch, acc=torch.float64)}
+    out = []
+    for j in range(int(fixture["n_calls"])):
+        row = {}
+        for name, ctx in variants.items():
+            kv, xc = load_kv_state(torch, gen, fixture)
+            with ctx():
+                _, pred = gen(noisy_image_or_video=torch.from_numpy(from_bits(fixture[f"c{j}_x"])).to(torch.bfloat16),
+                              conditional_dict={"prompt_embeds": prompt,
+                                                "control_latent": torch.from_numpy(from_bits(fixture["control"])).to(torch.bfloat16)},
+                              timestep=torch.from_numpy(fixture[f"c{j}_t"]), kv_cache=kv, crossattn_cache=xc,
+                              current_start=int(fixture[f"c{j}_start"]), drop_control=bool(fixture[f"c{j}_drop"]),
+                              sink_rope_mode="fixed")
+            row[f"{name}_pred"] = rel_l2(pred, from_bits(fixture[f"c{j}_pred"]))
+            for layer in KV_LAYERS:
+                for kind in ("k", "v"):
+                    got = bf16_bits(kv[layer][kind][:, :int(kv[layer]["local_end_index"].item())])
+                    row[f"{name}_{kind}{layer}"] = rel_l2(*(from_bits(written_slot(a)) for a in (got, fixture[f"c{j}_{kind}{layer}"])))
+        out.append(row)
+    return out
+
+
+def call_fixtures(out: Path) -> None:
+    """Per-call fixtures: torch state at each chunk boundary (chunks 0-2 and long chunk LONG_CALL_CHUNK), every
+    generator call's inputs and outputs, and the torch kernel-variant floor of each call (meta.json)."""
+    import types
+    import torch
+    from huggingface_hub import hf_hub_download
+    from matrix_game.inference.wrappers import WanVAE22Wrapper
+    torch.set_grad_enabled(False)
+    meta = json.loads((out / "meta.json").read_text())
+    inputs = np.load(out / "inputs.npz")
+    t0 = time.perf_counter()
+    vae = WanVAE22Wrapper(vae_path=hf_hub_download(VAE_REPO, VAE_FILE, revision=VAE_REVISION)).eval()
+    vae = vae.requires_grad_(False).to(meta["device_vae"], torch.bfloat16)
+    sink = torch.from_numpy(inputs["sink_latent"])
+    names = []
+    with cpu_bf16_emulation(torch):
+        stream, _ = load_stream(torch, meta["device_dit"], vae, inputs["prompt_embeds"], sink)
+        for i, (a, b) in enumerate(chunk_slices(meta["chunks"])):
+            chunk, state, control, calls = record_push(torch, stream, inputs[f"pixels_{i}"], a,
+                                                       inputs[f"initial_noise_{i}"], inputs[f"renoise_{i}"])
+            if not np.array_equal(to_np(chunk.latent), np.load(out / f"chunk_{i}.npz")["pred"]):
+                raise RuntimeError(f"Recorded chunk {i} does not reproduce the fixture bitwise")
+            save_calls(out / f"calls_chunk{i}.npz", state, control, calls)
+            names.append(f"calls_chunk{i}")
+            log(f"per-call fixture chunk {i}: {len(calls)} calls")
+        if (out / "long_inputs.npz").exists():
+            # The KV state at a chunk boundary only depends on the sink priming and each chunk's clean pass (the
+            # denoising writes land in the slot that pass overwrites), so replaying the stored long preds through
+            # the clean pass rebuilds it; the encoder cache advances on the same pixels.
+            long_inputs = np.load(out / "long_inputs.npz")
+            stream = make_stream(stream.gen, vae, stream.prompt, sink)
+            for i, (a, b) in enumerate(chunk_slices(LONG_CALL_CHUNK)):
+                stream_encode(torch, vae, long_inputs[f"pixels_{i}"], stream.encoder_features)
+                pred = torch.from_numpy(np.load(out / f"long_chunk_{i}.npz")["pred"]).to(stream.dtype)
+                stream.gen(noisy_image_or_video=pred, conditional_dict={"prompt_embeds": stream.prompt},
+                           timestep=torch.zeros(1, 1), drop_control=True, kv_cache=stream.kv, crossattn_cache=stream.xc,
+                           current_start=(i + stream.sink_offset) * stream.fsl, sink_rope_mode=stream.sink_rope_mode)
+                stream.index, stream.frame = i + 1, b
+            stream.decoder = types.SimpleNamespace(push=lambda z: torch.zeros(4, 3, 480, 864))   # not under test
+            i = LONG_CALL_CHUNK
+            chunk, state, control, calls = record_push(torch, stream, long_inputs[f"pixels_{i}"], stream.frame,
+                                                       long_inputs[f"initial_noise_{i}"], long_inputs[f"renoise_{i}"])
+            if not np.array_equal(to_np(chunk.latent), np.load(out / f"long_chunk_{i}.npz")["pred"]):
+                raise RuntimeError(f"Rebuilt long state does not reproduce long chunk {i} bitwise")
+            save_calls(out / f"calls_long{i}.npz", state, control, calls)
+            names.append(f"calls_long{i}")
+            log(f"per-call fixture long chunk {i}: {len(calls)} calls")
+    log(f"per-call fixtures recorded in {time.perf_counter() - t0:.0f}s")
+    call_floors(out, stream.gen, stream.prompt, names)
+
+
+def call_floors(out: Path, gen=None, prompt=None, names=None) -> None:
+    """Torch kernel-variant floor of every per-call fixture, written to meta.json["call_floors"]."""
+    import torch
+    torch.set_grad_enabled(False)
+    meta = json.loads((out / "meta.json").read_text())
+    if gen is None:
+        from matrix_game.inference.loading import build_dit
+        from matrix_game.inference.rollout import set_attention_window
+        ensure_accelerate(torch)                     # after upstream imports (transformers probes accelerate)
+        gen = build_dit(str(CONFIG_DIR), str(CHECKPOINT), is_causal=True, dtype="bfloat16", timestep_shift=5)
+        gen = gen.eval().requires_grad_(False)
+        set_attention_window(gen, 21, 1)
+        gen.model.set_rope_max_len(8192)
+        prompt = torch.from_numpy(np.load(out / "inputs.npz")["prompt_embeds"]).to(torch.bfloat16)
+        names = sorted(p.stem for p in out.glob("calls_*.npz"))
+    t0 = time.perf_counter()
+    floors = {}
+    for name in names:
+        floors[name] = call_floor(torch, gen, prompt, np.load(out / f"{name}.npz"))
+        log(f"floor {name}: {floors[name]}")
+    meta["call_floors"] = dict(
+        variants="native_sdpa: cpu_bf16_emulation(sdpa=False); native_cpu_bf16: no emulation; "
+                 "fp64_acc: cpu_bf16_emulation(acc=float64); same injected state",
+        metric="rel L2 vs the fixture call (pred, and the KV slot written at layers 0/29)", calls=floors,
+        seconds=time.perf_counter() - t0)
+    (out / "meta.json").write_text(json.dumps(meta, indent=2))
+    log(f"per-call floors done in {meta['call_floors']['seconds']:.0f}s")
+
+
 def torch_reference(args, out: Path, meta: dict, prompt, pixels, noises, renoises):
     """Upstream CastleStream on the chosen devices; writes inputs.npz and chunk_*.npz, returns the sink latent."""
     import torch
@@ -413,9 +605,19 @@ def main(argv=None):
     parser.add_argument("--long", action="store_true", help="Also run 25 chunks (pred and decoded only)")
     parser.add_argument("--floor-only", action="store_true",
                         help="Only (re)generate floor_chunk_*.npz from the existing inputs.npz and meta.json")
+    parser.add_argument("--calls-only", action="store_true",
+                        help="Only (re)generate the per-call fixtures calls_*.npz from the existing fixtures")
+    parser.add_argument("--call-floors-only", action="store_true",
+                        help="Only (re)measure the torch kernel-variant floor of the existing per-call fixtures")
     args = parser.parse_args(argv)
     if args.floor_only:
         floor_reference(fixtures_dir() / "egypt_quality")
+        return
+    if args.calls_only:
+        call_fixtures(fixtures_dir() / "egypt_quality")
+        return
+    if args.call_floors_only:
+        call_floors(fixtures_dir() / "egypt_quality")
         return
     out = fixtures_dir() / "egypt_quality"
     out.mkdir(parents=True, exist_ok=True)
@@ -443,6 +645,7 @@ def main(argv=None):
     (out / "meta.json").write_text(json.dumps(meta, indent=2))
     log(f"done in {meta['total_seconds']:.0f}s: {out}")
     floor_reference(out)
+    call_fixtures(out)
 
 
 if __name__ == "__main__":
