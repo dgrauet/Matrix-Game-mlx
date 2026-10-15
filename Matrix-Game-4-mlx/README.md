@@ -8,7 +8,7 @@ using the quality preset, with the ancient-egypt style supported first.
 
 | Milestone | Scope | Status |
 | --- | --- | --- |
-| M1 | ancient-egypt, quality preset (Wan VAE, steps `1000,500`), offline CLI, real-weight parity | Done; the render of a recorded game take is pending |
+| M1 | ancient-egypt, quality preset (Wan VAE, steps `1000,500`), offline CLI, real-weight parity | Implemented and parity-validated; acceptance render of a recorded take pending |
 | M2 | castle and racing (first-frame sink, absolute RoPE, racing RNG role), fixtures for both | Next |
 | M3 | realtime preset: TAEHV encode/decode (`taehv.py`), one-step schedule | Next |
 
@@ -17,7 +17,7 @@ using the quality preset, with the ancient-egypt style supported first.
 ```bash
 cd Matrix-Game-4-mlx
 pip install -e .
-export MATRIX_GAME_4_MLX_WEIGHTS_DIR=/path/to/matrix-game-4.0-mlx   # optional, see Weights
+export MATRIX_GAME_4_MLX_WEIGHTS_DIR=/path/to/matrix-game-4.0-mlx   # required, see Weights
 python -m matrix_game_mlx.inference.offline --scene ancient-egypt --input lowpoly.mp4 --output output/egypt
 ```
 
@@ -35,9 +35,10 @@ scene's sink image), `--preset quality` (the only preset in M1).
 
 ## Weights
 
-Converted weights are published as `dgrauet/matrix-game-4.0-mlx` (produced by
-[mlx-forge](https://github.com/dgrauet/mlx-forge)) and downloaded on first run. To use a local copy, point
-`MATRIX_GAME_4_MLX_WEIGHTS_DIR` at the pack directory. Tests marked `needs_weights` are skipped when it is unset.
+The weight pack is produced by the [mlx-forge](https://github.com/dgrauet/mlx-forge) conversion of
+`Skywork/Matrix-Game-4.0`. Its publication on the Hub as `dgrauet/matrix-game-4.0-mlx` is planned; until then,
+set `MATRIX_GAME_4_MLX_WEIGHTS_DIR` to the local pack directory (required). Tests marked `needs_weights` are
+skipped when it is unset.
 
 ```text
 matrix-game-4.0-mlx/
@@ -46,6 +47,7 @@ matrix-game-4.0-mlx/
   dit_ancient_egypt.safetensors  # also dit_castle, dit_racing
   taehv.safetensors              # realtime codec (M3)
   fps-egypt/                     # inference.json, sink.png (also fps-castle, driving_game)
+  licenses/                      # third-party licenses (TAEHV)
 ```
 
 The umT5 encoder, the Wan 2.2 VAE and the `google/umt5-xxl` tokenizer are the same files as Matrix-Game 3.0.
@@ -62,15 +64,15 @@ so it includes video decode, VAE encode/decode and MP4 encoding.
 
 | Run | Frames | Chunks | seconds | s/chunk | Peak memory |
 | --- | --- | --- | --- | --- | --- |
-| Before the float64 islands (fp32 RoPE and x0) | 6 | 3 | 77.5 | 25.8 | 23.9 GB |
-| Current (float64 islands on the CPU stream) | 6 | 3 | 73.6 | 24.5 | 24.4 GB |
+| Before Task 15 numeric fixes (float64 islands, fused fp32-opmath activations) | 6 | 3 | 77.5 | 25.8 | 23.9 GB |
+| After them (float64 islands on the CPU stream) | 6 | 3 | 73.6 | 24.5 | 24.4 GB |
 
-Kernel dtype audit (smeltr, 5-frame render): all DiT GEMMs and attention kernels are bf16
+Kernel dtype audit (smeltr, 5-frame render; shares come from smeltr's sampled per-op GPU timing, which was
+partly degraded during the run, so they are approximate): all DiT GEMMs and attention kernels are bf16
 (`steel_gemm_fused_*_bfloat16_bfloat16`, `steel_attention_bfloat16_*`), and the VAE convolutions are bf16
-(`implicit_gemm_conv_3d_bfloat16`, 42 % of GPU time). The only float32 GEMMs are 48 small calls (0.1 % of
-GPU time) in the one-off umT5 attention, where the float32 position bias promotes the scores. The float32
-elementwise and reduce kernels are the norm statistics and the torch-opmath activations listed under
-Numerics. The float64 CPU-stream work costs about 0.54 s per DiT forward (RoPE ~0.49 s over 30 layers,
+(the Conv kind is 42 % of GPU time, its top kernel `implicit_gemm_conv_3d_bfloat16` alone 40 %). No float32
+GEMM or attention kernel remains. The float32 elementwise and reduce kernels are the norm statistics and the
+torch-opmath activations listed under Numerics. The float64 CPU-stream work costs about 0.54 s per DiT forward (RoPE ~0.49 s over 30 layers,
 timestep MLP ~0.05 s, flow-to-x0 negligible), so 1.1 to 1.6 s per chunk (5 to 7 %).
 
 ## Numerics
@@ -80,14 +82,14 @@ on the MLX CPU stream where MLX has no GPU float64. bf16 rounding points follow 
 MLX's per-op defaults: SiLU / tanh-GELU and the VAE `RMS_norm` compute in fp32 and round once, and the
 timestep-MLP linears (one row per timestep entry, B x F) accumulate in float64, bias included, and round once
 (MLX's single-row bf16 addmm rounds the product before adding the bias, and fp32 summation order flips a few
-outputs at any row count). The scheduler's sigma grid reproduces `torch.linspace` bitwise.
+outputs at any row count). The scheduler's sigma grid reproduces `torch.linspace` bitwise. The umT5 text
+encoder runs in bf16, as upstream's loader runs it (`WanTextEncoder(...).to(device, torch.bfloat16)`),
+attention bias included (`x.new_zeros`).
 
 ## Known deviations from upstream
 
 - float64 runs on the MLX CPU stream (RoPE, flow-to-x0, timestep MLP accumulation) because MLX has no float64
   on the GPU; the values are upstream's, the device is not.
-- The umT5 text encoder runs in bf16; upstream runs it in float32 on the CPU. Both cast the prompt
-  embeddings to bf16 before the DiT.
 - KV-cache end indices are Python ints instead of 1-element tensors.
 - `CastleStream.push` has a test-only `renoise` argument.
 - Only the inference path (`kv_cache is not None`) is ported; training branches raise `NotImplementedError`.
@@ -112,8 +114,9 @@ directly (single module fp32 `max_abs < 1e-3`, block `< 5e-3`). Real-weight pari
   amplifies bf16 rounding chunk over chunk (torch against itself reaches ~0.3 rel L2 by chunk 2), so chunks 1
   and 2 are reported only.
 
-Fixtures are generated with the real upstream model (prompt embeddings come from the MLX umT5, so the
-fixtures do not cover the text encoder):
+Fixtures are generated with the real upstream model. The prompt embeddings come from the MLX umT5 and are
+stored in the fixtures, so both sides see the same context; the text encoder has its own real-weight test
+against upstream's bf16 umT5 (`tests/test_text_encoder.py`, gate 1.5x the torch-variant floor).
 
 ```bash
 cd Matrix-Game-4-mlx
@@ -132,7 +135,9 @@ MATRIX_GAME_4_MLX_WEIGHTS_DIR=... python -m tests.parity.gen_fixtures --device a
 
 They are written to `$MG4_FIXTURES_DIR/egypt_quality/` (default `~/.cache/matrix-game-4-mlx/fixtures`):
 about 1.7 GB for the default run and 6.2 GB with `--long` (the chunk-22 per-call fixture alone is 3.8 GB).
-The default run takes under 20 minutes, `--long` about 50 minutes. Native torch bf16 GEMMs on the CPU run at
+Recorded in `meta.json` (M2 Pro, VAE on MPS, DiT on CPU): the 3-chunk run took 219 s
+(`run_seconds`), the 25-chunk `--long` run 2668 s (about 44 min, `long_seconds`), plus 335 s for the floor
+run and 1267 s for the per-call floors. Native torch bf16 GEMMs on the CPU run at
 about 1 GFLOPS on Apple Silicon (a 5B forward would take about an hour), so the generator emulates them:
 bf16 linear, conv and SDPA calls on the CPU compute in fp32 and round the output to bf16 (fp32-accumulate
 kernel semantics). Every other op, including the float64 islands, runs unchanged, and `meta.json` records the
@@ -140,9 +145,11 @@ emulation and the device of each part.
 
 ## Tests
 
+Run with a Python that has the MLX/torch stack (the development machine uses Homebrew Python 3.14):
+
 ```bash
 cd Matrix-Game-4-mlx
-python3 -m pytest tests -v
+python -m pytest tests -v
 ```
 
 Install the `parity` extra for the upstream oracle. Tests marked `needs_fixtures` read the torch reference

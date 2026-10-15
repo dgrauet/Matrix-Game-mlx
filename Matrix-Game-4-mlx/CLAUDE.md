@@ -33,7 +33,7 @@ in the same test process (the tests import upstream as the oracle via `tests/con
 ### Dtype Policy
 
 DiT and T5 run in bf16 end to end, with no fp32 residual stream (upstream casts the whole DiT to bf16
-without autocast, unlike MG3; upstream's T5 runs in fp32 on CPU). The VAE is stored fp32 and cast to bf16
+without autocast, unlike MG3; upstream's loader also casts the T5 to bf16). The VAE is stored fp32 and cast to bf16
 at load. fp32 islands, as upstream: RMSNorm/LayerNorm statistics, scheduler `add_noise`, and torch's
 opmath for SiLU / tanh-GELU / VAE `RMS_norm`. float64 islands, as upstream, on the MLX CPU stream (no
 float64 on the GPU): RoPE tables and complex product, timestep sinusoid and timestep-MLP accumulation,
@@ -48,7 +48,6 @@ wrapper-level APIs keep upstream shapes `[B, F, C, h, w]`.
 ## Known Deviations (documented in README)
 
 - float64 islands run on the MLX CPU stream instead of the GPU
-- umT5 runs in bf16 (upstream: fp32 on CPU)
 - KV-cache end indices are Python ints instead of 1-element tensors
 - Test-only `renoise` argument on `CastleStream.push`
 
@@ -57,6 +56,7 @@ wrapper-level APIs keep upstream shapes `[B, F, C, h, w]`.
 ```text
 matrix_game_mlx/
   scenes.py                      # scene profiles (prompts, sink policy), model-loading parts only
+  configs/                       # ancient-egypt.json, castle.json, racing.json (scene name and prompt)
   inference/
     offline.py                   # CLI: --input clip | --take recording -> rendered.mp4 + render.json
     loader.py                    # ModelComponents: pack dir, pinned shared MG3 files (sha256), T5 -> DiT -> VAE
