@@ -30,3 +30,6 @@ var/
 
 # Dev
 venv
+
+# Generated videos
+Matrix-Game-3-mlx/output/
