@@ -2,7 +2,6 @@
 from dataclasses import dataclass, field
 
 import mlx.core as mx
-import numpy as np
 
 LATENT_SHAPE = (1, 1, 48, 30, 54)
 FRAME_SIZE = (480, 864)
@@ -62,7 +61,9 @@ class CastleStream:
         self.vae_backend = vae_backend
         self.dtype = generator.model.patch_embedding.weight.dtype
         self.shape = LATENT_SHAPE
-        if sink_latent is not None and (tuple(sink_latent.shape) != self.shape or not bool(mx.all(mx.isfinite(sink_latent)))):
+        if sink_latent is not None and (tuple(sink_latent.shape) != self.shape
+                                       or not mx.issubdtype(sink_latent.dtype, mx.floating)
+                                       or not bool(mx.all(mx.isfinite(sink_latent)))):
             raise ValueError("Sink must be one finite floating-point latent frame")
         self.sink_offset = int(sink_latent is not None and sink_mode == "kv_only")
         self.index = self.frame = 0
@@ -180,4 +181,6 @@ class CastleStream:
             return
         self.kv.clear()
         self.xc.clear()
+        self.encoder_features.clear()
+        self.decoder.feat.clear()
         self.closed = True

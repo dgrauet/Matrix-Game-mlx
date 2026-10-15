@@ -30,6 +30,22 @@ def test_validate_cadence_range_budget():
         s._validate(mx.zeros((4, 3, 480, 864)), frame_start=1)
 
 
+def test_close_clears_codec_caches():
+    from types import SimpleNamespace
+    s = _bare_stream()
+    s.kv, s.xc = [{"k": mx.zeros((1,))}], [{"is_init": True}]
+    s.encoder_features, s.decoder = [mx.zeros((1,))] * 3, SimpleNamespace(feat=[mx.zeros((1,))] * 2)
+    s.close()
+    assert s.closed and s.kv == [] and s.xc == [] and s.encoder_features == [] and s.decoder.feat == []
+
+
+def test_rejects_integer_sink_latent():
+    from types import SimpleNamespace
+    generator = SimpleNamespace(model=SimpleNamespace(patch_embedding=SimpleNamespace(weight=mx.zeros((1,), mx.bfloat16))))
+    with pytest.raises(ValueError, match="floating-point"):
+        CastleStream(generator, None, None, sink_latent=mx.zeros(LATENT_SHAPE, mx.int32))
+
+
 @pytest.mark.needs_weights
 def test_model_components_stream_smoke():
     import numpy as np
