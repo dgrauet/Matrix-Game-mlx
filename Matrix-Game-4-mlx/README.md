@@ -71,8 +71,8 @@ included) fills at chunk 19, and chunks 20 to 26 run with rolling eviction.
 | 2 to 26, steady state (25 chunks) | 33.2 | 26.9 | 42.4 |
 
 Memory over the same run: peak 22.74 GiB, active 17.24 GiB flat from chunk 2 through the window fill and the
-eviction, MLX buffer cache (`mx.get_cache_memory`) 6.14 GiB. At the steady-state mean, a 10 s take at 24 FPS (240 frames, 61 chunks) renders
-in about 34 min, roughly 8.3 s per video frame.
+eviction, MLX buffer cache (`mx.get_cache_memory`) 6.14 GiB. At the steady-state mean, a 10 s game take (recorded at 48 FPS:
+480 frames, 121 chunks) renders in about 67 min, roughly 8.3 s per video frame, excluding model load and video I/O.
 
 Short CLI runs (`render.json`, 1280x720 24 FPS input, 6 frames = 3 chunks): these averages include the
 one-frame chunk 0, so they understate the steady-state cost per chunk. `seconds` excludes model loading;
