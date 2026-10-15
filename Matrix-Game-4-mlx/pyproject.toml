@@ -9,5 +9,8 @@ dependencies = ["mlx>=0.31.0", "numpy", "Pillow", "imageio-ffmpeg", "huggingface
 [project.optional-dependencies]
 parity = ["torch", "diffusers", "einops"]
 
+[tool.setuptools.package-data]
+matrix_game_mlx = ["configs/*.json"]
+
 [tool.pytest.ini_options]
 markers = ["needs_weights: requires the converted MLX pack", "needs_fixtures: requires torch reference fixtures"]
