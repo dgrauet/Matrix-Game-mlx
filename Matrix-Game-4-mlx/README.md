@@ -17,9 +17,10 @@ Tests marked `needs_weights` are skipped when it is unset.
 
 Upstream's float64 islands (RoPE complex product and tables, flow-to-x0, timestep sinusoid) run in float64,
 on the MLX CPU stream where MLX has no GPU float64. bf16 rounding points follow torch's opmath rather than
-MLX's per-op defaults: SiLU / tanh-GELU and the VAE `RMS_norm` compute in fp32 and round once, and the M=1
-timestep-MLP linears add the bias before rounding (MLX's single-row addmm rounds the product first). The
-scheduler's sigma grid reproduces `torch.linspace` bitwise.
+MLX's per-op defaults: SiLU / tanh-GELU and the VAE `RMS_norm` compute in fp32 and round once, and the
+timestep-MLP linears (one row per timestep entry, B x F) accumulate in float64, bias included, and round once
+(MLX's single-row bf16 addmm rounds the product before adding the bias, and fp32 summation order flips a few
+outputs at any row count). The scheduler's sigma grid reproduces `torch.linspace` bitwise.
 
 ## Known deviations from upstream
 

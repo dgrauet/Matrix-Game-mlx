@@ -8,9 +8,10 @@ Three levels:
 - Per call (teacher forced): torch's exact cache state at a chunk boundary and torch's exact inputs are injected,
   one MLX generator call runs, and its pred plus the layer 0/29 KV it writes are compared with torch. Each call's
   threshold is 1.5 x the largest rel L2 between torch and its kernel variants on the same call (meta.json
-  "call_floors"), rounded up to one significant digit. The rest of the cache (history, sink, rolled window) must
-  match bitwise. Long chunk 22 runs past the 21-frame window, so the rolling eviction and the fixed-sink re-RoPE
-  run with real weights.
+  "call_floors"), rounded up to one significant digit. The rest of the cache (history, sink, rolled window), the
+  end indices and k_sink_raw of every layer must match torch exactly. Long chunk 22 (needs `gen_fixtures --long`,
+  skipped otherwise) runs past the 21-frame window, so the rolling eviction and the fixed-sink re-RoPE run with
+  real weights.
 - End to end: the full MLX stream from the same inputs. The autoregressive stream amplifies bf16 rounding chunk
   over chunk (torch against itself reaches ~0.3 rel L2 by chunk 2), so only chunk 0 is gated, with the spec
   thresholds; chunks 1 and 2 are reported.
@@ -99,7 +100,10 @@ def test_block_parity(comps, block_case, i):
 
 @pytest.mark.parametrize("name,j", sorted(CALL_TOL))
 def test_call_parity(comps, name, j):
-    fx = np.load(fixtures_dir() / "egypt_quality" / f"{name}.npz")
+    path = fixtures_dir() / "egypt_quality" / f"{name}.npz"
+    if name == LONG and not path.exists():
+        pytest.skip(f"{path.name} missing: generate it with gen_fixtures --long (then --calls-only)")
+    fx = np.load(path)
     stream = comps.stream(seed=0)
     _inject_state(stream.kv, fx)                                               # torch's state at the chunk boundary
     _, pred = stream.gen(noisy_image_or_video=_to_mx(fx[f"c{j}_x"]),
@@ -114,6 +118,16 @@ def test_call_parity(comps, name, j):
             assert got.shape == want.shape, f"{kind}{layer}: cache end index differs from torch"
             np.testing.assert_array_equal(got[:, :-405], want[:, :-405], err_msg=f"{kind}{layer} history")
             m[f"{kind}{layer}"] = rel_l2(written_slot(got), written_slot(want))
+    # Torch's post-call end indices and k_sink_raw are derived from the fixture (verified against a torch replay of
+    # all 12 calls): upstream sets global_end_index = current_start + new tokens, and writes k_sink_raw only when the
+    # written slot starts inside the sink, which torch's slot (at local_end_index - 405 >= 405) does not.
+    lei = fx[f"c{j}_k{KV_LAYERS[0]}"].shape[1]
+    assert lei - 405 >= 405, "torch's written slot overlaps the sink"
+    gei = int(fx[f"c{j}_start"]) + fx[f"c{j}_x"].shape[1] * 405
+    for i, c in enumerate(stream.kv):
+        assert (c["global_end_index"], c["local_end_index"]) == (gei, lei), f"layer {i} end indices"
+        np.testing.assert_array_equal(to_np(c["k_sink_raw"]), from_bits(fx[f"state_ksr{i}"]),
+                                      err_msg=f"layer {i} k_sink_raw")
     tol = dict(zip(("pred", *(f"l{layer}" for layer in KV_LAYERS)), CALL_TOL[(name, j)]))
     print(f"{name} call {j}: " + ", ".join(f"{k}={v:.3g}" for k, v in m.items()) + f" | tol {tol}")
     assert m["pred"] <= tol["pred"], (m, tol)

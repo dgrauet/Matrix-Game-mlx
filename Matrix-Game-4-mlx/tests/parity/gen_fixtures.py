@@ -217,11 +217,12 @@ def ensure_accelerate(torch) -> None:
     """Provide `accelerate.init_empty_weights` (used by upstream load_wan_dit) when accelerate is not installed.
 
     Same mechanism as accelerate with include_buffers=False: parameters are re-registered on the meta device.
+    Re-entrant: the shim has no `__spec__`, so `find_spec` would raise once it is in sys.modules.
     """
     import importlib.util
     import sys
     import types
-    if importlib.util.find_spec("accelerate") is not None:
+    if "accelerate" in sys.modules or importlib.util.find_spec("accelerate") is not None:
         return
 
     @contextlib.contextmanager
@@ -719,7 +720,9 @@ def main(argv=None):
     (out / "meta.json").write_text(json.dumps(meta, indent=2))
     log(f"done in {meta['total_seconds']:.0f}s: {out}")
     floor_reference(out)
+    gc.collect()                                 # one torch DiT alive at a time
     call_fixtures(out)
+    gc.collect()
     block_fixtures(out)
 
 

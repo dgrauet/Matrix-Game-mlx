@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 import mlx.core as mx
 from tests.conftest import import_upstream, assert_close
@@ -101,7 +102,12 @@ def _bf16_samples(n=200_000, scale=3.0):
 
 
 def test_bf16_activations_match_torch_opmath():
-    """torch computes bf16 SiLU / tanh-GELU in float32 and rounds once (per-op bf16 rounding diverged on ~40 %)."""
+    """torch computes bf16 SiLU / tanh-GELU in float32 and rounds once (per-op bf16 rounding diverged on ~40 %).
+
+    SiLU is checked bitwise. tanh-GELU is approximate (bf16 mismatch rate < 2 %, max abs < 1e-4): MLX's fp32
+    gelu_approx and torch's kernel differ at the ulp level (tanh implementation, operation order), which flips the
+    bf16 rounding of values near a rounding boundary.
+    """
     xm, xt = _bf16_samples()
     silu = np.array(M.silu(xm).astype(mx.float32))
     assert np.array_equal(silu, torch.nn.functional.silu(xt).float().numpy())
@@ -110,14 +116,16 @@ def test_bf16_activations_match_torch_opmath():
     assert (gelu != ref).mean() < 0.02 and np.abs(gelu - ref).max() < 1e-4
 
 
-def test_linear_f64_acc_matches_torch_bf16_single_row():
-    """Timestep MLP rows (M=1): correctly rounded (bias before the single bf16 rounding), as torch's bf16 nn.Linear."""
+@pytest.mark.parametrize("m", [1, 4])
+def test_linear_f64_acc_matches_torch_bf16(m):
+    """Timestep MLP (M = B x F rows): float64 accumulation, bias included, rounded once to bf16, as torch's bf16
+    nn.Linear (M=1 is MLX's GEMV path, which rounds the product before the bias)."""
     import mlx.nn as nn
     from tests.conftest import rel_l2
     from matrix_game_mlx.inference.wan.modules.causal_model import linear_f64_acc
     torch.manual_seed(0)
     ref_layer = torch.nn.Linear(256, 3072).bfloat16()
-    x = torch.randn(1, 256).bfloat16()
+    x = torch.randn(m, 256).bfloat16()
     layer = nn.Linear(256, 3072)
     layer.weight = mx.array(ref_layer.weight.detach().float().numpy()).astype(mx.bfloat16)
     layer.bias = mx.array(ref_layer.bias.detach().float().numpy()).astype(mx.bfloat16)

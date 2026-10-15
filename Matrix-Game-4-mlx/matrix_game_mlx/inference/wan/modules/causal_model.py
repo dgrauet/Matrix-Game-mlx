@@ -17,12 +17,13 @@ from matrix_game_mlx.inference.wan.modules.model import (
 
 @_on_cpu
 def linear_f64_acc(layer: nn.Linear, x: mx.array) -> mx.array:
-    """Correctly rounded bf16 nn.Linear for the timestep MLP rows (M=1): bias added before one rounding.
+    """Correctly rounded bf16 nn.Linear for the timestep MLP: float64 accumulation (bias included), rounded once.
 
-    MLX's bf16 addmm on a single row (GEMV path) rounds the product to bf16 before adding the bias (2.9e-3 relative
-    off torch). An fp32 accumulation then still flips ~1e-4 of the outputs depending on summation order, and e0
-    modulates every token of every block; float64 accumulation gives the correctly rounded value that torch's
-    bf16 linear returns up to its own order-dependent flips.
+    The MLP has one row per entry of t (M = B x F; 1 in the stream, which denoises one latent frame per call). At
+    M=1 MLX's bf16 addmm (GEMV path) rounds the product to bf16 before adding the bias (2.9e-3 relative off torch).
+    At any M an fp32 accumulation still flips ~1e-4 of the outputs depending on summation order, and e0 modulates
+    every token of every block; float64 accumulation gives the correctly rounded value that torch's bf16 linear
+    returns up to its own order-dependent flips.
     """
     return mx.addmm(layer.bias.astype(mx.float64), x.astype(mx.float64), layer.weight.astype(mx.float64).T).astype(x.dtype)
 

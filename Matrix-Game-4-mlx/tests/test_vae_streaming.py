@@ -74,7 +74,12 @@ def test_wrapper_loads_real_shared_vae_strictly():
 
 
 def test_rms_norm_and_silu_match_torch_bf16():
-    """bf16 RMS_norm (F.normalize * scale * gamma) and SiLU round where torch does (fp32 norm / opmath)."""
+    """bf16 RMS_norm (F.normalize * scale * gamma) and SiLU round where torch does (fp32 norm / opmath).
+
+    SiLU is checked bitwise. RMS_norm is approximate (bf16 mismatch rate < 1e-3): the fp32 L2 norm is a sum over
+    channels whose order differs between MLX and torch, so an ulp-level difference in the norm occasionally lands
+    on the other side of a bf16 rounding boundary.
+    """
     import numpy as np
     from matrix_game_mlx.inference.wan.modules.vae2_2 import RMS_norm, _SiLU_placeholder
     torch.manual_seed(0)
