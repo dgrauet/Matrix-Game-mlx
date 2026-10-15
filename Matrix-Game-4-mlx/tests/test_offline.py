@@ -28,6 +28,23 @@ def test_rejects_incomplete_take(tmp_path):
         main(["--take", str(take), "--output", str(tmp_path / "out")])
 
 
+def test_missing_sink_image_fails_before_loading(tmp_path, monkeypatch):
+    from matrix_game_mlx.inference import loader
+    monkeypatch.setattr(loader, "ModelComponents", lambda *a, **k: pytest.fail("models loaded"))
+    sink = tmp_path / "missing.png"
+    with pytest.raises(FileNotFoundError, match="missing.png"):
+        main(["--input", str(tmp_path / "x.mp4"), "--sink-image", str(sink), "--output", str(tmp_path / "out")])
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize("scene,warned", [("castle", True), ("racing", True), ("ancient-egypt", False)])
+def test_warns_on_scenes_not_parity_validated(tmp_path, caplog, scene, warned):
+    with pytest.raises(FileNotFoundError):
+        main(["--scene", scene, "--input", str(tmp_path / "x.mp4"), "--sink-image", str(tmp_path / "missing.png"),
+              "--output", str(tmp_path / "out")])
+    assert ("not parity-validated" in caplog.text) == warned
+
+
 @pytest.mark.needs_weights
 def test_render_short_clip(tmp_path):
     import imageio_ffmpeg, numpy as np
