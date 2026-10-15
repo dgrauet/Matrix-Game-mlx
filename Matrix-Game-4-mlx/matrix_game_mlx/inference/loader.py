@@ -5,15 +5,18 @@ import os
 from pathlib import Path
 from typing import Dict
 
-from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub import hf_hub_download
 
 PACK_REPO_ID = "dgrauet/matrix-game-4.0-mlx"
 
 
 def pack_dir() -> Path:
-    """Local pack dir from MATRIX_GAME_4_MLX_WEIGHTS_DIR, else the HF snapshot."""
+    """Local pack dir from MATRIX_GAME_4_MLX_WEIGHTS_DIR (required until the pack is published on the Hub)."""
     local = os.environ.get("MATRIX_GAME_4_MLX_WEIGHTS_DIR")
-    return Path(local) if local else Path(snapshot_download(PACK_REPO_ID))
+    if not local:
+        raise RuntimeError(f"Set MATRIX_GAME_4_MLX_WEIGHTS_DIR to the local MLX weight pack directory; "
+                           f"its Hub publication as {PACK_REPO_ID} is planned")
+    return Path(local)
 
 
 def sha256_file(path: Path) -> str:

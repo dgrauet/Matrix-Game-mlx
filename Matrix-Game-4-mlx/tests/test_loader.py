@@ -44,3 +44,15 @@ def test_hub_download_called_with_pinned_revision(tmp_path, monkeypatch):
     monkeypatch.setattr(loader, "hf_hub_download", fake_download)
     loader.resolve_shared_files(pack)
     assert {c[2] for c in calls} == {"r"} and {c[0] for c in calls} == {"x/y"} and len(calls) == 3
+
+
+def test_pack_dir_requires_env_until_hub_publication(monkeypatch):
+    monkeypatch.delenv("MATRIX_GAME_4_MLX_WEIGHTS_DIR", raising=False)
+    with pytest.raises(RuntimeError, match="MATRIX_GAME_4_MLX_WEIGHTS_DIR") as info:
+        loader.pack_dir()
+    assert loader.PACK_REPO_ID in str(info.value) and "planned" in str(info.value)
+
+
+def test_pack_dir_from_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("MATRIX_GAME_4_MLX_WEIGHTS_DIR", str(tmp_path))
+    assert loader.pack_dir() == tmp_path
