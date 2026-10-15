@@ -19,15 +19,16 @@ def _pair():
 
 
 def test_sigmas_timesteps_match():
+    """Bitwise: torch.linspace's float32 FMA halves are reproduced (np.linspace differed on ~220 entries)."""
     a, b = _pair()
-    assert_close(a.sigmas, b.sigmas, atol=1e-6, rtol=0)
-    assert_close(a.timesteps, b.timesteps, atol=1e-3, rtol=0)
+    np.testing.assert_array_equal(np.array(a.sigmas), b.sigmas.numpy())
+    np.testing.assert_array_equal(np.array(a.timesteps), b.timesteps.numpy())
 
 
 def test_warp_steps_match():
     a, b = _pair()
     for steps in ([1000, 500], [1000], [1000, 750, 500, 250]):
-        np.testing.assert_allclose(np.array(warp_steps(a, steps)), up_r.warp_steps(b, steps).numpy(), atol=1e-3)
+        np.testing.assert_array_equal(np.array(warp_steps(a, steps)), up_r.warp_steps(b, steps).numpy())
 
 
 def test_add_noise_match():
@@ -38,4 +39,4 @@ def test_add_noise_match():
     t = float(up_r.warp_steps(b, [1000, 500])[1])
     out_a = a.add_noise(mx.array(x0), mx.array(n), mx.array([t]))
     out_b = b.add_noise(torch.from_numpy(x0), torch.from_numpy(n), torch.tensor([t]))
-    assert_close(out_a, out_b, atol=1e-5, rtol=0)
+    np.testing.assert_array_equal(np.array(out_a), out_b.numpy())

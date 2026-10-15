@@ -34,7 +34,11 @@ def test_flow_to_x0_matches_upstream():
         ref = up_w.WanDiffusionWrapper._convert_flow_pred_to_x0(ref_wrapper, torch.from_numpy(fp), torch.from_numpy(xt),
                                                                 torch.tensor([t]))
         out = w._convert_flow_pred_to_x0(mx.array(fp), mx.array(xt), mx.array([t]))
-        assert_close(out, ref, atol=1e-5, rtol=0, msg=f"t={t}")   # fp32 vs float64 gap, documented deviation
+        np.testing.assert_array_equal(np.array(out), ref.numpy(), err_msg=f"t={t}")        # float64 as upstream
+        bf = lambda a: torch.from_numpy(a).bfloat16()
+        ref = up_w.WanDiffusionWrapper._convert_flow_pred_to_x0(ref_wrapper, bf(fp), bf(xt), torch.tensor([t]))
+        out = w._convert_flow_pred_to_x0(mx.array(fp).astype(mx.bfloat16), mx.array(xt).astype(mx.bfloat16), mx.array([t]))
+        np.testing.assert_array_equal(np.array(out.astype(mx.float32)), ref.float().numpy(), err_msg=f"bf16 t={t}")
 
 
 def test_caches_shapes():

@@ -1,5 +1,5 @@
 """Shared Wan building blocks: embeddings, RoPE, norms and T2V cross-attention."""
-from functools import partial
+from functools import partial, wraps
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -36,7 +36,8 @@ def gelu_tanh(x: mx.array) -> mx.array:
 
 
 def sinusoidal_embedding_1d(dim: int, position: mx.array) -> mx.array:
-    """Upstream computes in float64; float64 is CPU-only in MLX, so build in numpy float64."""
+    """Computed in numpy float64 as upstream. Stored float32: torch's float64 -> bf16 cast goes through float32,
+    so the caller's bf16 cast rounds exactly as upstream's `.type_as(x)`."""
     assert dim % 2 == 0
     half = dim // 2
     pos = np.array(position.astype(mx.float32), dtype=np.float64)
@@ -44,12 +45,30 @@ def sinusoidal_embedding_1d(dim: int, position: mx.array) -> mx.array:
     return mx.array(np.concatenate([np.cos(sinusoid), np.sin(sinusoid)], axis=1).astype(np.float32))
 
 
+def _on_cpu(fn):
+    """Run `fn` on the MLX CPU stream: upstream's RoPE products are float64, which MLX supports on CPU only."""
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        with mx.stream(mx.cpu):
+            return fn(*args, **kwargs)
+    return wrapped
+
+
 def rope_params(max_seq_len: int, dim: int, theta: float = 10000) -> Tuple[mx.array, mx.array]:
-    """cos/sin tables built in float64 (as torch.polar on float64), stored float32."""
+    """float64 cos/sin tables (upstream: complex128 torch.polar); float64 arrays are used on the CPU stream only."""
     assert dim % 2 == 0
     freqs = np.outer(np.arange(max_seq_len, dtype=np.float64),
                      1.0 / np.power(theta, np.arange(0, dim, 2, dtype=np.float64) / dim))
-    return mx.array(np.cos(freqs).astype(np.float32)), mx.array(np.sin(freqs).astype(np.float32))
+    return mx.array(np.cos(freqs), dtype=mx.float64), mx.array(np.sin(freqs), dtype=mx.float64)
+
+
+@_on_cpu
+def rope_freqs(max_seq_len: int, head_dim: int) -> Tuple[mx.array, mx.array]:
+    """Concatenated (time, height, width) float64 cos/sin tables, as upstream's complex128 `freqs` [n, head_dim // 2]."""
+    d = head_dim
+    parts = [rope_params(max_seq_len, d - 4 * (d // 6)), rope_params(max_seq_len, 2 * (d // 6)),
+             rope_params(max_seq_len, 2 * (d // 6))]
+    return mx.concatenate([p[0] for p in parts], axis=1), mx.concatenate([p[1] for p in parts], axis=1)
 
 
 def _apply_rope_rotation(
@@ -74,6 +93,7 @@ def _apply_rope_rotation(
     )
 
 
+@_on_cpu
 def rope_apply(
     x: mx.array,
     grid_sizes: List[List[int]],
@@ -87,7 +107,7 @@ def rope_apply(
         freqs: ``(cos_freqs, sin_freqs)`` each ``[max_seq_len, C // 2]``.
 
     Returns:
-        Tensor of same shape and dtype as *x* (rotation computed in float32).
+        Tensor of same shape and dtype as *x* (rotation computed in float64, as upstream).
     """
     n = x.shape[2]
     c = x.shape[3] // 2  # half-dim for cos/sin pairs
@@ -106,7 +126,7 @@ def rope_apply(
         seq_len = f * h * w
 
         # Reshape to pair up dims: [seq_len, n, dim//2, 2]
-        x_i = x[i, :seq_len].astype(mx.float32).reshape(seq_len, n, -1, 2)
+        x_i = x[i, :seq_len].astype(mx.float64).reshape(seq_len, n, -1, 2)
 
         # Build per-axis cos/sin and broadcast over the 3-D grid
         # Temporal: [f, 1, 1, c_t] -> [f, h, w, c_t]

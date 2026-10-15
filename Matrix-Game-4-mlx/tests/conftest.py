@@ -25,7 +25,7 @@ def to_np(x) -> np.ndarray:
         return x.detach().cpu().float().numpy()
     import mlx.core as mx
     if isinstance(x, mx.array):
-        return np.array(x.astype(mx.float32))
+        return np.array(x) if x.dtype == mx.float64 else np.array(x.astype(mx.float32))
     return np.asarray(x, dtype=np.float32)
 
 

@@ -61,13 +61,15 @@ class WanDiffusionWrapper:
         return list(mx.concatenate(parts, axis=-1))
 
     def _convert_flow_pred_to_x0(self, flow_pred: mx.array, xt: mx.array, timestep: mx.array) -> mx.array:
-        """x0 = x_t - sigma_t * flow (upstream float64, here float32: documented deviation)."""
+        """x0 = x_t - sigma_t * flow in float64, as upstream (on the MLX CPU stream: float64 is CPU-only)."""
         original_dtype = flow_pred.dtype
-        sigmas, timesteps = self.scheduler.sigmas, self.scheduler.timesteps
-        timestep_id = mx.argmin(mx.abs(timesteps[None, :] - timestep[:, None]), axis=1)
-        sigma_t = mx.where(timestep == 0, 0.0, sigmas[timestep_id]).reshape(-1, 1, 1, 1)
-        x0_pred = xt.astype(mx.float32) - sigma_t * flow_pred.astype(mx.float32)
-        return x0_pred.astype(original_dtype)
+        with mx.stream(mx.cpu):
+            flow_pred, xt, sigmas, timesteps = (a.astype(mx.float64) for a in
+                                                (flow_pred, xt, self.scheduler.sigmas, self.scheduler.timesteps))
+            timestep_id = mx.argmin(mx.abs(timesteps[None, :] - timestep.astype(mx.float64)[:, None]), axis=1)
+            sigma_t = mx.where(timestep == 0, 0.0, sigmas[timestep_id]).reshape(-1, 1, 1, 1)
+            x0_pred = xt - sigma_t * flow_pred
+            return x0_pred.astype(original_dtype)
 
     def __call__(self, noisy_image_or_video: mx.array, conditional_dict: dict, timestep: mx.array,
                  kv_cache: Optional[List[dict]] = None, crossattn_cache: Optional[List[dict]] = None,

@@ -110,11 +110,11 @@ def test_bf16_activations_match_torch_opmath():
     assert (gelu != ref).mean() < 0.02 and np.abs(gelu - ref).max() < 1e-4
 
 
-def test_linear_fp32_acc_matches_torch_bf16_single_row():
-    """Timestep MLP rows (M=1): bias added before the single bf16 rounding, as torch's bf16 nn.Linear."""
+def test_linear_f64_acc_matches_torch_bf16_single_row():
+    """Timestep MLP rows (M=1): correctly rounded (bias before the single bf16 rounding), as torch's bf16 nn.Linear."""
     import mlx.nn as nn
     from tests.conftest import rel_l2
-    from matrix_game_mlx.inference.wan.modules.causal_model import linear_fp32_acc
+    from matrix_game_mlx.inference.wan.modules.causal_model import linear_f64_acc
     torch.manual_seed(0)
     ref_layer = torch.nn.Linear(256, 3072).bfloat16()
     x = torch.randn(1, 256).bfloat16()
@@ -123,6 +123,9 @@ def test_linear_fp32_acc_matches_torch_bf16_single_row():
     layer.bias = mx.array(ref_layer.bias.detach().float().numpy()).astype(mx.bfloat16)
     with torch.no_grad():
         ref = ref_layer(x).float().numpy()
-    out = linear_fp32_acc(layer, mx.array(x.float().numpy()).astype(mx.bfloat16))
+    out = linear_f64_acc(layer, mx.array(x.float().numpy()).astype(mx.bfloat16))
     assert out.dtype == mx.bfloat16
     assert rel_l2(out, ref) < 1e-6
+    exact = torch.from_numpy(x.double().numpy() @ ref_layer.weight.detach().double().numpy().T
+                             + ref_layer.bias.detach().double().numpy()).bfloat16().float().numpy()
+    np.testing.assert_array_equal(np.array(out.astype(mx.float32)), exact)          # correctly rounded

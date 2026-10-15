@@ -1,7 +1,7 @@
 """Causal Wan DiT with rolling KV cache (MLX port of matrix_game/inference/wan/modules/causal_model.py).
 
-Only the KV-cache inference path is ported. Deviation: the RoPE complex product is computed in
-float32 (upstream float64; MLX has no float64 on GPU). Tables are built in float64 (model.rope_params).
+Only the KV-cache inference path is ported. The RoPE complex product runs in float64 on the MLX CPU stream, as
+upstream (MLX has no float64 on GPU); tables are float64 (model.rope_params).
 """
 import math
 from typing import Optional
@@ -11,17 +11,20 @@ import mlx.nn as nn
 
 from matrix_game_mlx.inference.wan.modules.attention import attention
 from matrix_game_mlx.inference.wan.modules.model import (
-    WAN_CROSSATTENTION_CLASSES, WanLayerNorm, WanRMSNorm, _apply_rope_rotation, gelu_tanh, rope_params, silu,
+    WAN_CROSSATTENTION_CLASSES, WanLayerNorm, WanRMSNorm, _apply_rope_rotation, _on_cpu, gelu_tanh, rope_freqs, silu,
     sinusoidal_embedding_1d)
 
 
-def linear_fp32_acc(layer: nn.Linear, x: mx.array) -> mx.array:
-    """torch bf16 nn.Linear semantics (fp32 accumulate, bias added before the single rounding) for M=1 rows.
+@_on_cpu
+def linear_f64_acc(layer: nn.Linear, x: mx.array) -> mx.array:
+    """Correctly rounded bf16 nn.Linear for the timestep MLP rows (M=1): bias added before one rounding.
 
-    MLX's bf16 addmm on a single row (GEMV path) rounds the product to bf16 before adding the bias; on the
-    timestep MLP that double rounding is 2.9e-3 relative off torch. Larger M is unaffected.
+    MLX's bf16 addmm on a single row (GEMV path) rounds the product to bf16 before adding the bias (2.9e-3 relative
+    off torch). An fp32 accumulation then still flips ~1e-4 of the outputs depending on summation order, and e0
+    modulates every token of every block; float64 accumulation gives the correctly rounded value that torch's
+    bf16 linear returns up to its own order-dependent flips.
     """
-    return mx.addmm(layer.bias.astype(mx.float32), x.astype(mx.float32), layer.weight.astype(mx.float32).T).astype(x.dtype)
+    return mx.addmm(layer.bias.astype(mx.float64), x.astype(mx.float64), layer.weight.astype(mx.float64).T).astype(x.dtype)
 
 
 def _check_rope_len(freqs, need: int) -> None:
@@ -55,11 +58,12 @@ def _rope_rows(x: mx.array, grid_sizes, freqs, time_rows) -> mx.array:
                                axis=-1).reshape(seq_len, 1, -1)
         sin_i = mx.concatenate([grid(st, (f, 1, 1, -1)), grid(sh[:h], (1, h, 1, -1)), grid(sw[:w], (1, 1, w, -1))],
                                axis=-1).reshape(seq_len, 1, -1)
-        x_i = _apply_rope_rotation(x[i, :seq_len].astype(mx.float32).reshape(seq_len, n, -1, 2), cos_i, sin_i)
-        output.append(mx.concatenate([x_i, x[i, seq_len:].astype(mx.float32)], axis=0))
+        x_i = _apply_rope_rotation(x[i, :seq_len].astype(mx.float64).reshape(seq_len, n, -1, 2), cos_i, sin_i)
+        output.append(mx.concatenate([x_i, x[i, seq_len:].astype(mx.float64)], axis=0))
     return mx.stack(output).astype(x.dtype)
 
 
+@_on_cpu
 def causal_rope_apply(x: mx.array, grid_sizes, freqs, start_frame: int = 0) -> mx.array:
     """Apply 3D RoPE with the frame axis offset by `start_frame`; returns x.dtype."""
     _check_rope_len(freqs, int(start_frame) + max(g[0] for g in grid_sizes))
@@ -67,6 +71,7 @@ def causal_rope_apply(x: mx.array, grid_sizes, freqs, start_frame: int = 0) -> m
     return _rope_rows(x, grid_sizes, freqs, lambda i, f: (ct[start_frame:start_frame + f], st[start_frame:start_frame + f]))
 
 
+@_on_cpu
 def rope_apply_frames(x: mx.array, grid_sizes, freqs, frame_pos) -> mx.array:
     """Apply 3D RoPE with explicit (non-negative) per-frame positions; returns x.dtype.
 
@@ -264,9 +269,7 @@ class CausalWanModel(nn.Module):
         n = int(n)
         if n <= self._rope_rows:
             return
-        d = self.dim // self.num_heads
-        parts = [rope_params(n, d - 4 * (d // 6)), rope_params(n, 2 * (d // 6)), rope_params(n, 2 * (d // 6))]
-        self._freqs = (mx.concatenate([p[0] for p in parts], axis=1), mx.concatenate([p[1] for p in parts], axis=1))
+        self._freqs = rope_freqs(n, self.dim // self.num_heads)
         self._rope_rows = n
 
     @property
@@ -296,9 +299,9 @@ class CausalWanModel(nn.Module):
         assert max(u.shape[1] for u in tokens) <= seq_len
         x = mx.concatenate(tokens, axis=0)
 
-        e = linear_fp32_acc(self.time_embedding_linear2, silu(linear_fp32_acc(
+        e = linear_f64_acc(self.time_embedding_linear2, silu(linear_f64_acc(
             self.time_embedding_linear1, sinusoidal_embedding_1d(self.freq_dim, t.reshape(-1)).astype(x.dtype))))
-        e0 = linear_fp32_acc(self.time_projection_linear1, silu(e)).reshape(*t.shape, 6, self.dim)
+        e0 = linear_f64_acc(self.time_projection_linear1, silu(e)).reshape(*t.shape, 6, self.dim)
 
         ctx = context if isinstance(context, mx.array) else mx.stack(list(context))
         if ctx.shape[1] < self.text_len:

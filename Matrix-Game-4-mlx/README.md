@@ -13,15 +13,16 @@ Converted weights are published as `dgrauet/matrix-game-4.0-mlx` (produced by
 `MATRIX_GAME_4_MLX_WEIGHTS_DIR` environment variable at the directory containing `config.json`.
 Tests marked `needs_weights` are skipped when it is unset.
 
+## Numerics
+
+Upstream's float64 islands (RoPE complex product and tables, flow-to-x0, timestep sinusoid) run in float64,
+on the MLX CPU stream where MLX has no GPU float64. bf16 rounding points follow torch's opmath rather than
+MLX's per-op defaults: SiLU / tanh-GELU and the VAE `RMS_norm` compute in fp32 and round once, and the M=1
+timestep-MLP linears add the bias before rounding (MLX's single-row addmm rounds the product first). The
+scheduler's sigma grid reproduces `torch.linspace` bitwise.
+
 ## Known deviations from upstream
 
-- float64 is replaced by fp32 in `_convert_flow_pred_to_x0` and in the RoPE complex product (the MLX GPU
-  has no float64); RoPE tables are built in numpy float64 and then cast to fp32. Measured against upstream
-  on real activations: the x0 conversion is bit-exact after the bf16 cast, and RoPE differs on ~1 element in
-  10^5 by one bf16 ulp (below a single bf16 GEMM's rounding noise).
-- bf16 rounding points follow torch's opmath, not MLX's per-op defaults: SiLU / tanh-GELU and the VAE
-  `RMS_norm` compute in fp32 and round once, and the M=1 timestep-MLP linears add the bias before rounding
-  (MLX's single-row addmm rounds the product first).
 - KV-cache end indices are Python ints instead of 1-element tensors.
 - `CastleStream.push` has a test-only `renoise` argument.
 
