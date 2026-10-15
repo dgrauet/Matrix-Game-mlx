@@ -1,14 +1,4 @@
-"""Real-weight parity of the MLX stream against upstream PyTorch fixtures (tests/parity/gen_fixtures.py).
-
-Gates are relative to a torch-vs-torch floor, not fixed thresholds. The autoregressive stream writes each chunk's
-prediction into the KV cache that conditions the next chunk, so it amplifies bf16 rounding: two torch runs that
-differ only in the SDPA kernel are already ~2 % apart at the first DiT pass and ~30 % apart in pred by chunk 2.
-Fixed thresholds (2e-2, 35 dB) sit below that floor. `floor_chunk_{i}.npz` holds that torch variant (and, for
-control, the torch VAE encoder on its other device); MLX must stay within 2x of the floor's distance to the
-fixture (3 dB for decoded frames). One absolute single-forward gate remains on chunk 0's first DiT pass.
-The sink KV slot is not gated separately: the SDPA variant cannot move layer-0 keys (computed before any
-attention), so its floor there is 0; the sink tokens stay covered by the whole-cache kv_k_layer0/29 gates.
-"""
+"""Real-weight parity of the MLX stream against upstream PyTorch fixtures (tests/parity/gen_fixtures.py)."""
 import numpy as np
 import pytest
 import mlx.core as mx
@@ -16,8 +6,6 @@ import mlx.core as mx
 from tests.conftest import fixtures_dir, psnr, rel_l2, to_np
 
 pytestmark = [pytest.mark.needs_weights, pytest.mark.needs_fixtures]
-
-FLOOR_FACTOR, FLOOR_MIN, PSNR_MARGIN_DB, STEP0_MAX = 2.0, 1e-3, 3.0, 5e-2
 
 
 class _StepRecorder:
@@ -62,25 +50,11 @@ def run():
 def test_chunk_parity(run, i):
     d, chunks = run
     ref = np.load(d / f"chunk_{i}.npz")
-    floor = np.load(d / f"floor_chunk_{i}.npz")
     c = chunks[i]
-    failures = []
-    for k in ("control", "pred", "kv_k_layer0", "kv_k_layer29"):
-        value, base = rel_l2(c[k], ref[k]), rel_l2(floor[k], ref[k])
-        gate = FLOOR_FACTOR * max(base, FLOOR_MIN)
-        line = f"chunk {i} {k}: mlx={value:.4g} floor={base:.4g} ratio={value / max(base, FLOOR_MIN):.2f} gate={gate:.4g}"
-        print(line)
-        if value > gate:
-            failures.append(line)
-    value, base = psnr(c["decoded"], ref["decoded"]), psnr(floor["decoded"], ref["decoded"])
-    line = f"chunk {i} decoded PSNR: mlx={value:.2f} dB floor={base:.2f} dB delta={value - base:+.2f} dB"
-    print(line)
-    if value < base - PSNR_MARGIN_DB:
-        failures.append(line)
-    if i == 0:
-        value = rel_l2(c["pred_step0"], ref["pred_step0"])
-        line = f"chunk 0 pred_step0 (single forward): mlx={value:.4g} gate={STEP0_MAX}"
-        print(line)
-        if value >= STEP0_MAX:
-            failures.append(line)
-    assert not failures, "\n".join(failures)
+    m = {k: rel_l2(c[k], ref[k]) for k in ("control", "pred_step0", "pred", "kv_k_layer0", "kv_k_layer29")}
+    m["decoded_psnr"] = psnr(c["decoded"], ref["decoded"])
+    print(f"chunk {i}: " + ", ".join(f"{k}={v:.4g}" for k, v in m.items()))
+    assert m["control"] < 2e-2, m
+    assert m["pred"] < 2e-2, m
+    assert m["kv_k_layer0"] < 2e-2 and m["kv_k_layer29"] < 2e-2, m
+    assert m["decoded_psnr"] > 35.0, m
