@@ -74,6 +74,16 @@ def _inject_state(kv, fx) -> None:
         c["global_end_index"], c["local_end_index"] = int(fx[f"state_gei{i}"]), n
 
 
+def test_sink_encoding_production_path(comps):
+    """The pack's sink.png through ModelComponents' encode path vs the torch-encoded sink (rel L2 < 2e-2)."""
+    from matrix_game_mlx.inference.stream import encode_sink_image
+    torch_sink = np.load(fixtures_dir() / "egypt_quality" / "inputs.npz")["sink_latent"]
+    assert comps.sink_image == comps.pack / "fps-egypt" / "sink.png"
+    err = rel_l2(encode_sink_image(comps.vae, comps.sink_image, "wan"), torch_sink)
+    print(f"sink rel L2 {err:.3e}")
+    assert err < 2e-2, err
+
+
 @pytest.fixture(scope="module")
 def block_case(comps):
     d = fixtures_dir() / "egypt_quality"
