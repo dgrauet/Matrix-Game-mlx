@@ -16,6 +16,7 @@ def _check_rope_len(freqs, need: int) -> None:
 
 
 def _split(freqs, c: int):
+    """Split the (cos, sin) tables along the channel-pair axis into (time, height, width) parts."""
     c_t, c_h = c - 2 * (c // 3), c // 3
     cos, sin = freqs
     return ((cos[:, :c_t], sin[:, :c_t]), (cos[:, c_t:c_t + c_h], sin[:, c_t:c_t + c_h]),
@@ -51,8 +52,16 @@ def causal_rope_apply(x: mx.array, grid_sizes, freqs, start_frame: int = 0) -> m
 
 
 def rope_apply_frames(x: mx.array, grid_sizes, freqs, frame_pos) -> mx.array:
-    """Apply 3D RoPE with explicit (non-negative) per-frame positions; returns x.dtype."""
+    """Apply 3D RoPE with explicit (non-negative) per-frame positions; returns x.dtype.
+
+    frame_pos is 1-D and shared by all samples; its length must equal f of every grid entry.
+    """
     pos = [int(p) for p in frame_pos]
+    if not pos:
+        raise ValueError("frame_pos must not be empty")
+    for f, _, _ in grid_sizes:
+        if len(pos) != f:
+            raise ValueError(f"frame_pos has {len(pos)} entries but the grid has {f} frames")
     if min(pos) < 0:
         raise NotImplementedError("negative RoPE positions are only used by the kv_mem path (not ported)")
     _check_rope_len(freqs, max(pos) + 1)
