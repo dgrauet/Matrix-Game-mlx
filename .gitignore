@@ -33,3 +33,6 @@ venv
 
 # Generated videos
 Matrix-Game-3-mlx/output/
+
+# Matrix-Game-4-mlx local outputs
+Matrix-Game-4-mlx/output/
