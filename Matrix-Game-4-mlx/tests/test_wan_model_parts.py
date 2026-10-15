@@ -93,3 +93,36 @@ def test_attention_matches_sdpa():
     ref = torch.nn.functional.scaled_dot_product_attention(
         *(torch.from_numpy(t).transpose(1, 2) for t in (q, k, v))).transpose(1, 2)
     assert_close(attention(mx.array(q), mx.array(k), mx.array(v)), ref, atol=1e-5)
+
+
+def _bf16_samples(n=200_000, scale=3.0):
+    x = (np.random.default_rng(0).standard_normal(n) * scale).astype(np.float32)
+    return mx.array(x).astype(mx.bfloat16), torch.from_numpy(x).bfloat16()
+
+
+def test_bf16_activations_match_torch_opmath():
+    """torch computes bf16 SiLU / tanh-GELU in float32 and rounds once (per-op bf16 rounding diverged on ~40 %)."""
+    xm, xt = _bf16_samples()
+    silu = np.array(M.silu(xm).astype(mx.float32))
+    assert np.array_equal(silu, torch.nn.functional.silu(xt).float().numpy())
+    gelu = np.array(M.gelu_tanh(xm).astype(mx.float32))
+    ref = torch.nn.functional.gelu(xt, approximate="tanh").float().numpy()
+    assert (gelu != ref).mean() < 0.02 and np.abs(gelu - ref).max() < 1e-4
+
+
+def test_linear_fp32_acc_matches_torch_bf16_single_row():
+    """Timestep MLP rows (M=1): bias added before the single bf16 rounding, as torch's bf16 nn.Linear."""
+    import mlx.nn as nn
+    from tests.conftest import rel_l2
+    from matrix_game_mlx.inference.wan.modules.causal_model import linear_fp32_acc
+    torch.manual_seed(0)
+    ref_layer = torch.nn.Linear(256, 3072).bfloat16()
+    x = torch.randn(1, 256).bfloat16()
+    layer = nn.Linear(256, 3072)
+    layer.weight = mx.array(ref_layer.weight.detach().float().numpy()).astype(mx.bfloat16)
+    layer.bias = mx.array(ref_layer.bias.detach().float().numpy()).astype(mx.bfloat16)
+    with torch.no_grad():
+        ref = ref_layer(x).float().numpy()
+    out = linear_fp32_acc(layer, mx.array(x.float().numpy()).astype(mx.bfloat16))
+    assert out.dtype == mx.bfloat16
+    assert rel_l2(out, ref) < 1e-6

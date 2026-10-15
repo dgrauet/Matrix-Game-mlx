@@ -11,8 +11,17 @@ import mlx.nn as nn
 
 from matrix_game_mlx.inference.wan.modules.attention import attention
 from matrix_game_mlx.inference.wan.modules.model import (
-    WAN_CROSSATTENTION_CLASSES, WanLayerNorm, WanRMSNorm, _apply_rope_rotation, rope_params,
+    WAN_CROSSATTENTION_CLASSES, WanLayerNorm, WanRMSNorm, _apply_rope_rotation, gelu_tanh, rope_params, silu,
     sinusoidal_embedding_1d)
+
+
+def linear_fp32_acc(layer: nn.Linear, x: mx.array) -> mx.array:
+    """torch bf16 nn.Linear semantics (fp32 accumulate, bias added before the single rounding) for M=1 rows.
+
+    MLX's bf16 addmm on a single row (GEMV path) rounds the product to bf16 before adding the bias; on the
+    timestep MLP that double rounding is 2.9e-3 relative off torch. Larger M is unaffected.
+    """
+    return mx.addmm(layer.bias.astype(mx.float32), x.astype(mx.float32), layer.weight.astype(mx.float32).T).astype(x.dtype)
 
 
 def _check_rope_len(freqs, need: int) -> None:
@@ -186,7 +195,7 @@ class CausalWanAttentionBlock(nn.Module):
         self.modulation = mx.zeros((1, 6, dim))
 
     def ffn(self, x):
-        return self.ffn_linear2(nn.gelu_approx(self.ffn_linear1(x)))
+        return self.ffn_linear2(gelu_tanh(self.ffn_linear1(x)))
 
     def __call__(self, x, e, seq_lens, grid_sizes, freqs, context, context_lens, block_mask=None, kv_cache=None,
                  crossattn_cache=None, current_start=0, cache_start=None, sink_rope_mode=None):
@@ -287,14 +296,14 @@ class CausalWanModel(nn.Module):
         assert max(u.shape[1] for u in tokens) <= seq_len
         x = mx.concatenate(tokens, axis=0)
 
-        e = self.time_embedding_linear2(nn.silu(self.time_embedding_linear1(
-            sinusoidal_embedding_1d(self.freq_dim, t.reshape(-1)).astype(x.dtype))))
-        e0 = self.time_projection_linear1(nn.silu(e)).reshape(*t.shape, 6, self.dim)
+        e = linear_fp32_acc(self.time_embedding_linear2, silu(linear_fp32_acc(
+            self.time_embedding_linear1, sinusoidal_embedding_1d(self.freq_dim, t.reshape(-1)).astype(x.dtype))))
+        e0 = linear_fp32_acc(self.time_projection_linear1, silu(e)).reshape(*t.shape, 6, self.dim)
 
         ctx = context if isinstance(context, mx.array) else mx.stack(list(context))
         if ctx.shape[1] < self.text_len:
             ctx = mx.concatenate([ctx, mx.zeros((ctx.shape[0], self.text_len - ctx.shape[1], ctx.shape[2]), ctx.dtype)], 1)
-        context = self.text_embedding_linear2(nn.gelu_approx(self.text_embedding_linear1(ctx.astype(dtype))))
+        context = self.text_embedding_linear2(gelu_tanh(self.text_embedding_linear1(ctx.astype(dtype))))
 
         for block_index, block in enumerate(self.blocks):
             x = block(x, e0, seq_lens, grid_sizes, self.freqs, context, None, None,
