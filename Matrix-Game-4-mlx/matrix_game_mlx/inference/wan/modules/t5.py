@@ -86,7 +86,7 @@ class T5Attention(nn.Module):
         v = self.v(context).reshape(b, -1, n, c)
 
         # attention bias: [B, N, Lq, Lk]
-        attn_bias = mx.zeros((b, n, q.shape[1], k.shape[1]))
+        attn_bias = mx.zeros((b, n, q.shape[1], k.shape[1]), dtype=x.dtype)  # x.new_zeros
         if pos_bias is not None:
             attn_bias = attn_bias + pos_bias
         if mask is not None:
