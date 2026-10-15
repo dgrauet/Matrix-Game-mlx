@@ -106,3 +106,71 @@ class WanTextEncoder:
         """Returns {"prompt_embeds": [B, 512, 4096]}."""
         context = self.text_encoder(text_prompts)
         return {"prompt_embeds": mx.stack(context)}
+
+
+WAN22_VAE_MEAN = [
+    -0.2289, -0.0052, -0.1323, -0.2339, -0.2799, 0.0174, 0.1838, 0.1557,
+    -0.1382, 0.0542, 0.2813, 0.0891, 0.1570, -0.0098, 0.0375, -0.1825,
+    -0.2246, -0.1207, -0.0698, 0.5109, 0.2665, -0.2108, -0.2158, 0.2502,
+    -0.2055, -0.0322, 0.1109, 0.1567, -0.0729, 0.0899, -0.2799, -0.1230,
+    -0.0313, -0.1649, 0.0117, 0.0723, -0.2839, -0.2083, -0.0520, 0.3748,
+    0.0152, 0.1957, 0.1433, -0.2944, 0.3573, -0.0548, -0.1681, -0.0667,
+]
+WAN22_VAE_STD = [
+    0.4765, 1.0364, 0.4514, 1.1677, 0.5313, 0.4990, 0.4818, 0.5013,
+    0.8158, 1.0344, 0.5894, 1.0901, 0.6885, 0.6165, 0.8454, 0.4978,
+    0.5759, 0.3523, 0.7135, 0.6804, 0.5833, 1.4146, 0.8986, 0.5659,
+    0.7069, 0.5338, 0.4889, 0.4917, 0.4069, 0.4999, 0.6866, 0.4093,
+    0.5709, 0.6065, 0.6415, 0.4944, 0.5726, 1.2042, 0.5458, 1.6887,
+    0.3971, 1.0600, 0.3943, 0.5537, 0.5444, 0.4089, 0.7468, 0.7744,
+]
+
+
+class WanVAE22Wrapper:
+    """Wan2.2 VAE (48 latent channels, 4x temporal / 16x spatial) with streaming encode."""
+    z_dim, temporal_stride, spatial_stride = 48, 4, 16
+
+    def __init__(self, vae_path: str, dtype=mx.bfloat16):
+        from matrix_game_mlx.inference.wan.modules.vae2_2 import WanVAE_
+        model = WanVAE_(dim=160, z_dim=48, dim_mult=[1, 2, 4, 4], temperal_downsample=[False, True, True])
+        clean = {}
+        for key, value in mx.load(str(vae_path)).items():
+            head, dot, _rest = key.partition(".")
+            if dot and head.startswith("vae"):
+                key = key[len(head) + 1:]
+            clean[key] = value.astype(dtype) if mx.issubdtype(value.dtype, mx.floating) else value
+        model.load_weights(list(clean.items()), strict=True)
+        mx.eval(model.parameters())
+        self._init(model, WAN22_VAE_MEAN, WAN22_VAE_STD, dtype)
+
+    @classmethod
+    def from_model(cls, model, mean, std, dtype) -> "WanVAE22Wrapper":
+        self = cls.__new__(cls)
+        self._init(model, mean, std, dtype)
+        return self
+
+    def _init(self, model, mean, std, dtype) -> None:
+        self.model, self.dtype = model, dtype
+        self.mean = mx.array(mean, dtype=mx.float32)
+        self.std = mx.array(std, dtype=mx.float32)
+
+    def _scale(self, dtype) -> List[mx.array]:
+        return [self.mean.astype(dtype), (1.0 / self.std).astype(dtype)]
+
+    def encode_stream(self, x: mx.array, feat_cache: list) -> mx.array:
+        """One streaming encoder step: x [B, T, H, W, 3] (T = 1 then 4) -> normalized mu [B, 1, 48, h, w].
+
+        Mirrors CastleStream.push's Wan branch: encoder(patchify(x), feat_cache, feat_idx=[0]) -> conv1 -> mu.
+        """
+        from matrix_game_mlx.inference.wan.modules.vae2_2 import patchify
+        hidden = self.model.encoder(patchify(x.astype(self.dtype), patch_size=2), feat_cache=feat_cache, feat_idx=[0])
+        mu = self.model.conv1(hidden)[..., :self.z_dim]
+        mean, inv_std = self._scale(self.dtype)
+        return ((mu - mean) * inv_std).transpose(0, 1, 4, 2, 3)
+
+    def encode_to_latent(self, pixel: mx.array) -> mx.array:
+        """pixel [B, F, 3, H, W] in [-1, 1] -> latents [B, F', 48, h, w] (float32)."""
+        scale = self._scale(self.dtype)
+        out = [self.model.encode(u.transpose(0, 2, 3, 1)[None].astype(self.dtype), scale).astype(mx.float32)[0]
+               for u in pixel]
+        return mx.stack(out).transpose(0, 1, 4, 2, 3)
