@@ -1,0 +1,67 @@
+import numpy as np
+import torch
+import mlx.core as mx
+from tests.conftest import import_upstream, assert_close
+
+from matrix_game_mlx.inference.wan.modules import model as M
+from matrix_game_mlx.inference.wan.modules.attention import attention
+
+up = import_upstream("matrix_game.inference.wan.modules.model")
+
+
+def _load_linear(dst, src):
+    dst.weight = mx.array(src.weight.detach().numpy())
+    dst.bias = mx.array(src.bias.detach().numpy())
+
+
+def test_sinusoidal_embedding():
+    pos = np.array([0.0, 250.0, 937.5, 1000.0], np.float32)
+    assert_close(M.sinusoidal_embedding_1d(256, mx.array(pos)),
+                 up.sinusoidal_embedding_1d(256, torch.from_numpy(pos)).float(), atol=1e-5, rtol=0)
+
+
+def test_rope_params_long_table():
+    cos, sin = M.rope_params(8192, 44)
+    ref = up.rope_params(8192, 44)
+    assert_close(cos, ref.real.float(), atol=1e-6, rtol=0)
+    assert_close(sin, ref.imag.float(), atol=1e-6, rtol=0)
+
+
+def test_norms():
+    x = np.random.default_rng(0).standard_normal((2, 7, 64)).astype(np.float32)
+    rms_a, rms_b = M.WanRMSNorm(64, eps=1e-6), up.WanRMSNorm(64, eps=1e-6)
+    torch.nn.init.normal_(rms_b.weight)
+    rms_a.weight = mx.array(rms_b.weight.detach().numpy())
+    assert_close(rms_a(mx.array(x)), rms_b(torch.from_numpy(x)), atol=1e-5)
+    ln_a, ln_b = M.WanLayerNorm(64, 1e-6, elementwise_affine=True), up.WanLayerNorm(64, 1e-6, elementwise_affine=True)
+    torch.nn.init.normal_(ln_b.weight); torch.nn.init.normal_(ln_b.bias)
+    ln_a.weight = mx.array(ln_b.weight.detach().numpy()); ln_a.bias = mx.array(ln_b.bias.detach().numpy())
+    assert_close(ln_a(mx.array(x)), ln_b(torch.from_numpy(x)), atol=1e-5)
+
+
+def test_cross_attention_with_cache():
+    torch.manual_seed(0)
+    dim, heads = 128, 4
+    b = up.WanT2VCrossAttention(dim, heads, (-1, -1), True, 1e-6).eval()
+    a = M.WanT2VCrossAttention(dim, heads, (-1, -1), True, 1e-6)
+    for name in ("q", "k", "v", "o"):
+        _load_linear(getattr(a, name), getattr(b, name))
+    a.norm_q.weight = mx.array(b.norm_q.weight.detach().numpy())
+    a.norm_k.weight = mx.array(b.norm_k.weight.detach().numpy())
+    x = torch.randn(1, 40, dim); ctx = torch.randn(1, 16, dim)
+    cache_a, cache_b = {"is_init": False}, {"k": None, "v": None, "is_init": False}
+    with torch.no_grad():
+        ref1 = b(x, ctx, None, crossattn_cache=cache_b)
+        ref2 = b(x * 2, ctx * 0, None, crossattn_cache=cache_b)   # second call must reuse cached K/V
+    out1 = a(mx.array(x.numpy()), mx.array(ctx.numpy()), None, crossattn_cache=cache_a)
+    out2 = a(mx.array((x * 2).numpy()), mx.array((ctx * 0).numpy()), None, crossattn_cache=cache_a)
+    assert_close(out1, ref1, atol=1e-4)
+    assert_close(out2, ref2, atol=1e-4)
+
+
+def test_attention_matches_sdpa():
+    rng = np.random.default_rng(0)
+    q, k, v = (rng.standard_normal(s).astype(np.float32) for s in ((1, 10, 4, 32), (1, 30, 4, 32), (1, 30, 4, 32)))
+    ref = torch.nn.functional.scaled_dot_product_attention(
+        *(torch.from_numpy(t).transpose(1, 2) for t in (q, k, v))).transpose(1, 2)
+    assert_close(attention(mx.array(q), mx.array(k), mx.array(v)), ref, atol=1e-5)
