@@ -35,14 +35,18 @@ def test_kv_cache_rollout_30_chunks(sink_rope_mode):
                "global_end_index": 0, "local_end_index": 0, "k_sink_raw": mx.zeros((1, S * fsl, heads, dim // heads))}
     rng = np.random.default_rng(0)
     for chunk in range(30):
-        x = rng.standard_normal((1, fsl, dim)).astype(np.float32)
-        # each chunk is written twice like the stream: denoise pass then clean pass at the same start
-        for _ in range(2):
+        # each chunk is written twice like the stream: denoise pass then clean pass at the same start, with a
+        # different input so the clean pass must overwrite what the denoise pass wrote
+        for pass_name in ("denoise", "clean"):
+            x = rng.standard_normal((1, fsl, dim)).astype(np.float32)
             with torch.no_grad():
                 ref = b(torch.from_numpy(x), torch.tensor([fsl]), torch.tensor(grid), fp, None,
                         kv_cache=cache_b, current_start=chunk * fsl, sink_rope_mode=sink_rope_mode)
             out = a(mx.array(x), mx.array([fsl]), grid, fm, None, kv_cache=cache_a,
                     current_start=chunk * fsl, sink_rope_mode=sink_rope_mode)
-            assert_close(out, ref, atol=1e-4, msg=f"chunk {chunk}")
-        assert cache_a["local_end_index"] == int(cache_b["local_end_index"])
-        assert_close(cache_a["k"], cache_b["k"], atol=1e-4)
+            msg = f"chunk {chunk} {pass_name}"
+            assert_close(out, ref, atol=1e-4, msg=msg)
+            assert cache_a["global_end_index"] == int(cache_b["global_end_index"]), msg
+            assert cache_a["local_end_index"] == int(cache_b["local_end_index"]), msg
+            for name in ("k", "v", "k_sink_raw"):
+                assert_close(cache_a[name], cache_b[name], atol=1e-4, msg=f"{msg} {name}")

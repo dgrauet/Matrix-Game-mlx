@@ -52,8 +52,9 @@ def test_rollout_25_chunks_fixed_sink():
     rng = np.random.default_rng(0)
     ctx = rng.standard_normal((1, 8, 32)).astype(np.float32)
     for i in range(L):
-        x = rng.standard_normal((12, 1, 2, 4)).astype(np.float32)          # torch [C, F, H, W]
+        # denoise pass then clean pass at the same start, each with its own input (the clean pass overwrites)
         for t in (937.5, 0.0):
+            x = rng.standard_normal((12, 1, 2, 4)).astype(np.float32)      # torch [C, F, H, W]
             with torch.no_grad():
                 out_b = ref(torch.from_numpy(x)[None], t=torch.tensor([[t]]), context=torch.from_numpy(ctx),
                             seq_len=fsl, kv_cache=kv_b, crossattn_cache=xc_b, current_start=i * fsl,
@@ -61,4 +62,10 @@ def test_rollout_25_chunks_fixed_sink():
             out_a = model([mx.array(x.transpose(1, 2, 3, 0))], t=mx.array([[t]]), context=mx.array(ctx),
                           seq_len=fsl, kv_cache=kv_a, crossattn_cache=xc_a, current_start=i * fsl,
                           sink_rope_mode="fixed")
-            assert_close(out_a, out_b.permute(0, 2, 3, 4, 1), atol=5e-4, msg=f"chunk {i} t={t}")
+            msg = f"chunk {i} t={t}"
+            assert_close(out_a, out_b.permute(0, 2, 3, 4, 1), atol=5e-4, msg=msg)
+            for layer, (ca, cb) in enumerate(zip(kv_a, kv_b)):
+                assert ca["global_end_index"] == int(cb["global_end_index"]), f"{msg} layer {layer}"
+                assert ca["local_end_index"] == int(cb["local_end_index"]), f"{msg} layer {layer}"
+                for name in ("k", "v", "k_sink_raw"):
+                    assert_close(ca[name], cb[name], atol=5e-4, msg=f"{msg} layer {layer} {name}")
