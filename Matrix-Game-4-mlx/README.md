@@ -57,12 +57,28 @@ these files (still sha256-checked).
 
 ## Performance
 
-Apple M2 Pro, 32 GB, MLX 0.31.1, ancient-egypt, quality preset, 1280x720 24 FPS input (rendered at 480x864).
-A chunk is one latent frame (four video frames, one for the first chunk), with two denoising calls and one
-cache-update call. `seconds` excludes model loading (~30 s); `seconds_per_chunk` is `seconds / chunks`,
-so it includes video decode, VAE encode/decode and MP4 encoding.
+Apple M2 Pro, 32 GB, MLX 0.31.1, ancient-egypt, quality preset, frames at 480x864. A chunk is one latent
+frame (four video frames, one for the first chunk), with two denoising calls and one cache-update call.
 
-| Run | Frames | Chunks | seconds | s/chunk | Peak memory |
+Long run: 27 chunks (105 frames) through `CastleStream.push` with real weights, timed per chunk (VAE encode, the
+three DiT calls and VAE decode; no video I/O; model loading ~23 s excluded). The KV window (21 latents, sink
+included) fills at chunk 19, and chunks 20 to 26 run with rolling eviction.
+
+| Chunks | s/chunk mean | min | max |
+| --- | --- | --- | --- |
+| 0 (one frame) | 12.0 | | |
+| 1 (first four-frame chunk) | 30.2 | | |
+| 2 to 26, steady state (25 chunks) | 33.2 | 26.9 | 42.4 |
+
+Memory over the same run: peak 22.74 GiB, active 17.24 GiB flat from chunk 2 through the window fill and the
+eviction, MLX buffer cache (`mx.get_cache_memory`) 6.14 GiB. At the steady-state mean, a 10 s take at 24 FPS (240 frames, 61 chunks) renders
+in about 34 min, roughly 8.3 s per video frame.
+
+Short CLI runs (`render.json`, 1280x720 24 FPS input, 6 frames = 3 chunks): these averages include the
+one-frame chunk 0, so they understate the steady-state cost per chunk. `seconds` excludes model loading;
+`seconds_per_chunk` is `seconds / chunks` and includes video decode, VAE encode/decode and MP4 encoding.
+
+| Short run (3 chunks) | Frames | Chunks | seconds | s/chunk | Peak memory |
 | --- | --- | --- | --- | --- | --- |
 | Before Task 15 numeric fixes (float64 islands, fused fp32-opmath activations) | 6 | 3 | 77.5 | 25.8 | 23.9 GB |
 | After them (float64 islands on the CPU stream) | 6 | 3 | 73.6 | 24.5 | 24.4 GB |
@@ -73,7 +89,7 @@ partly degraded during the run, so they are approximate): all DiT GEMMs and atte
 (the Conv kind is 42 % of GPU time, its top kernel `implicit_gemm_conv_3d_bfloat16` alone 40 %). No float32
 GEMM or attention kernel remains. The float32 elementwise and reduce kernels are the norm statistics and the
 torch-opmath activations listed under Numerics. The float64 CPU-stream work costs about 0.54 s per DiT forward (RoPE ~0.49 s over 30 layers,
-timestep MLP ~0.05 s, flow-to-x0 negligible), so 1.1 to 1.6 s per chunk (5 to 7 %).
+timestep MLP ~0.05 s, flow-to-x0 negligible), so 1.1 to 1.6 s per chunk (3 to 5 % of the 33.2 s steady-state chunk).
 
 ## Numerics
 
@@ -85,6 +101,12 @@ timestep-MLP linears (one row per timestep entry, B x F) accumulate in float64, 
 outputs at any row count). The scheduler's sigma grid reproduces `torch.linspace` bitwise. The umT5 text
 encoder runs in bf16, as upstream's loader runs it (`WanTextEncoder(...).to(device, torch.bfloat16)`),
 attention bias included (`x.new_zeros`).
+
+## Scenes
+
+Only ancient-egypt is parity-validated in milestone 1. `--scene castle` and `--scene racing` are exposed (the pack
+holds their DiT weights and sink images), but their first-frame sink, absolute RoPE and racing RNG role have no
+torch fixtures yet (milestone 2); the CLI logs a warning when they are selected.
 
 ## Known deviations from upstream
 

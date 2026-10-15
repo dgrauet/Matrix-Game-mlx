@@ -46,7 +46,7 @@ the broader project overview.
 
 ## Matrix-Game 4.0 MLX Port (Apple Silicon)
 
-[Matrix-Game-4-mlx](Matrix-Game-4-mlx): offline rendering of Matrix-Game 4.0 with MLX (ancient-egypt, quality preset, ~25 s per four-frame chunk on an M2 Pro 32 GB), validated against the upstream PyTorch code with real weights. Castle, racing and the realtime preset are next.
+[Matrix-Game-4-mlx](Matrix-Game-4-mlx): offline rendering of Matrix-Game 4.0 with MLX (ancient-egypt, quality preset, ~33 s per four-frame chunk in steady state on an M2 Pro 32 GB, about 34 min for a 10 s 24 FPS take), validated against the upstream PyTorch code with real weights. Castle, racing and the realtime preset are next.
 
 ## Matrix-Game 3.0 MLX Port (Apple Silicon)
 
