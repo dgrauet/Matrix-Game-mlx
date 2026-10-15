@@ -1,16 +1,22 @@
 """Real-weight parity of the MLX stream against upstream PyTorch fixtures (tests/parity/gen_fixtures.py).
 
-Two levels:
+Three levels:
+- Per block (isolated): for chunk 0's first denoising call, each MLX block gets torch's exact block input (and
+  shared e0 / context / sink KV); its output must be within 1.5 x the largest rel L2 between torch and its own
+  kernel variants on that block (meta.json "block_floors"). This is the check that nothing diverges
+  systematically.
 - Per call (teacher forced): torch's exact cache state at a chunk boundary and torch's exact inputs are injected,
   one MLX generator call runs, and its pred plus the layer 0/29 KV it writes are compared with torch. Each call's
-  threshold is the largest rel L2 measured between torch and its own kernel variants on the same call (native
-  bf16 SDPA, native CPU bf16; meta.json "call_floors"), rounded up to one significant digit. The rest of the cache
-  (history, sink, rolled window) must match bitwise. Long chunk 22 runs past the 21-frame window, so the rolling
-  eviction and the fixed-sink re-RoPE run with real weights.
+  threshold is 1.5 x the largest rel L2 between torch and its kernel variants on the same call (meta.json
+  "call_floors"), rounded up to one significant digit. The rest of the cache (history, sink, rolled window) must
+  match bitwise. Long chunk 22 runs past the 21-frame window, so the rolling eviction and the fixed-sink re-RoPE
+  run with real weights.
 - End to end: the full MLX stream from the same inputs. The autoregressive stream amplifies bf16 rounding chunk
   over chunk (torch against itself reaches ~0.3 rel L2 by chunk 2), so only chunk 0 is gated, with the spec
   thresholds; chunks 1 and 2 are reported.
 """
+import json
+
 import numpy as np
 import pytest
 import mlx.core as mx
@@ -21,24 +27,24 @@ from tests.parity.gen_fixtures import KV_LAYERS, LONG_CALL_CHUNK, from_bits, wri
 pytestmark = [pytest.mark.needs_weights, pytest.mark.needs_fixtures]
 
 LONG = f"calls_long{LONG_CALL_CHUNK}"
-# (fixture, call) -> (pred, layer-0 KV slot, layer-29 KV slot) rel L2 thresholds: the max over the three torch
-# kernel variants of that call ("sdpa": native bf16 SDPA, "bf16": native CPU bf16, "f64": float64-accumulated
-# GEMM/conv/SDPA; meta.json "call_floors"), rounded up to one significant digit. KV numbers are max(k, v) of the
-# slot the call writes. Calls 0 / 1 are the t=1000 / t=833 denoising steps, call 2 the clean KV pass (t=0:
-# pred = input exactly, so its pred threshold is 0).
+# (fixture, call) -> (pred, layer-0 KV slot, layer-29 KV slot) rel L2 thresholds: 1.5 x the max over the three
+# torch kernel variants of that call ("sdpa": native bf16 SDPA, "bf16": native CPU bf16, "f64": float64-accumulated
+# GEMM/conv/SDPA; meta.json "call_floors"), rounded up to one significant digit. The comments give the max variant
+# per entry. KV numbers are max(k, v) of the slot the call writes. Calls 0 / 1 are the t=1000 / t=833 denoising
+# steps, call 2 the clean KV pass (t=0: pred = input exactly, so its pred threshold is 0).
 CALL_TOL = {
-    ("calls_chunk0", 0): (2e-2, 3e-4, 3e-2),  # pred sdpa 1.78e-2 bf16 1.68e-2 f64 1.70e-2; l0 bf16 2.16e-4; l29 sdpa 2.97e-2
-    ("calls_chunk0", 1): (2e-2, 2e-4, 3e-2),  # pred sdpa 1.14e-2 bf16 1.14e-2 f64 1.17e-2; l0 bf16 1.75e-4; l29 f64 2.12e-2
-    ("calls_chunk0", 2): (0.0, 2e-4, 2e-2),   # pred 0 / 0 / 0; l0 bf16 1.45e-4; l29 bf16 1.86e-2
-    ("calls_chunk1", 0): (9e-2, 2e-4, 2e-1),  # pred sdpa 5.22e-2 bf16 8.54e-2 f64 4.92e-2; l0 bf16 1.75e-4; l29 bf16 1.57e-1
-    ("calls_chunk1", 1): (4e-2, 2e-4, 7e-2),  # pred sdpa 2.43e-2 bf16 3.00e-2 f64 3.03e-2; l0 f64 1.49e-4; l29 f64 6.46e-2
-    ("calls_chunk1", 2): (0.0, 2e-4, 2e-2),   # pred 0 / 0 / 0; l0 f64 1.54e-4; l29 f64 1.89e-2
-    ("calls_chunk2", 0): (7e-2, 3e-4, 2e-1),  # pred sdpa 5.87e-2 bf16 6.90e-2 f64 6.77e-2; l0 f64 2.04e-4; l29 bf16 1.46e-1
-    ("calls_chunk2", 1): (6e-2, 2e-4, 2e-1),  # pred sdpa 5.16e-2 bf16 5.52e-2 f64 4.94e-2; l0 bf16 1.34e-4; l29 bf16 1.21e-1
-    ("calls_chunk2", 2): (0.0, 2e-4, 3e-2),   # pred 0 / 0 / 0; l0 bf16 1.35e-4; l29 bf16 2.54e-2
-    (LONG, 0): (5e-2, 2e-4, 9e-2),            # pred sdpa 3.01e-2 bf16 2.79e-2 f64 4.11e-2; l0 f64 1.78e-4; l29 f64 8.08e-2
-    (LONG, 1): (3e-2, 2e-4, 5e-2),            # pred sdpa 2.29e-2 bf16 2.06e-2 f64 2.18e-2; l0 bf16 1.97e-4; l29 sdpa 4.72e-2
-    (LONG, 2): (0.0, 2e-4, 2e-2),             # pred 0 / 0 / 0; l0 f64 1.20e-4; l29 sdpa 1.94e-2
+    ("calls_chunk0", 0): (3e-2, 4e-4, 5e-2),  # pred sdpa 1.78e-2 / bf16 1.68e-2 / f64 1.70e-2; l0 bf16 2.16e-4; l29 sdpa 2.97e-2
+    ("calls_chunk0", 1): (2e-2, 3e-4, 4e-2),  # pred sdpa 1.14e-2 / bf16 1.14e-2 / f64 1.17e-2; l0 bf16 1.75e-4; l29 f64 2.12e-2
+    ("calls_chunk0", 2): (0.0, 3e-4, 3e-2),   # pred 0 / 0 / 0; l0 bf16 1.45e-4; l29 bf16 1.86e-2
+    ("calls_chunk1", 0): (2e-1, 3e-4, 3e-1),  # pred sdpa 5.22e-2 / bf16 8.54e-2 / f64 4.92e-2; l0 bf16 1.75e-4; l29 bf16 1.57e-1
+    ("calls_chunk1", 1): (5e-2, 3e-4, 1e-1),  # pred sdpa 2.43e-2 / bf16 3.00e-2 / f64 3.03e-2; l0 f64 1.49e-4; l29 f64 6.46e-2
+    ("calls_chunk1", 2): (0.0, 3e-4, 3e-2),   # pred 0 / 0 / 0; l0 f64 1.54e-4; l29 f64 1.89e-2
+    ("calls_chunk2", 0): (2e-1, 4e-4, 3e-1),  # pred sdpa 5.87e-2 / bf16 6.90e-2 / f64 6.77e-2; l0 f64 2.04e-4; l29 bf16 1.46e-1
+    ("calls_chunk2", 1): (9e-2, 3e-4, 2e-1),  # pred sdpa 5.16e-2 / bf16 5.52e-2 / f64 4.94e-2; l0 bf16 1.34e-4; l29 bf16 1.21e-1
+    ("calls_chunk2", 2): (0.0, 3e-4, 4e-2),   # pred 0 / 0 / 0; l0 bf16 1.35e-4; l29 bf16 2.54e-2
+    (LONG, 0): (7e-2, 3e-4, 2e-1),            # pred sdpa 3.01e-2 / bf16 2.79e-2 / f64 4.11e-2; l0 f64 1.78e-4; l29 f64 8.08e-2
+    (LONG, 1): (4e-2, 3e-4, 8e-2),            # pred sdpa 2.29e-2 / bf16 2.06e-2 / f64 2.18e-2; l0 bf16 1.97e-4; l29 sdpa 4.72e-2
+    (LONG, 2): (0.0, 2e-4, 3e-2),             # pred 0 / 0 / 0; l0 f64 1.20e-4; l29 sdpa 1.94e-2
 }
 
 
@@ -57,16 +63,45 @@ def comps():
     return comps
 
 
-@pytest.mark.parametrize("name,j", sorted(CALL_TOL))
-def test_call_parity(comps, name, j):
-    fx = np.load(fixtures_dir() / "egypt_quality" / f"{name}.npz")
-    stream = comps.stream(seed=0)
-    for i, c in enumerate(stream.kv):                                          # torch's state at the chunk boundary
+def _inject_state(kv, fx) -> None:
+    """Fill MLX KV caches with torch's state at the chunk boundary (all layers)."""
+    for i, c in enumerate(kv):
         n = int(fx[f"state_lei{i}"])
         c["k"], c["v"] = mx.zeros_like(c["k"]), mx.zeros_like(c["v"])
         c["k"][:, :n], c["v"][:, :n] = _to_mx(fx[f"state_k{i}"]), _to_mx(fx[f"state_v{i}"])
         c["k_sink_raw"] = _to_mx(fx[f"state_ksr{i}"])
         c["global_end_index"], c["local_end_index"] = int(fx[f"state_gei{i}"]), n
+
+
+@pytest.fixture(scope="module")
+def block_case(comps):
+    d = fixtures_dir() / "egypt_quality"
+    gates = [b["gate"] for b in json.loads((d / "meta.json").read_text())["block_floors"]["blocks"]]
+    return np.load(d / "calls_chunk0.npz"), np.load(d / "blocks_chunk0_call0.npz"), gates
+
+
+@pytest.mark.parametrize("i", range(30))
+def test_block_parity(comps, block_case, i):
+    """Block i on torch's exact input, e0, context and sink KV vs torch's output; gate 1.5 x max torch variant."""
+    from matrix_game_mlx.inference.wrappers import init_crossattn_cache
+    fx, blocks, gates = block_case
+    stream = comps.stream(seed=0)
+    _inject_state(stream.kv, fx)
+    xc = init_crossattn_cache(stream.gen, 1, mx.bfloat16)                     # cross-attn K/V from torch's context
+    model = stream.gen.model
+    y = model.blocks[i](_to_mx(blocks[f"x{i}"]), _to_mx(blocks["e0"]), mx.array([405]), [[1, 15, 27]], model.freqs,
+                        _to_mx(blocks["context"]), None, None, kv_cache=stream.kv[i], crossattn_cache=xc[i],
+                        current_start=int(fx["c0_start"]), cache_start=0, sink_rope_mode="fixed")
+    err = rel_l2(y, from_bits(blocks[f"x{i + 1}"]))
+    print(f"block {i}: rel L2 {err:.3e} gate {gates[i]:.3e} ratio {err / gates[i]:.2f}")
+    assert err <= gates[i], (err, gates[i])
+
+
+@pytest.mark.parametrize("name,j", sorted(CALL_TOL))
+def test_call_parity(comps, name, j):
+    fx = np.load(fixtures_dir() / "egypt_quality" / f"{name}.npz")
+    stream = comps.stream(seed=0)
+    _inject_state(stream.kv, fx)                                               # torch's state at the chunk boundary
     _, pred = stream.gen(noisy_image_or_video=_to_mx(fx[f"c{j}_x"]),
                          conditional_dict={"prompt_embeds": comps.prompt, "control_latent": _to_mx(fx["control"])},
                          timestep=mx.array(fx[f"c{j}_t"]), kv_cache=stream.kv, crossattn_cache=stream.xc,

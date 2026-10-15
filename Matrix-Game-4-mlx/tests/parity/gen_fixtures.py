@@ -4,8 +4,8 @@ Run manually from Matrix-Game-4-mlx/ (not collected by pytest):
     MATRIX_GAME_4_MLX_WEIGHTS_DIR=... python -m tests.parity.gen_fixtures --device auto [--long]
 
 Writes `$MG4_FIXTURES_DIR/egypt_quality/`: inputs.npz, chunk_{i}.npz, floor_chunk_{i}.npz, calls_chunk{i}.npz,
-meta.json (and long_*.npz plus calls_long22.npz with --long). `--floor-only` / `--calls-only` regenerate only the
-floor / per-call files from the saved fixtures.
+blocks_chunk0_call0.npz, meta.json (and long_*.npz plus calls_long22.npz with --long). `--floor-only`,
+`--calls-only`, `--call-floors-only` and `--blocks-only` regenerate only those parts from the saved fixtures.
 """
 import argparse
 import contextlib
@@ -375,16 +375,35 @@ def save_calls(path: Path, state: dict, control: np.ndarray, calls: list) -> Non
              **{f"c{j}_{k}": v for j, call in enumerate(calls) for k, v in call.items()})
 
 
+FLOOR_VARIANTS = ("native_sdpa", "native_cpu_bf16", "fp64_acc")
+
+
+def floor_variant(torch, name: str):
+    """Context of one torch kernel variant used for the floors (see meta.json "call_floors" / "block_floors")."""
+    return {"native_sdpa": lambda: cpu_bf16_emulation(torch, sdpa=False), "native_cpu_bf16": contextlib.nullcontext,
+            "fp64_acc": lambda: cpu_bf16_emulation(torch, acc=torch.float64)}[name]()
+
+
+def build_torch_dit(torch):
+    """Upstream causal DiT on CPU, configured as CastleStream does (21-latent window, 1 sink, 8192 RoPE rows)."""
+    from matrix_game.inference.loading import build_dit
+    from matrix_game.inference.rollout import set_attention_window
+    ensure_accelerate(torch)                     # after upstream imports (transformers probes accelerate)
+    gen = build_dit(str(CONFIG_DIR), str(CHECKPOINT), is_causal=True, dtype="bfloat16", timestep_shift=5)
+    gen = gen.eval().requires_grad_(False)
+    set_attention_window(gen, 21, 1)
+    gen.model.set_rope_max_len(8192)
+    return gen
+
+
 def call_floor(torch, gen, prompt, fixture) -> list:
     """Torch-vs-torch floor per call: rel L2 of pred and of the layer 0/29 KV slot it writes, for two other kernels."""
-    variants = {"native_sdpa": lambda: cpu_bf16_emulation(torch, sdpa=False), "native_cpu_bf16": contextlib.nullcontext,
-                "fp64_acc": lambda: cpu_bf16_emulation(torch, acc=torch.float64)}
     out = []
     for j in range(int(fixture["n_calls"])):
         row = {}
-        for name, ctx in variants.items():
+        for name in FLOOR_VARIANTS:
             kv, xc = load_kv_state(torch, gen, fixture)
-            with ctx():
+            with floor_variant(torch, name):
                 _, pred = gen(noisy_image_or_video=torch.from_numpy(from_bits(fixture[f"c{j}_x"])).to(torch.bfloat16),
                               conditional_dict={"prompt_embeds": prompt,
                                                 "control_latent": torch.from_numpy(from_bits(fixture["control"])).to(torch.bfloat16)},
@@ -457,13 +476,7 @@ def call_floors(out: Path, gen=None, prompt=None, names=None) -> None:
     torch.set_grad_enabled(False)
     meta = json.loads((out / "meta.json").read_text())
     if gen is None:
-        from matrix_game.inference.loading import build_dit
-        from matrix_game.inference.rollout import set_attention_window
-        ensure_accelerate(torch)                     # after upstream imports (transformers probes accelerate)
-        gen = build_dit(str(CONFIG_DIR), str(CHECKPOINT), is_causal=True, dtype="bfloat16", timestep_shift=5)
-        gen = gen.eval().requires_grad_(False)
-        set_attention_window(gen, 21, 1)
-        gen.model.set_rope_max_len(8192)
+        gen = build_torch_dit(torch)
         prompt = torch.from_numpy(np.load(out / "inputs.npz")["prompt_embeds"]).to(torch.bfloat16)
         names = sorted(p.stem for p in out.glob("calls_*.npz"))
     t0 = time.perf_counter()
@@ -478,6 +491,62 @@ def call_floors(out: Path, gen=None, prompt=None, names=None) -> None:
         seconds=time.perf_counter() - t0)
     (out / "meta.json").write_text(json.dumps(meta, indent=2))
     log(f"per-call floors done in {meta['call_floors']['seconds']:.0f}s")
+
+
+def block_fixtures(out: Path) -> None:
+    """Per-block isolated fixture for chunk 0's first denoising call (calls_chunk0.npz, call 0): every block's torch
+    input/output and the shared e0 / context (blocks_chunk0_call0.npz), and each block's torch kernel-variant
+    floor with the derived gate 1.5 x max variant (meta.json "block_floors")."""
+    import torch
+    torch.set_grad_enabled(False)
+    meta = json.loads((out / "meta.json").read_text())
+    fixture = np.load(out / "calls_chunk0.npz")
+    prompt = torch.from_numpy(np.load(out / "inputs.npz")["prompt_embeds"]).to(torch.bfloat16)
+    t0 = time.perf_counter()
+    gen = build_torch_dit(torch)
+    blocks = gen.model.blocks
+    acts, kwargs = {}, {}
+
+    def capture(i):
+        def hook(module, args, kw):
+            acts[f"x{i}"] = bf16_bits(args[0])
+            kwargs[i] = dict(kw)
+        return hook
+
+    hooks = [blk.register_forward_pre_hook(capture(i), with_kwargs=True) for i, blk in enumerate(blocks)]
+    hooks.append(blocks[-1].register_forward_hook(lambda module, args, y: acts.__setitem__(f"x{len(blocks)}", bf16_bits(y))))
+    kv, xc = load_kv_state(torch, gen, fixture)
+    call = dict(noisy_image_or_video=torch.from_numpy(from_bits(fixture["c0_x"])).to(torch.bfloat16),
+                conditional_dict={"prompt_embeds": prompt,
+                                  "control_latent": torch.from_numpy(from_bits(fixture["control"])).to(torch.bfloat16)},
+                timestep=torch.from_numpy(fixture["c0_t"]), current_start=int(fixture["c0_start"]), sink_rope_mode="fixed")
+    try:
+        with cpu_bf16_emulation(torch):
+            _, pred = gen(kv_cache=kv, crossattn_cache=xc, **call)
+    finally:
+        for h in hooks:
+            h.remove()
+    if not np.array_equal(bf16_bits(pred), fixture["c0_pred"]):
+        raise RuntimeError("Hooked call does not reproduce calls_chunk0 call 0 bitwise")
+    acts["e0"], acts["context"] = bf16_bits(kwargs[0]["e"]), bf16_bits(kwargs[0]["context"])
+    np.savez(out / "blocks_chunk0_call0.npz", **acts)
+    floors = []
+    for i, blk in enumerate(blocks):
+        x = torch.from_numpy(from_bits(acts[f"x{i}"])).to(torch.bfloat16)
+        row = {}
+        for name in FLOOR_VARIANTS:
+            kv, xc = load_kv_state(torch, gen, fixture)
+            with floor_variant(torch, name):
+                y = blk(x, **dict(kwargs[i], kv_cache=kv[i], crossattn_cache=xc[i]))
+            row[name] = rel_l2(y, from_bits(acts[f"x{i + 1}"]))
+        row["gate"] = 1.5 * max(row[name] for name in FLOOR_VARIANTS)
+        floors.append(row)
+        log(f"block {i}: {row}")
+    meta["block_floors"] = dict(
+        call="calls_chunk0 call 0", metric="rel L2 of the block output vs torch, on torch's exact block input",
+        variants=list(FLOOR_VARIANTS), gate_rule="1.5 x max variant", blocks=floors, seconds=time.perf_counter() - t0)
+    (out / "meta.json").write_text(json.dumps(meta, indent=2))
+    log(f"per-block fixture done in {meta['block_floors']['seconds']:.0f}s")
 
 
 def torch_reference(args, out: Path, meta: dict, prompt, pixels, noises, renoises):
@@ -609,6 +678,8 @@ def main(argv=None):
                         help="Only (re)generate the per-call fixtures calls_*.npz from the existing fixtures")
     parser.add_argument("--call-floors-only", action="store_true",
                         help="Only (re)measure the torch kernel-variant floor of the existing per-call fixtures")
+    parser.add_argument("--blocks-only", action="store_true",
+                        help="Only (re)generate the per-block fixture of chunk 0 call 0 and its floors")
     args = parser.parse_args(argv)
     if args.floor_only:
         floor_reference(fixtures_dir() / "egypt_quality")
@@ -618,6 +689,9 @@ def main(argv=None):
         return
     if args.call_floors_only:
         call_floors(fixtures_dir() / "egypt_quality")
+        return
+    if args.blocks_only:
+        block_fixtures(fixtures_dir() / "egypt_quality")
         return
     out = fixtures_dir() / "egypt_quality"
     out.mkdir(parents=True, exist_ok=True)
@@ -646,6 +720,7 @@ def main(argv=None):
     log(f"done in {meta['total_seconds']:.0f}s: {out}")
     floor_reference(out)
     call_fixtures(out)
+    block_fixtures(out)
 
 
 if __name__ == "__main__":
