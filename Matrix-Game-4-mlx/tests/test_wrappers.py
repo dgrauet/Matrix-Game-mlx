@@ -13,10 +13,13 @@ up_w = import_upstream("matrix_game.inference.wrappers")
 def test_with_condition_layout():
     model, _ = build_pair()
     w = WanDiffusionWrapper(model, timestep_shift=5.0)
-    x = mx.ones((1, 1, 4, 2, 4)); ctrl = mx.full((1, 1, 4, 2, 4), 2.0)
+    assert w.control_channels == 8
+    x = mx.ones((1, 1, 4, 2, 4)); ctrl = mx.full((1, 1, w.control_channels, 2, 4), 2.0)
     out = w._with_condition(x, ctrl)[0]            # [F, h, w, in_dim]
     assert out.shape == (1, 2, 4, 12)
-    assert float(out[..., :4].mean()) == 1.0 and float(out[..., 4:8].mean()) == 2.0 and float(out[..., 8:].sum()) == 0.0
+    assert float(out[..., :4].mean()) == 1.0 and float(out[..., 4:12].mean()) == 2.0
+    out = w._with_condition(x, None)[0]
+    assert float(out[..., :4].mean()) == 1.0 and float(out[..., 4:].sum()) == 0.0
 
 
 def test_flow_to_x0_matches_upstream():

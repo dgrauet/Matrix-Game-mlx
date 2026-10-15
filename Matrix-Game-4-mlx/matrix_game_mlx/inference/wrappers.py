@@ -35,7 +35,7 @@ class WanDiffusionWrapper:
         self.uniform_timestep = False
         self.is_causal = True
         self.extra_in_channels = model.in_dim - model.out_dim
-        self.control_channels = min(CONTROL_CHANNELS, model.out_dim, self.extra_in_channels)
+        self.control_channels = min(CONTROL_CHANNELS, self.extra_in_channels)
         self.scheduler = FlowMatchScheduler(shift=timestep_shift, sigma_min=0.0, extra_one_step=True)
         self.scheduler.set_timesteps(1000, training=True)
 
