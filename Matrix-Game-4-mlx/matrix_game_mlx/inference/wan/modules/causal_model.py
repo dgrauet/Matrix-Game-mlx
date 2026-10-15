@@ -10,7 +10,9 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from matrix_game_mlx.inference.wan.modules.attention import attention
-from matrix_game_mlx.inference.wan.modules.model import WanRMSNorm, _apply_rope_rotation
+from matrix_game_mlx.inference.wan.modules.model import (
+    WAN_CROSSATTENTION_CLASSES, WanLayerNorm, WanRMSNorm, _apply_rope_rotation, rope_params,
+    sinusoidal_embedding_1d)
 
 
 def _check_rope_len(freqs, need: int) -> None:
@@ -164,3 +166,149 @@ class CausalWanSelfAttention(nn.Module):
         kv_cache["global_end_index"] = current_end
         kv_cache["local_end_index"] = local_end_index
         return self.o(x.reshape(b, s, n * d))
+
+
+class CausalWanAttentionBlock(nn.Module):
+    """Self-attention (KV cache) + cross-attention + FFN block with per-frame adaLN modulation."""
+
+    def __init__(self, cross_attn_type, dim, ffn_dim, num_heads, local_attn_size=-1, sink_size=0,
+                 qk_norm=True, cross_attn_norm=False, eps=1e-6):
+        super().__init__()
+        self.dim, self.ffn_dim, self.num_heads = dim, ffn_dim, num_heads
+        self.local_attn_size, self.qk_norm, self.cross_attn_norm, self.eps = local_attn_size, qk_norm, cross_attn_norm, eps
+        self.norm1 = WanLayerNorm(dim, eps)
+        self.self_attn = CausalWanSelfAttention(dim, num_heads, local_attn_size, sink_size, qk_norm, eps)
+        self.norm3 = WanLayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
+        self.cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](dim, num_heads, (-1, -1), qk_norm, eps)
+        self.norm2 = WanLayerNorm(dim, eps)
+        self.ffn_linear1 = nn.Linear(dim, ffn_dim)
+        self.ffn_linear2 = nn.Linear(ffn_dim, dim)
+        self.modulation = mx.zeros((1, 6, dim))
+
+    def ffn(self, x):
+        return self.ffn_linear2(nn.gelu_approx(self.ffn_linear1(x)))
+
+    def __call__(self, x, e, seq_lens, grid_sizes, freqs, context, context_lens, block_mask=None, kv_cache=None,
+                 crossattn_cache=None, current_start=0, cache_start=None, sink_rope_mode=None):
+        num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
+        e = mx.split(self.modulation[:, None] + e, 6, axis=2)
+        def mod(h, shift, scale):
+            return (h.reshape(h.shape[0], num_frames, frame_seqlen, -1) * (1 + scale) + shift).reshape(h.shape)
+        def gate(h, g):
+            return (h.reshape(h.shape[0], num_frames, frame_seqlen, -1) * g).reshape(h.shape)
+        y = self.self_attn(mod(self.norm1(x), e[0], e[1]), seq_lens, grid_sizes, freqs, block_mask, kv_cache,
+                           current_start, cache_start, sink_rope_mode=sink_rope_mode)
+        x = x + gate(y, e[2])
+
+        def cross_attn_ffn(x, context, context_lens, e, crossattn_cache=None):
+            x = x + self.cross_attn(self.norm3(x), context, context_lens, crossattn_cache=crossattn_cache)
+            y = self.ffn(mod(self.norm2(x), e[3], e[4]))
+            return x + gate(y, e[5])
+
+        return cross_attn_ffn(x, context, context_lens, e, crossattn_cache)
+
+
+class CausalHead(nn.Module):
+    """Output head with per-frame shift/scale modulation."""
+
+    def __init__(self, dim, out_dim, patch_size, eps=1e-6):
+        super().__init__()
+        self.dim, self.out_dim, self.patch_size, self.eps = dim, out_dim, patch_size, eps
+        self.norm = WanLayerNorm(dim, eps)
+        self.head = nn.Linear(dim, math.prod(patch_size) * out_dim)
+        self.modulation = mx.zeros((1, 2, dim))
+
+    def __call__(self, x, e):
+        num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
+        e = mx.split(self.modulation[:, None] + e, 2, axis=2)
+        h = self.norm(x).reshape(x.shape[0], num_frames, frame_seqlen, -1) * (1 + e[1]) + e[0]
+        return self.head(h)
+
+
+class CausalWanModel(nn.Module):
+    """Causal Wan DiT, KV-cache inference forward only (frames are [F, H, W, C] channels-last)."""
+
+    def __init__(self, model_type="t2v", patch_size=(1, 2, 2), text_len=512, in_dim=16, dim=2048, ffn_dim=8192,
+                 freq_dim=256, text_dim=4096, out_dim=16, num_heads=16, num_layers=32, local_attn_size=-1,
+                 sink_size=0, qk_norm=True, cross_attn_norm=True, eps=1e-6):
+        super().__init__()
+        assert model_type in ("t2v", "ti2v"), "i2v (CLIP branch) is not used by Matrix-Game 4.0"
+        self.model_type, self.patch_size, self.text_len = model_type, tuple(patch_size), text_len
+        self.in_dim, self.dim, self.ffn_dim, self.freq_dim = in_dim, dim, ffn_dim, freq_dim
+        self.text_dim, self.out_dim, self.num_heads, self.num_layers = text_dim, out_dim, num_heads, num_layers
+        self.local_attn_size, self.qk_norm, self.cross_attn_norm, self.eps = local_attn_size, qk_norm, cross_attn_norm, eps
+        # Conv3d(kernel=stride=patch) stored as Linear over (C, t, h, w)-flattened patches (mlx-forge layout).
+        self.patch_embedding = nn.Linear(in_dim * math.prod(patch_size), dim)
+        self.text_embedding_linear1 = nn.Linear(text_dim, dim)
+        self.text_embedding_linear2 = nn.Linear(dim, dim)
+        self.time_embedding_linear1 = nn.Linear(freq_dim, dim)
+        self.time_embedding_linear2 = nn.Linear(dim, dim)
+        self.time_projection_linear1 = nn.Linear(dim, dim * 6)
+        self.blocks = [CausalWanAttentionBlock("t2v_cross_attn", dim, ffn_dim, num_heads, local_attn_size, sink_size,
+                                               qk_norm, cross_attn_norm, eps) for _ in range(num_layers)]
+        self.head = CausalHead(dim, out_dim, patch_size, eps)
+        assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
+        self._rope_rows = 0
+        self.set_rope_max_len(1024)
+
+    def set_rope_max_len(self, n: int) -> None:
+        n = int(n)
+        if n <= self._rope_rows:
+            return
+        d = self.dim // self.num_heads
+        parts = [rope_params(n, d - 4 * (d // 6)), rope_params(n, 2 * (d // 6)), rope_params(n, 2 * (d // 6))]
+        self._freqs = (mx.concatenate([p[0] for p in parts], axis=1), mx.concatenate([p[1] for p in parts], axis=1))
+        self._rope_rows = n
+
+    @property
+    def freqs(self):
+        return self._freqs
+
+    def __call__(self, x, t, context, seq_len, kv_cache=None, crossattn_cache=None, current_start=0, cache_start=0,
+                 sink_rope_mode=None):
+        if kv_cache is None:
+            raise NotImplementedError("only _forward_inference (KV cache) is ported")
+        return self._forward_inference(x, t, context, seq_len, kv_cache=kv_cache, crossattn_cache=crossattn_cache,
+                                       current_start=current_start, cache_start=cache_start,
+                                       sink_rope_mode=sink_rope_mode)
+
+    def _forward_inference(self, x, t, context, seq_len, kv_cache=None, crossattn_cache=None, current_start=0,
+                           cache_start=0, sink_rope_mode=None):
+        pt, ph, pw = self.patch_size
+        dtype = self.patch_embedding.weight.dtype
+        tokens, grid_sizes = [], []
+        for u in x:
+            f, h, w, c = u.shape
+            fp, hp, wp = f // pt, h // ph, w // pw
+            grid_sizes.append([fp, hp, wp])
+            u = u.reshape(fp, pt, hp, ph, wp, pw, c).transpose(0, 2, 4, 6, 1, 3, 5)
+            tokens.append(self.patch_embedding(u.reshape(1, fp * hp * wp, c * pt * ph * pw).astype(dtype)))
+        seq_lens = mx.array([u.shape[1] for u in tokens])
+        assert max(u.shape[1] for u in tokens) <= seq_len
+        x = mx.concatenate(tokens, axis=0)
+
+        e = self.time_embedding_linear2(nn.silu(self.time_embedding_linear1(
+            sinusoidal_embedding_1d(self.freq_dim, t.reshape(-1)).astype(x.dtype))))
+        e0 = self.time_projection_linear1(nn.silu(e)).reshape(*t.shape, 6, self.dim)
+
+        ctx = context if isinstance(context, mx.array) else mx.stack(list(context))
+        if ctx.shape[1] < self.text_len:
+            ctx = mx.concatenate([ctx, mx.zeros((ctx.shape[0], self.text_len - ctx.shape[1], ctx.shape[2]), ctx.dtype)], 1)
+        context = self.text_embedding_linear2(nn.gelu_approx(self.text_embedding_linear1(ctx.astype(dtype))))
+
+        for block_index, block in enumerate(self.blocks):
+            x = block(x, e0, seq_lens, grid_sizes, self.freqs, context, None, None,
+                      kv_cache=kv_cache[block_index], crossattn_cache=crossattn_cache[block_index],
+                      current_start=current_start, cache_start=cache_start, sink_rope_mode=sink_rope_mode)
+
+        x = self.head(x, e.reshape(*t.shape, 1, self.dim))
+        return mx.stack(self.unpatchify(x.reshape(x.shape[0], -1, x.shape[-1]), grid_sizes))
+
+    def unpatchify(self, x, grid_sizes):
+        c = self.out_dim
+        pt, ph, pw = self.patch_size
+        out = []
+        for i, (fp, hp, wp) in enumerate(grid_sizes):
+            u = x[i, :fp * hp * wp].reshape(fp, hp, wp, pt, ph, pw, c).transpose(0, 3, 1, 4, 2, 5, 6)
+            out.append(u.reshape(fp * pt, hp * ph, wp * pw, c))
+        return out
