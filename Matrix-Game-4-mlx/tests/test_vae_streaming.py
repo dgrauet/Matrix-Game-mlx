@@ -71,3 +71,22 @@ def test_wrapper_loads_real_shared_vae_strictly():
     params = tree_flatten(w.model.parameters())
     assert len(params) == 196
     assert all(v.dtype == mx.bfloat16 for _, v in params)
+
+
+def test_rms_norm_and_silu_match_torch_bf16():
+    """bf16 RMS_norm (F.normalize * scale * gamma) and SiLU round where torch does (fp32 norm / opmath)."""
+    import numpy as np
+    from matrix_game_mlx.inference.wan.modules.vae2_2 import RMS_norm, _SiLU_placeholder
+    torch.manual_seed(0)
+    ref = up_v.RMS_norm(160, images=False)
+    torch.nn.init.normal_(ref.gamma, mean=1.0, std=0.2)
+    x = (torch.randn(1, 160, 2, 8, 8) * 3).bfloat16()
+    m = RMS_norm(160, images=False)
+    m.gamma = mx.array(ref.gamma.detach().reshape(-1).numpy()).astype(mx.bfloat16)
+    xm = mx.array(x.float().permute(0, 2, 3, 4, 1).numpy()).astype(mx.bfloat16)
+    with torch.no_grad():
+        want = ref.bfloat16()(x).float().permute(0, 2, 3, 4, 1).numpy()
+        want_silu = torch.nn.functional.silu(x).float().permute(0, 2, 3, 4, 1).numpy()
+    got = np.array(m(xm).astype(mx.float32))
+    assert (got != want).mean() < 1e-3
+    assert np.array_equal(np.array(_SiLU_placeholder()(xm).astype(mx.float32)), want_silu)
