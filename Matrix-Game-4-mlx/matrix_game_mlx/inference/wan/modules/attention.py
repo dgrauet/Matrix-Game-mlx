@@ -3,7 +3,7 @@
 Replaces PyTorch Flash Attention with mx.fast.scaled_dot_product_attention.
 """
 import math
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import mlx.core as mx
 

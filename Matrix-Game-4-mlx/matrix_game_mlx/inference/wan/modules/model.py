@@ -72,7 +72,7 @@ def rope_apply(
         freqs: ``(cos_freqs, sin_freqs)`` each ``[max_seq_len, C // 2]``.
 
     Returns:
-        Tensor of same shape as *x*, dtype float32.
+        Tensor of same shape and dtype as *x* (rotation computed in float32).
     """
     n = x.shape[2]
     c = x.shape[3] // 2  # half-dim for cos/sin pairs
@@ -110,10 +110,10 @@ def rope_apply(
         x_i = _apply_rope_rotation(x_i, cos_i, sin_i)
 
         # Append any padding beyond seq_len unchanged
-        x_i = mx.concatenate([x_i, x[i, seq_len:]], axis=0)
+        x_i = mx.concatenate([x_i.astype(x.dtype), x[i, seq_len:]], axis=0)
         output.append(x_i)
 
-    return mx.stack(output).astype(mx.float32)
+    return mx.stack(output)
 
 
 class WanRMSNorm(nn.Module):

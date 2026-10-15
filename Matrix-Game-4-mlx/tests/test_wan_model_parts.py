@@ -55,8 +55,36 @@ def test_cross_attention_with_cache():
         ref2 = b(x * 2, ctx * 0, None, crossattn_cache=cache_b)   # second call must reuse cached K/V
     out1 = a(mx.array(x.numpy()), mx.array(ctx.numpy()), None, crossattn_cache=cache_a)
     out2 = a(mx.array((x * 2).numpy()), mx.array((ctx * 0).numpy()), None, crossattn_cache=cache_a)
+    assert cache_a["is_init"] is True and "k" in cache_a and "v" in cache_a
     assert_close(out1, ref1, atol=1e-4)
     assert_close(out2, ref2, atol=1e-4)
+
+
+def test_cross_attention_bf16_dtype():
+    a = M.WanT2VCrossAttention(128, 4)
+    a.set_dtype(mx.bfloat16)
+    out = a(mx.ones((1, 8, 128), mx.bfloat16), mx.ones((1, 4, 128), mx.bfloat16), None)
+    assert out.dtype == mx.bfloat16
+
+
+def test_norms_bf16_dtype():
+    x = mx.ones((2, 7, 64), mx.bfloat16)
+    rms = M.WanRMSNorm(64); rms.set_dtype(mx.bfloat16)
+    ln = M.WanLayerNorm(64, elementwise_affine=True); ln.set_dtype(mx.bfloat16)
+    assert rms(x).dtype == mx.bfloat16
+    assert ln(x).dtype == mx.bfloat16
+
+
+def test_rope_apply_matches_upstream_and_keeps_dtype():
+    d, grids = 44, [[3, 4, 5]]
+    seq = 3 * 4 * 5
+    x = np.random.default_rng(0).standard_normal((1, seq + 6, 2, d)).astype(np.float32)
+    cos, sin = M.rope_params(16, d)
+    freqs = up.rope_params(16, d)
+    out = M.rope_apply(mx.array(x), grids, (cos, sin))
+    ref = up.rope_apply(torch.from_numpy(x), torch.tensor(grids), freqs)
+    assert_close(out, ref, atol=1e-5)
+    assert M.rope_apply(mx.array(x).astype(mx.bfloat16), grids, (cos, sin)).dtype == mx.bfloat16
 
 
 def test_attention_matches_sdpa():
