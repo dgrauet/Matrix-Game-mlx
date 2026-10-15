@@ -3,7 +3,8 @@
 Run manually from Matrix-Game-4-mlx/ (not collected by pytest):
     MATRIX_GAME_4_MLX_WEIGHTS_DIR=... python -m tests.parity.gen_fixtures --device auto [--long]
 
-Writes `$MG4_FIXTURES_DIR/egypt_quality/`: inputs.npz, chunk_{i}.npz, meta.json (and long_*.npz with --long).
+Writes `$MG4_FIXTURES_DIR/egypt_quality/`: inputs.npz, chunk_{i}.npz, floor_chunk_{i}.npz, meta.json
+(and long_*.npz with --long). `--floor-only` regenerates only the floor files from the saved inputs.
 """
 import argparse
 import contextlib
@@ -109,14 +110,15 @@ def injected_renoise(torch, tensors):
 
 
 @contextlib.contextmanager
-def cpu_bf16_emulation(torch):
+def cpu_bf16_emulation(torch, sdpa: bool = True):
     """Run CPU bf16 GEMM/conv/attention in fp32 and round the output to bf16 (fp32-accumulate kernel semantics).
 
     Native CPU bf16 kernels run at ~1 GFLOPS on Apple Silicon (a 5B forward would take ~1 h); every other op,
     including the float64 RoPE / timestep / x0 islands, runs unchanged. MPS and fp32 calls are untouched.
+    `sdpa=False` keeps the native bf16 SDPA kernel (torch-vs-torch floor variant).
     """
     F = torch.nn.functional
-    names = ("linear", "conv1d", "conv2d", "conv3d", "scaled_dot_product_attention")
+    names = ("linear", "conv1d", "conv2d", "conv3d") + (("scaled_dot_product_attention",) if sdpa else ())
     real = {name: getattr(F, name) for name in names}
 
     def upcast(fn):
@@ -155,17 +157,23 @@ class GenRecorder:
         return self.gen.parameters()
 
 
-def vae_roundtrip(torch, vae, pixels: np.ndarray) -> np.ndarray:
-    """First-chunk streaming encode + incremental decode, as CastleStream.push does (fresh caches)."""
-    from matrix_game.inference.decoder import IncrementalDecoder
-    from matrix_game.inference.wan.modules.vae2_2 import count_conv3d, patchify
+def stream_encode(torch, vae, pixels: np.ndarray, feat_cache: list):
+    """One streaming encoder step, as CastleStream.push's Wan branch: [T,3,H,W] -> normalized [1,1,48,h,w]."""
+    from matrix_game.inference.wan.modules.vae2_2 import patchify
     p = next(vae.parameters())
     x = torch.from_numpy(pixels).permute(1, 0, 2, 3).unsqueeze(0).to(p.device, p.dtype)
     model = vae.model
-    hidden = model.encoder(patchify(x, patch_size=2), feat_cache=[None] * count_conv3d(model.encoder), feat_idx=[0])
+    hidden = model.encoder(patchify(x, patch_size=2), feat_cache=feat_cache, feat_idx=[0])
     mu = model.conv1(hidden).chunk(2, dim=1)[0]
     mean, inv_std = vae._scale(p.device, p.dtype)
-    latent = ((mu - mean.view(1, 48, 1, 1, 1)) * inv_std.view(1, 48, 1, 1, 1)).permute(0, 2, 1, 3, 4)
+    return ((mu - mean.view(1, 48, 1, 1, 1)) * inv_std.view(1, 48, 1, 1, 1)).permute(0, 2, 1, 3, 4)
+
+
+def vae_roundtrip(torch, vae, pixels: np.ndarray) -> np.ndarray:
+    """First-chunk streaming encode + incremental decode, as CastleStream.push does (fresh caches)."""
+    from matrix_game.inference.decoder import IncrementalDecoder
+    from matrix_game.inference.wan.modules.vae2_2 import count_conv3d
+    latent = stream_encode(torch, vae, pixels, [None] * count_conv3d(vae.model.encoder))
     return IncrementalDecoder(vae).push(latent).float().cpu().numpy()
 
 
@@ -347,12 +355,68 @@ def _torch_run(args, out, meta, prompt, pixels, noises, renoises):
     return sink
 
 
+def floor_reference(out: Path) -> None:
+    """Torch-vs-torch floor for the 3-chunk set, from the saved inputs (main fixtures are not touched).
+
+    DiT tensors: the same upstream stream with only the CPU SDPA kernel changed (native bf16 instead of
+    fp32-emulated). control: the same streaming encoder on the other VAE device (the SDPA variant does not
+    touch the VAE, so its control would equal the fixture bitwise).
+    """
+    import torch
+    from huggingface_hub import hf_hub_download
+    from matrix_game.inference.wan.modules.vae2_2 import count_conv3d
+    from matrix_game.inference.wrappers import WanVAE22Wrapper
+    torch.set_grad_enabled(False)
+    meta = json.loads((out / "meta.json").read_text())
+    inputs = np.load(out / "inputs.npz")
+    n_chunks = meta["chunks"]
+    pixels = [inputs[f"pixels_{i}"] for i in range(n_chunks)]
+    t0 = time.perf_counter()
+    vae = WanVAE22Wrapper(vae_path=hf_hub_download(VAE_REPO, VAE_FILE, revision=VAE_REVISION)).eval()
+    vae = vae.requires_grad_(False).to(meta["device_vae"], torch.bfloat16)
+    floors = [{} for _ in range(n_chunks)]
+
+    def save(i, chunk, preds, seconds):
+        floors[i].update(pred_step0=preds[0], pred=to_np(chunk.latent), decoded=to_np(chunk.pixels),
+                         kv_k_layer0=to_np(stream.kv[0]["k"]), kv_k_layer29=to_np(stream.kv[29]["k"]))
+        log(f"floor chunk {i}: {seconds:.1f}s")
+
+    with cpu_bf16_emulation(torch, sdpa=False):
+        stream, device_dit = load_stream(torch, meta["device_dit"], vae, inputs["prompt_embeds"],
+                                         torch.from_numpy(inputs["sink_latent"]))
+        if device_dit != meta["device_dit"]:
+            raise RuntimeError(f"Floor DiT device {device_dit} != fixture DiT device {meta['device_dit']}")
+        run_chunks(torch, stream, np.concatenate(pixels), [inputs[f"initial_noise_{i}"] for i in range(n_chunks)],
+                   [inputs[f"renoise_{i}"] for i in range(n_chunks)], n_chunks, save)
+    del stream
+    gc.collect()
+    control_device = "cpu" if meta["device_vae"] == "mps" else "mps"
+    vae = vae.to(control_device)
+    feats = [None] * count_conv3d(vae.model.encoder)
+    with cpu_bf16_emulation(torch):
+        for i in range(n_chunks):
+            floors[i]["control"] = stream_encode(torch, vae, pixels[i], feats).float().cpu().numpy()
+    for i, tensors in enumerate(floors):
+        np.savez_compressed(out / f"floor_chunk_{i}.npz", **tensors)
+    meta["floor"] = dict(
+        dit_variant="native bf16 CPU SDPA (cpu_bf16_emulation(sdpa=False)); everything else as the fixture run",
+        control_variant=f"torch streaming VAE encoder on {control_device} (fixture: {meta['device_vae']})",
+        chunks=n_chunks, seconds=time.perf_counter() - t0)
+    (out / "meta.json").write_text(json.dumps(meta, indent=2))
+    log(f"floor fixtures done in {meta['floor']['seconds']:.0f}s")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", choices=("auto", "mps", "cpu"), default="auto")
     parser.add_argument("--chunks", type=int, default=3)
     parser.add_argument("--long", action="store_true", help="Also run 25 chunks (pred and decoded only)")
+    parser.add_argument("--floor-only", action="store_true",
+                        help="Only (re)generate floor_chunk_*.npz from the existing inputs.npz and meta.json")
     args = parser.parse_args(argv)
+    if args.floor_only:
+        floor_reference(fixtures_dir() / "egypt_quality")
+        return
     out = fixtures_dir() / "egypt_quality"
     out.mkdir(parents=True, exist_ok=True)
     t_start = time.perf_counter()
@@ -378,6 +442,7 @@ def main(argv=None):
     meta["total_seconds"] = time.perf_counter() - t_start
     (out / "meta.json").write_text(json.dumps(meta, indent=2))
     log(f"done in {meta['total_seconds']:.0f}s: {out}")
+    floor_reference(out)
 
 
 if __name__ == "__main__":
