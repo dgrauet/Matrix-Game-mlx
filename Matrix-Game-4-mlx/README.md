@@ -8,7 +8,7 @@ using the quality preset, with the ancient-egypt style supported first.
 
 | Milestone | Scope | Status |
 | --- | --- | --- |
-| M1 | ancient-egypt, quality preset (Wan VAE, steps `1000,500`), offline CLI, real-weight parity | Implemented and parity-validated; acceptance render of a recorded take pending |
+| M1 | ancient-egypt, quality preset (Wan VAE, steps `1000,500`), offline CLI, real-weight parity | Done: parity-validated; a 19 s recorded take (909 frames, 48 FPS) rendered in 1 h 52 min (29.4 s/chunk, peak 24.4 GB) |
 | M2 | castle and racing (first-frame sink, absolute RoPE, racing RNG role), fixtures for both | Next |
 | M3 | realtime preset: TAEHV encode/decode (`taehv.py`), one-step schedule | Next |
 
