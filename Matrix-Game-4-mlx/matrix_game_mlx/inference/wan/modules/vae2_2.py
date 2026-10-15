@@ -15,6 +15,24 @@ __all__ = ["Wan2_2_VAE"]
 CACHE_T = 2
 
 
+@mx.compile
+def _rms_normalize(x: mx.array, gamma: mx.array, scale: mx.array) -> mx.array:
+    """F.normalize(x, dim=C) * scale * gamma with torch's bf16 rounding points (fused into one kernel).
+
+    The L2 norm is accumulated in float32 and rounded once (torch vector_norm), clamped at 1e-12, and the
+    Python-float `scale` multiplies in float32 (torch scalar opmath) before rounding.
+    """
+    norm = mx.sqrt(mx.sum(mx.square(x.astype(mx.float32)), axis=-1, keepdims=True)).astype(x.dtype)
+    out = x / mx.maximum(norm, 1e-12)
+    return (out.astype(mx.float32) * scale).astype(x.dtype) * gamma
+
+
+@mx.compile
+def _silu(x: mx.array) -> mx.array:
+    """torch bf16 SiLU: float32 opmath, one rounding (fused into one kernel)."""
+    return nn.silu(x.astype(mx.float32)).astype(x.dtype)
+
+
 # ---------------------------------------------------------------------------
 # CausalConv3d
 # ---------------------------------------------------------------------------
@@ -111,14 +129,7 @@ class RMS_norm(nn.Module):
         self.scale = dim ** 0.5
 
     def __call__(self, x: mx.array) -> mx.array:
-        """F.normalize(x, dim=C) * scale * gamma (+ bias) with torch's bf16 rounding points.
-
-        The L2 norm is accumulated in float32 and rounded once (torch vector_norm), clamped at 1e-12, and the
-        Python-float `scale` multiplies in float32 (torch scalar opmath) before rounding.
-        """
-        norm = mx.sqrt(mx.sum(mx.square(x.astype(mx.float32)), axis=-1, keepdims=True)).astype(x.dtype)
-        out = x / mx.maximum(norm, 1e-12)
-        out = (out.astype(mx.float32) * self.scale).astype(x.dtype) * self.gamma
+        out = _rms_normalize(x, self.gamma, mx.array(self.scale, mx.float32))
         if self._has_bias:
             out = out + self.bias
         return out
@@ -254,7 +265,7 @@ class Resample(nn.Module):
 class _SiLU_placeholder(nn.Module):
     """Non-parametric SiLU placeholder for Sequential-like lists."""
     def __call__(self, x: mx.array) -> mx.array:
-        return nn.silu(x.astype(mx.float32)).astype(x.dtype)  # torch bf16 SiLU: float32 opmath, one rounding
+        return _silu(x)
 
 
 class _Dropout_placeholder(nn.Module):

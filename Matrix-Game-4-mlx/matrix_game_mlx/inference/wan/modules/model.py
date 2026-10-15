@@ -1,4 +1,5 @@
 """Shared Wan building blocks: embeddings, RoPE, norms and T2V cross-attention."""
+from functools import partial
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -22,11 +23,13 @@ __all__ = [
 ]
 
 
+@partial(mx.compile, shapeless=True)
 def silu(x: mx.array) -> mx.array:
     """torch nn.SiLU on bf16: computed in float32 (opmath) and rounded once to the input dtype."""
     return nn.silu(x.astype(mx.float32)).astype(x.dtype)
 
 
+@partial(mx.compile, shapeless=True)
 def gelu_tanh(x: mx.array) -> mx.array:
     """torch nn.GELU(approximate='tanh') on bf16: computed in float32 (opmath) and rounded once."""
     return nn.gelu_approx(x.astype(mx.float32)).astype(x.dtype)
