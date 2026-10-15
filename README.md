@@ -44,6 +44,10 @@ Game assets, sink images and inference configuration files are included in the
 See the [project website](https://matrix-game-v4-0.github.io/page/) for demos and
 the broader project overview.
 
+## Matrix-Game 4.0 MLX Port (Apple Silicon)
+
+[Matrix-Game-4-mlx](Matrix-Game-4-mlx): offline rendering of Matrix-Game 4.0 with MLX (ancient-egypt, quality preset, ~25 s per four-frame chunk on an M2 Pro 32 GB), validated against the upstream PyTorch code with real weights. Castle, racing and the realtime preset are next.
+
 ## Matrix-Game 3.0 MLX Port (Apple Silicon)
 
 This repository provides an implementation of Matrix-Game-3.0 for Apple Silicon using [MLX](https://ml-explore.github.io/mlx/).
