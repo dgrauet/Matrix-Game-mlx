@@ -92,3 +92,17 @@ class WanDiffusionWrapper:
                                                 noisy_image_or_video.reshape(b * f, *noisy_image_or_video.shape[2:]),
                                                 timestep.reshape(-1)).reshape(flow_pred.shape)
         return flow_pred, pred_x0
+
+
+class WanTextEncoder:
+    """UMT5-XXL prompt encoder; rows past each prompt's token count are zeroed by T5EncoderModel."""
+
+    def __init__(self, t5_checkpoint_path: str, tokenizer_path: str, dtype=mx.bfloat16) -> None:
+        from matrix_game_mlx.inference.wan.modules.t5 import T5EncoderModel
+        self.text_encoder = T5EncoderModel(text_len=512, dtype=dtype, checkpoint_path=t5_checkpoint_path,
+                                           tokenizer_path=tokenizer_path)
+
+    def __call__(self, text_prompts: List[str]) -> dict:
+        """Returns {"prompt_embeds": [B, 512, 4096]}."""
+        context = self.text_encoder(text_prompts)
+        return {"prompt_embeds": mx.stack(context)}
