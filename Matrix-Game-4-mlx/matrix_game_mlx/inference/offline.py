@@ -30,7 +30,7 @@ def frame_blocks(reader):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scene", choices=tuple(SCENES), default="ancient-egypt")
-    parser.add_argument("--preset", choices=("quality",), default="quality")
+    parser.add_argument("--preset", choices=("quality", "realtime"), default="quality")
     parser.add_argument("--sink-image", type=Path, help="Override the scene sink image")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--input", type=Path, help="Clean low-poly RGB video")

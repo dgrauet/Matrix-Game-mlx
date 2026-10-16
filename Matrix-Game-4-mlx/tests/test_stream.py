@@ -1,6 +1,8 @@
 import time
+from types import SimpleNamespace
 
 import mlx.core as mx
+import numpy as np
 import pytest
 
 from matrix_game_mlx.inference.stream import CastleStream, LATENT_SHAPE
@@ -33,6 +35,7 @@ def test_validate_cadence_range_budget():
 def test_close_clears_codec_caches():
     from types import SimpleNamespace
     s = _bare_stream()
+    s.vae_backend = "wan"
     s.kv, s.xc = [{"k": mx.zeros((1,))}], [{"is_init": True}]
     s.encoder_features, s.decoder = [mx.zeros((1,))] * 3, SimpleNamespace(feat=[mx.zeros((1,))] * 2)
     s.close()
@@ -44,6 +47,84 @@ def test_rejects_integer_sink_latent():
     generator = SimpleNamespace(model=SimpleNamespace(patch_embedding=SimpleNamespace(weight=mx.zeros((1,), mx.bfloat16))))
     with pytest.raises(ValueError, match="floating-point"):
         CastleStream(generator, None, None, sink_latent=mx.zeros(LATENT_SHAPE, mx.int32))
+
+
+def _taehv(dtype=mx.bfloat16):
+    from matrix_game_mlx.inference.taehv import TAEHV
+    mx.random.seed(0)
+    return TAEHV("taew2_2.safetensors", dtype, load=False)
+
+
+class _FakeGenerator:
+    """Records DiT calls; returns a deterministic latent prediction."""
+
+    def __init__(self):
+        from types import SimpleNamespace
+        from matrix_game_mlx.inference.scheduler import FlowMatchScheduler
+        self.model = SimpleNamespace(
+            patch_embedding=SimpleNamespace(weight=mx.zeros((1,), mx.bfloat16)), blocks=[], num_heads=1, dim=4,
+            num_layers=1, patch_size=(1, 2, 2), set_rope_max_len=lambda n: None)
+        self.scheduler = FlowMatchScheduler(shift=5.0, sigma_min=0.0, extra_one_step=True)
+        self.scheduler.set_timesteps(1000, training=True)
+        self.calls = []
+
+    def get_scheduler(self):
+        return self.scheduler
+
+    def __call__(self, **kw):
+        self.calls.append(kw)
+        pred = mx.random.normal(LATENT_SHAPE, key=mx.random.key(len(self.calls))) * 0.1
+        return None, pred.astype(mx.bfloat16)
+
+
+def test_taehv_stream_three_pushes():
+    from matrix_game_mlx.inference.stream import CastleStream
+    vae, ref = _taehv(), _taehv()
+    ref.core.update(vae.core.parameters())                       # identical random weights
+    gen = _FakeGenerator()
+    stream = CastleStream(gen, vae, mx.zeros((1, 2, 4)), vae_backend="taehv", steps=(1000,), first_steps=(1000,))
+    rng = np.random.default_rng(0)
+    frame = 0
+    for index, count in enumerate((1, 4, 4)):
+        pixels = mx.array(rng.uniform(-1, 1, (count, 3, 480, 864)).astype(np.float32))
+        before = len(gen.calls)
+        chunk = stream.push(pixels, frame_start=frame)
+        assert tuple(chunk.pixels.shape) == (count, 3, 480, 864) and bool(mx.all(mx.isfinite(chunk.pixels)))
+        calls = gen.calls[before:]
+        assert len(calls) == 2
+        denoise, clean = calls
+        assert float(denoise["timestep"][0, 0]) == 1000 and "control_latent" in denoise["conditional_dict"]
+        assert not denoise.get("drop_control") and clean["drop_control"] is True
+        expected = ref.encode_stream(pixels.transpose(1, 0, 2, 3)[None]).transpose(0, 2, 1, 3, 4)
+        assert mx.array_equal(denoise["conditional_dict"]["control_latent"], expected)
+        assert mx.array_equal(chunk.control, expected)
+        frame += count
+    stream.close()
+    assert vae._streaming_encoder is None and vae._streaming_decoder is None and vae._streaming_encode_frames == 0
+
+
+def test_encode_sink_image_taehv_clears_state(tmp_path):
+    from PIL import Image
+    from matrix_game_mlx.inference.stream import encode_sink_image
+    path = tmp_path / "sink.png"
+    Image.fromarray(np.random.default_rng(1).integers(0, 255, (700, 1000, 3), dtype=np.uint8)).save(path)
+    vae, fresh = _taehv(), _taehv()
+    fresh.core.update(vae.core.parameters())
+    for first_frame in (False, True):
+        latent = encode_sink_image(vae, path, "taehv", first_frame=first_frame)
+        assert tuple(latent.shape) == LATENT_SHAPE
+        assert vae._streaming_encoder is None and vae._streaming_encode_frames == 0 and vae._streaming_decoder is None
+    pixels = mx.array(np.random.default_rng(2).uniform(-1, 1, (1, 3, 1, 480, 864)).astype(np.float32))
+    assert mx.array_equal(vae.encode_stream(pixels), fresh.encode_stream(pixels))
+
+
+def test_unknown_backend_raises(tmp_path):
+    from matrix_game_mlx.inference.stream import encode_sink_image
+    with pytest.raises(ValueError, match="Expected wan or taehv VAE backend"):
+        encode_sink_image(None, tmp_path / "x.png", "bogus")
+    generator = SimpleNamespace(model=SimpleNamespace(patch_embedding=SimpleNamespace(weight=mx.zeros((1,), mx.bfloat16))))
+    with pytest.raises(ValueError, match="Expected wan or taehv VAE backend"):
+        CastleStream(generator, None, None, vae_backend="bogus")
 
 
 @pytest.mark.needs_weights
@@ -62,5 +143,25 @@ def test_model_components_stream_smoke():
         print(f"chunk {chunk.index}: {time.perf_counter() - t0:.1f}s, peak {mx.get_peak_memory() / 2**30:.1f} GiB")
         assert tuple(chunk.pixels.shape) == (count, 3, 480, 864)
         assert np.isfinite(np.array(chunk.pixels)).all()
+        frame += count
+    stream.close()
+
+
+@pytest.mark.needs_weights
+def test_model_components_realtime_stream_smoke():
+    from matrix_game_mlx.inference.loader import ModelComponents
+
+    components = ModelComponents("ancient-egypt", "realtime")
+    components.load()
+    stream = components.stream()
+    frame = 0
+    for count in (1, 4):
+        t0 = time.perf_counter()
+        chunk = stream.push(mx.zeros((count, 3, 480, 864)), frame_start=frame)
+        mx.eval(chunk.pixels)
+        print(f"realtime chunk {chunk.index}: {time.perf_counter() - t0:.1f}s, peak {mx.get_peak_memory() / 2**30:.1f} GiB")
+        assert tuple(chunk.pixels.shape) == (count, 3, 480, 864)
+        assert chunk.denoising_steps == 1
+        assert np.isfinite(np.array(chunk.pixels.astype(mx.float32))).all()
         frame += count
     stream.close()

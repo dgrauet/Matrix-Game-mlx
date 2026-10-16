@@ -56,3 +56,19 @@ def test_pack_dir_requires_env_until_hub_publication(monkeypatch):
 def test_pack_dir_from_env(tmp_path, monkeypatch):
     monkeypatch.setenv("MATRIX_GAME_4_MLX_WEIGHTS_DIR", str(tmp_path))
     assert loader.pack_dir() == tmp_path
+
+
+@pytest.mark.parametrize("preset,steps,backend", [("quality", (1000, 500), "wan"), ("realtime", (1000,), "taehv")])
+def test_preset_resolution(tmp_path, preset, steps, backend):
+    pack = tmp_path / "pack"
+    (pack / "s").mkdir(parents=True)
+    (pack / "config.json").write_text(json.dumps({"scenes": {"castle": {
+        "component": "dit_castle", "inference": "s/inference.json", "sink_image": "s/sink.png"}}}))
+    (pack / "s/inference.json").write_text(json.dumps({"quality_steps": [1000, 500], "realtime_steps": [1000],
+                                                       "scheduler_shift": 5.0}))
+    components = loader.ModelComponents("castle", preset, pack=pack)
+    cfg = components.config()
+    assert components.steps == steps and cfg["steps"] == list(steps) and cfg["first_steps"] == list(steps)
+    assert cfg["vae_backend"] == backend and cfg["preset"] == preset
+    with pytest.raises(ValueError, match="preset"):
+        loader.ModelComponents("castle", "baseline", pack=pack)

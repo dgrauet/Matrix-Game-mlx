@@ -11,14 +11,22 @@ def encode_sink_image(vae, path, vae_backend="wan", *, first_frame=False):
     """Encode an independent image, without seeding either streaming VAE cache."""
     from PIL import Image, ImageOps
     from matrix_game_mlx.inference.preprocessing import crop_and_resize, frames_to_tensor
-    if vae_backend != "wan":
-        raise NotImplementedError("realtime preset (TAEHV): milestone 3")
+    if vae_backend not in ("wan", "taehv"):
+        raise ValueError("Expected wan or taehv VAE backend")
     with Image.open(path) as image:
         image = ImageOps.exif_transpose(image).convert("RGB")
         image = (ImageOps.fit(image, (FRAME_SIZE[1], FRAME_SIZE[0]), method=Image.Resampling.LANCZOS) if first_frame
                  else crop_and_resize(image, *FRAME_SIZE))
         pixels = frames_to_tensor([image])
-    latent = vae.encode_to_latent(pixels[None].astype(vae.dtype))
+    pixels = pixels[None].astype(vae.dtype)
+    if vae_backend == "wan":
+        latent = vae.encode_to_latent(pixels)
+    else:
+        vae.clear_cache()
+        try:
+            latent = vae.encode(pixels.transpose(0, 2, 1, 3, 4)).transpose(0, 2, 1, 3, 4)
+        finally:
+            vae.clear_cache()
     if tuple(latent.shape) != LATENT_SHAPE or not bool(mx.all(mx.isfinite(latent))):
         raise ValueError("Sink image must encode to one finite 48-channel latent")
     return latent
@@ -42,9 +50,7 @@ class CastleStream:
     def __init__(self, generator, vae, prompt_embeds, *, seed=0, max_latents=8192, vae_backend="wan",
                  steps=(1000, 500), first_steps=(1000, 750, 500, 250), sink_latent=None, sink_mode="kv_only",
                  sink_rope_mode="fixed"):
-        from matrix_game_mlx.inference.decoder import IncrementalDecoder
         from matrix_game_mlx.inference.rollout import set_attention_window, warp_steps
-        from matrix_game_mlx.inference.wan.modules.vae2_2 import count_conv3d
         from matrix_game_mlx.inference.wrappers import frame_seq_length_of, init_crossattn_cache, init_kv_cache
 
         self.gen, self.vae, self.prompt = generator, vae, prompt_embeds
@@ -52,8 +58,8 @@ class CastleStream:
             raise ValueError("Invalid sink policy")
         self.sink_mode, self.sink_rope_mode = sink_mode, sink_rope_mode
         self.first_frame_latent = sink_latent if sink_mode == "first_frame" else None
-        if vae_backend != "wan":
-            raise NotImplementedError("realtime preset (TAEHV): milestone 3")
+        if vae_backend not in ("wan", "taehv"):
+            raise ValueError("Expected wan or taehv VAE backend")
         for values in (steps, first_steps):
             if not values or values[0] != 1000 or any(not 0 < v <= 1000 for v in values) or any(
                     a <= b for a, b in zip(values, values[1:])):
@@ -85,8 +91,14 @@ class CastleStream:
         self.xc = init_crossattn_cache(generator, 1, self.dtype)
         for cache in self.kv:
             cache["k_sink_raw"] = mx.zeros_like(cache["k"][:, :self.fsl])
-        self.encoder_features = [None] * count_conv3d(vae.model.encoder)
-        self.decoder = IncrementalDecoder(vae)
+        self.encoder_features, self.decoder = [], None
+        if vae_backend == "wan":
+            from matrix_game_mlx.inference.decoder import IncrementalDecoder
+            from matrix_game_mlx.inference.wan.modules.vae2_2 import count_conv3d
+            self.encoder_features = [None] * count_conv3d(vae.model.encoder)
+            self.decoder = IncrementalDecoder(vae)
+        else:
+            vae.clear_cache()
         if self.sink_offset:
             self.gen(noisy_image_or_video=sink_latent.astype(self.dtype), conditional_dict={"prompt_embeds": self.prompt},
                      timestep=mx.zeros((1, 1)), drop_control=True, kv_cache=self.kv, crossattn_cache=self.xc,
@@ -127,8 +139,13 @@ class CastleStream:
     def push(self, pixels, *, frame_start, initial_noise=None, renoise=None) -> Chunk:
         count = self._validate(pixels, frame_start=frame_start, initial_noise=initial_noise)
         try:
-            x = pixels.transpose(0, 2, 3, 1)[None]                                   # [1, T, H, W, 3]
-            control = self.vae.encode_stream(x, self.encoder_features)               # [1, 1, 48, h, w]
+            if self.vae_backend == "wan":
+                x = pixels.transpose(0, 2, 3, 1)[None]                               # [1, T, H, W, 3]
+                control = self.vae.encode_stream(x, self.encoder_features)           # [1, 1, 48, h, w]
+            else:
+                # TAEHV already uses the normalized Wan2.2 latent space.
+                x = pixels.transpose(1, 0, 2, 3)[None].astype(self.vae.dtype)        # [1, 3, T, H, W]
+                control = self.vae.encode_stream(x).transpose(0, 2, 1, 3, 4)
             mx.eval(control)
             if tuple(control.shape) != self.shape:
                 raise RuntimeError("VAE encoder output cadence changed")
@@ -164,7 +181,10 @@ class CastleStream:
             self.gen(noisy_image_or_video=pred, conditional_dict=cond, timestep=mx.zeros((1, 1)), drop_control=True,
                      **common)
             self._eval_caches()
-            decoded = self.decoder.push(pred)
+            if self.vae_backend == "wan":
+                decoded = self.decoder.push(pred)
+            else:
+                decoded = self.vae.decode_stream(pred.transpose(0, 2, 1, 3, 4))[0].transpose(1, 0, 2, 3)
             mx.eval(decoded)
             if tuple(decoded.shape) != (count, 3, *FRAME_SIZE):
                 raise RuntimeError("VAE decoder output cadence changed")
@@ -182,5 +202,8 @@ class CastleStream:
         self.kv.clear()
         self.xc.clear()
         self.encoder_features.clear()
-        self.decoder.feat.clear()
+        if self.decoder is not None:
+            self.decoder.feat.clear()
+        if self.vae_backend == "taehv":
+            self.vae.clear_cache()
         self.closed = True

@@ -105,3 +105,28 @@ def test_render_short_clip(tmp_path):
     assert (out / "rendered.mp4").is_file() and not (out / "rendered.partial.mp4").exists()
     rep = json.loads((out / "render.json").read_text())
     assert rep["frames"] == 6 and rep["padded_frames"] == 3 and rep["status"] == "complete"
+
+
+def test_preset_option(monkeypatch, tmp_path):
+    from matrix_game_mlx.inference import loader
+    seen = []
+
+    def fake(scene, preset, *a, **k):
+        seen.append(preset)
+        raise RuntimeError("stop")
+    monkeypatch.setattr(loader, "ModelComponents", fake)
+    import imageio_ffmpeg
+
+    class Reader:
+        def __next__(self):
+            return dict(size=(1280, 720), fps=24)
+
+        def close(self):
+            pass
+    monkeypatch.setattr(imageio_ffmpeg, "read_frames", lambda *a, **k: Reader())
+    for extra, expected in (([], "quality"), (["--preset", "realtime"], "realtime")):
+        with pytest.raises(RuntimeError, match="stop"):
+            main(["--input", str(tmp_path / "x.mp4"), "--output", str(tmp_path / "out"), *extra])
+        assert seen[-1] == expected
+    with pytest.raises(SystemExit):
+        main(["--input", str(tmp_path / "x.mp4"), "--output", str(tmp_path / "out"), "--preset", "baseline"])
