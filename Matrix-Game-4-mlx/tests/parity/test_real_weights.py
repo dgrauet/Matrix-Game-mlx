@@ -332,8 +332,8 @@ def test_stream_end_to_end(scene, comps):
         print(f"{scene} end-to-end chunk {i}{'' if i in gated else ' (info)'}: "
               + ", ".join(f"{k}={v:.4g}" for k, v in m.items()))
         if i in gated:
-            # Racing chunk 1 sits on top of a full chunk-0 clean pass, so torch against its own kernel variant already
-            # exceeds the spec's 2e-2 there (floor_chunk_1: ~3.1e-2); its pred gate is 1.5 x that torch floor instead.
+            # Racing chunk 1: torch against its own kernel variant reaches 3.07e-2 on this chunk (floor_chunk_1),
+            # above the spec's 2e-2, so its pred gate is 1.5 x that torch floor instead.
             pred_tol = 2e-2 if i == 0 else 1.5 * rel_l2(np.load(d / f"floor_chunk_{i}.npz")["pred"], ref["pred"])
             assert m["control"] < 2e-2, m
             assert m["pred"] < pred_tol, (m, pred_tol)

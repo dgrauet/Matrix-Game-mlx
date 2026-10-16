@@ -568,7 +568,8 @@ def call_floors(out: Path, gen=None, prompt=None, names=None) -> None:
     meta["call_floors"] = dict(
         variants="native_sdpa: cpu_bf16_emulation(sdpa=False); native_cpu_bf16: no emulation; "
                  "fp64_acc: cpu_bf16_emulation(acc=float64); same injected state",
-        metric="rel L2 vs the fixture call (pred, and the KV slot written at layers 0/29)", calls=floors,
+        metric=("rel L2 vs the fixture call (pred, the KV slot written at layers 0/29, and the k_sink_raw (ksr) "
+                "entries for sink-writing calls)"), calls=floors,
         seconds=time.perf_counter() - t0)
     (out / "meta.json").write_text(json.dumps(meta, indent=2))
     log(f"per-call floors done in {meta['call_floors']['seconds']:.0f}s")
