@@ -18,7 +18,6 @@ ancient-egypt, castle and racing scenes.
 ```bash
 cd Matrix-Game-4-mlx
 pip install -e .
-export MATRIX_GAME_4_MLX_WEIGHTS_DIR=/path/to/matrix-game-4.0-mlx   # required, see Weights
 python -m matrix_game_mlx.inference.offline --scene ancient-egypt --input lowpoly.mp4 --output output/egypt
 ```
 
@@ -41,9 +40,11 @@ python -m matrix_game_mlx.inference.offline --scene castle --preset realtime --i
 ## Weights
 
 The weight pack is produced by the [mlx-forge](https://github.com/dgrauet/mlx-forge) conversion of
-`Skywork/Matrix-Game-4.0`. Its publication on the Hub as `dgrauet/matrix-game-4.0-mlx` is planned; until then,
-set `MATRIX_GAME_4_MLX_WEIGHTS_DIR` to the local pack directory (required). Tests marked `needs_weights` are
-skipped when it is unset.
+`Skywork/Matrix-Game-4.0` and published as [`dgrauet/matrix-game-4.0-mlx`](https://huggingface.co/dgrauet/matrix-game-4.0-mlx)
+(bf16). It is downloaded automatically on first use, pinned to a fixed revision (`PACK_REVISION` in
+`inference/loader.py`), and only the selected scene's DiT (~10 GB) plus `taehv.safetensors` for the realtime preset
+are fetched. `MATRIX_GAME_4_MLX_WEIGHTS_DIR` points at a local pack directory instead (no download). Tests marked
+`needs_weights` use the local pack and are skipped when that variable is unset.
 
 ```text
 matrix-game-4.0-mlx/

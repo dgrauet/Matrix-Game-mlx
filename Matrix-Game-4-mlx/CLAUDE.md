@@ -5,8 +5,8 @@
 MLX inference port of Matrix-Game 4.0 (`../Matrix-Game-4/`, SkyworkAI/Matrix-Game). We port the
 causal video-to-video renderer for offline rendering on Apple Silicon, with a quality preset (Wan VAE) and a realtime
 preset (TAEHV codec, one denoising step). Model conversion is handled by
-[mlx-forge](https://github.com/dgrauet/mlx-forge); the converted pack is local for now
-(`MATRIX_GAME_4_MLX_WEIGHTS_DIR`), its Hub publication as `dgrauet/matrix-game-4.0-mlx` is planned. Inference only.
+[mlx-forge](https://github.com/dgrauet/mlx-forge); the converted pack is published as `dgrauet/matrix-game-4.0-mlx`
+(pinned revision, auto-downloaded) or read locally from `MATRIX_GAME_4_MLX_WEIGHTS_DIR`. Inference only.
 
 ## Guiding Principles
 

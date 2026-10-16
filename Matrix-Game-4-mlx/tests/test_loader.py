@@ -60,11 +60,40 @@ def test_hub_download_called_with_pinned_revision(tmp_path, monkeypatch):
     assert {c[2] for c in calls} == {"r"} and {c[0] for c in calls} == {"x/y"} and len(calls) == 3
 
 
-def test_pack_dir_requires_env_until_hub_publication(monkeypatch):
+@pytest.mark.parametrize("components,weights", [(None, ["*.safetensors"]), ((), []),
+                                                  (("dit_castle", "taehv"), ["dit_castle.safetensors", "taehv.safetensors"])])
+def test_pack_dir_from_hub_pinned(tmp_path, monkeypatch, components, weights):
     monkeypatch.delenv("MATRIX_GAME_4_MLX_WEIGHTS_DIR", raising=False)
-    with pytest.raises(RuntimeError, match="MATRIX_GAME_4_MLX_WEIGHTS_DIR") as info:
-        loader.pack_dir()
-    assert loader.PACK_REPO_ID in str(info.value) and "planned" in str(info.value)
+    calls = []
+    def fake_snapshot(repo_id, revision, allow_patterns):
+        calls.append((repo_id, revision, allow_patterns))
+        return str(tmp_path)
+    monkeypatch.setattr(loader, "snapshot_download", fake_snapshot)
+    assert loader.pack_dir(components) == tmp_path
+    assert calls == [(loader.PACK_REPO_ID, loader.PACK_REVISION, ["*.json", "*.png", *weights])]
+
+
+def test_model_components_fetches_only_the_scene_weights(tmp_path, monkeypatch):
+    pack = tmp_path / "pack"
+    (pack / "s").mkdir(parents=True)
+    (pack / "config.json").write_text(json.dumps({"scenes": {"castle": {
+        "component": "dit_castle", "inference": "s/inference.json", "sink_image": "s/sink.png"}}}))
+    (pack / "s/inference.json").write_text(json.dumps({"quality_steps": [1000, 500], "realtime_steps": [1000]}))
+    calls = []
+    def fake_pack_dir(components=None):
+        calls.append(components)
+        return pack
+    monkeypatch.setattr(loader, "pack_dir", fake_pack_dir)
+    class Stop(Exception):
+        pass
+    def stop(*args):
+        raise Stop
+    monkeypatch.setattr(loader, "resolve_shared_files", stop)
+    m = loader.ModelComponents("castle", "realtime")
+    assert calls == [()]
+    with pytest.raises(Stop):
+        m.load()
+    assert calls == [(), ("dit_castle", "taehv")]
 
 
 def test_pack_dir_from_env(tmp_path, monkeypatch):

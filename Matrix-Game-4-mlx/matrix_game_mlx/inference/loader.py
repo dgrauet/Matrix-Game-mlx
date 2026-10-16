@@ -5,18 +5,22 @@ import os
 from pathlib import Path
 from typing import Dict
 
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, snapshot_download
 
 PACK_REPO_ID = "dgrauet/matrix-game-4.0-mlx"
+PACK_REVISION = "327ce1f7ae729224ba37b0326fbf0eb4f79e0503"
 
 
-def pack_dir() -> Path:
-    """Local pack dir from MATRIX_GAME_4_MLX_WEIGHTS_DIR (required until the pack is published on the Hub)."""
+def pack_dir(components=None) -> Path:
+    """Pack dir: MATRIX_GAME_4_MLX_WEIGHTS_DIR if set, else the pinned Hub pack (PACK_REPO_ID at PACK_REVISION).
+
+    From the Hub, the small files (json configs, sink images) are always fetched, plus the `components` safetensors
+    (e.g. ("dit_castle", "taehv")); default is every component. Downloads are cached by huggingface_hub."""
     local = os.environ.get("MATRIX_GAME_4_MLX_WEIGHTS_DIR")
-    if not local:
-        raise RuntimeError(f"Set MATRIX_GAME_4_MLX_WEIGHTS_DIR to the local MLX weight pack directory; "
-                           f"its Hub publication as {PACK_REPO_ID} is planned")
-    return Path(local)
+    if local:
+        return Path(local)
+    weights = ["*.safetensors"] if components is None else [f"{c}.safetensors" for c in components]
+    return Path(snapshot_download(PACK_REPO_ID, revision=PACK_REVISION, allow_patterns=["*.json", "*.png", *weights]))
 
 
 def sha256_file(path: Path) -> str:
@@ -61,7 +65,7 @@ class ModelComponents:
         if preset not in ("quality", "realtime"):
             raise ValueError(f"Unknown preset {preset!r}; expected quality or realtime")
         self.scene, self.preset = scene, preset
-        self.pack = Path(pack) if pack else pack_dir()
+        self.pack = Path(pack) if pack else pack_dir(())
         self.cfg = json.loads((self.pack / "config.json").read_text())
         entry = self.cfg["scenes"][scene]
         self.component = entry["component"]
@@ -72,6 +76,7 @@ class ModelComponents:
         self.vae_backend = "taehv" if preset == "realtime" else "wan"
         self.steps = tuple(self.inference[f"{preset}_steps"])
         self.gen = self.vae = self.prompt = self.sink_latent = None
+        self._fetch_weights = pack is None
 
     def load(self):
         import gc
@@ -79,6 +84,8 @@ class ModelComponents:
         from matrix_game_mlx.inference.loading import build_dit
         from matrix_game_mlx.inference.stream import encode_sink_image
         from matrix_game_mlx.inference.wrappers import WanTextEncoder
+        if self._fetch_weights:
+            self.pack = pack_dir((self.component, "taehv") if self.vae_backend == "taehv" else (self.component,))
         shared = resolve_shared_files(self.pack, ("t5_encoder", "vae") if self.vae_backend == "wan" else ("t5_encoder",))
         text = WanTextEncoder(str(shared["t5_encoder.safetensors"]), str(shared["google/umt5-xxl"]))
         self.prompt = text([self.prompt_text])["prompt_embeds"].astype(mx.bfloat16)
