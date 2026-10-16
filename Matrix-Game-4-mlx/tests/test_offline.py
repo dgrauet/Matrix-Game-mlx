@@ -37,12 +37,58 @@ def test_missing_sink_image_fails_before_loading(tmp_path, monkeypatch):
     assert not (tmp_path / "out").exists()
 
 
-@pytest.mark.parametrize("scene,warned", [("castle", True), ("racing", True), ("ancient-egypt", False)])
-def test_warns_on_scenes_not_parity_validated(tmp_path, caplog, scene, warned):
+@pytest.mark.parametrize("scene", ["castle", "racing", "ancient-egypt"])
+def test_no_parity_warning_for_any_scene(tmp_path, caplog, scene):
     with pytest.raises(FileNotFoundError):
         main(["--scene", scene, "--input", str(tmp_path / "x.mp4"), "--sink-image", str(tmp_path / "missing.png"),
               "--output", str(tmp_path / "out")])
-    assert ("not parity-validated" in caplog.text) == warned
+    assert "not parity-validated" not in caplog.text
+
+
+def _take(tmp_path, **fields):
+    from matrix_game_mlx.scenes import SCENES
+    take = tmp_path / "take"
+    take.mkdir()
+    manifest = dict(status="complete", frames=5, width=1280, height=720, fps=24, **fields)
+    (take / "session.json").write_text(json.dumps(manifest))
+    return take, SCENES
+
+
+@pytest.mark.parametrize("fields,scene", [
+    (dict(scene="castle"), "castle"),
+    (dict(game="racing", mode="drive"), "racing"),
+    (dict(game="ancient-egypt"), "ancient-egypt"),
+])
+def test_take_resolves_scene_from_manifest(tmp_path, monkeypatch, fields, scene):
+    from matrix_game_mlx.inference import loader
+    take, scenes = _take(tmp_path, prompt=None, **fields)
+    manifest = json.loads((take / "session.json").read_text())
+    manifest["prompt"] = scenes[scene]["prompt"]
+    (take / "session.json").write_text(json.dumps(manifest))
+    seen = {}
+
+    def fake(scene_name, *a, **k):
+        seen["scene"] = scene_name
+        raise RuntimeError("stop")
+    monkeypatch.setattr(loader, "ModelComponents", fake)
+    import imageio_ffmpeg
+
+    class Reader:
+        def __next__(self):
+            return dict(size=(1280, 720), fps=24)
+
+        def close(self):
+            pass
+    monkeypatch.setattr(imageio_ffmpeg, "read_frames", lambda *a, **k: Reader())
+    with pytest.raises(RuntimeError, match="stop"):
+        main(["--take", str(take), "--output", str(tmp_path / "out")])
+    assert seen["scene"] == scene
+
+
+def test_take_prompt_mismatch_rejected(tmp_path):
+    take, _ = _take(tmp_path, scene="racing", prompt="wrong")
+    with pytest.raises(SystemExit):
+        main(["--take", str(take), "--output", str(tmp_path / "out")])
 
 
 @pytest.mark.needs_weights

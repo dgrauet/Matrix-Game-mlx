@@ -1,7 +1,6 @@
 """Render a video or a complete local recording using the same stream as online (MLX)."""
 import argparse
 import json
-import logging
 from pathlib import Path
 import time
 
@@ -52,9 +51,6 @@ def main(argv=None):
         if scene not in SCENES or manifest.get("prompt") != SCENES[scene]["prompt"]:
             parser.error("Recording scene/prompt does not match release profiles")
         args.scene, args.input = scene, args.take / "reference.mkv"
-    if args.scene in ("castle", "racing"):
-        logging.getLogger(__name__).warning("Scene %s is not parity-validated in milestone 1 (ancient-egypt is)",
-                                            args.scene)
     if args.sink_image is not None and not args.sink_image.is_file():
         raise FileNotFoundError(f"Missing resources:\n{args.sink_image}")
     import imageio_ffmpeg
