@@ -54,7 +54,18 @@ def weights_dir() -> Optional[Path]:
     return Path(d) if d and Path(d, "config.json").is_file() else None
 
 
+@pytest.hookimpl(trylast=True)                  # after pytest's own fixture-based reordering
 def pytest_collection_modifyitems(config, items):
+    # Group each module's items by their "scene" parameter (first-appearance order, stable otherwise), so
+    # tests/parity/test_real_weights.py, which keeps one scene's DiT in memory at a time, loads each scene once.
+    def scene_key(item):
+        return item.path, getattr(getattr(item, "callspec", None), "params", {}).get("scene")
+
+    modules, scenes = {}, {}
+    for item in items:
+        modules.setdefault(item.path, len(modules))
+        scenes.setdefault(scene_key(item), len(scenes))
+    items.sort(key=lambda item: (modules[item.path], scenes[scene_key(item)]))
     for item in items:
         if "needs_weights" in item.keywords and weights_dir() is None:
             item.add_marker(pytest.mark.skip(reason="MATRIX_GAME_4_MLX_WEIGHTS_DIR not set"))

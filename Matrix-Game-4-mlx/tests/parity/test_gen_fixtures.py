@@ -72,3 +72,38 @@ def test_queued_renoise_is_consumed_per_chunk():
             if drawn:
                 torch.randn(1, *LATENT_SHAPE[2:])
         assert not left
+
+
+def test_sink_rows_written_follows_upstream_rule():
+    """k_sink_raw is written iff the slot starts inside the 405-token sink (racing chunk 0: slot 0 of an empty cache)."""
+    from tests.parity.gen_fixtures import sink_rows_written
+    assert sink_rows_written(405, 405) == range(0, 405)          # racing chunk-0 clean pass / kv_only sink priming
+    assert not sink_rows_written(810, 405)                        # egypt chunk 0 (slot 1 after the primed sink)
+    assert not sink_rows_written(21 * 405, 405)                   # full rolled window
+    assert sink_rows_written(600, 405) == range(195, 405)         # a slot straddling the sink boundary
+
+
+def test_call_recorder_stores_k_sink_raw_only_for_sink_writes():
+    """Layer 0/29 k_sink_raw after the call is recorded (ksr{layer}) only when the call writes into the sink."""
+    from tests.parity.gen_fixtures import KV_LAYERS, CallRecorder, from_bits
+    kv = [dict(k=torch.zeros(1, 810, 2, 4, dtype=torch.bfloat16), v=torch.zeros(1, 810, 2, 4, dtype=torch.bfloat16),
+               k_sink_raw=torch.zeros(1, 405, 2, 4, dtype=torch.bfloat16),
+               global_end_index=torch.tensor([0]), local_end_index=torch.tensor([0])) for _ in range(30)]
+
+    def gen(**kw):                                                # writes one 405-token slot at current_start
+        start = kw["current_start"]
+        for c in kv:
+            c["k"][:, start:start + 405] = 1.0
+            if start < 405:
+                c["k_sink_raw"][:] = 2.0
+            c["global_end_index"].fill_(start + 405)
+            c["local_end_index"].fill_(start + 405)
+        return None, torch.zeros(1, dtype=torch.bfloat16)
+
+    recorder = CallRecorder(gen, kv)
+    for start in (0, 405):
+        recorder(noisy_image_or_video=torch.zeros(1, dtype=torch.bfloat16), timestep=torch.zeros(1, 1),
+                 current_start=start, drop_control=True)
+    first, second = recorder.calls
+    assert all((from_bits(first[f"ksr{layer}"]) == 2.0).all() for layer in KV_LAYERS)
+    assert not any(key.startswith("ksr") for key in second)

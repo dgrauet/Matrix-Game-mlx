@@ -364,6 +364,14 @@ def written_slot(a: np.ndarray, tokens: int = 405) -> np.ndarray:
     return a[:, -tokens:]
 
 
+def sink_rows_written(local_end_index: int, new_tokens: int, sink_tokens: int = 405) -> range:
+    """Rows of k_sink_raw a cache write of `new_tokens` ending at `local_end_index` updates. Upstream
+    CausalWanSelfAttention writes the raw (pre-RoPE) k of the slot's sink part iff the slot starts inside the sink
+    (one 405-token sink frame, set_attention_window(gen, 21, 1)); empty otherwise."""
+    start = local_end_index - new_tokens
+    return range(start, min(sink_tokens, local_end_index)) if start < sink_tokens else range(0)
+
+
 def bf16_bits(t) -> np.ndarray:
     """Exact bf16 payload of a torch tensor as uint16 (decoded by from_bits); a copy, never a view of a live cache."""
     import torch
@@ -396,7 +404,9 @@ def load_kv_state(torch, gen, state: dict):
 
 
 class CallRecorder:
-    """Wrap the upstream generator: record each call's inputs, pred_x0 and the layer 0/29 KV after the call."""
+    """Wrap the upstream generator: record each call's inputs, pred_x0 and the layer 0/29 KV after the call, plus the
+    layer 0/29 k_sink_raw after the call when the call writes into the sink (`ksr{layer}`: racing's chunk-0 clean pass
+    at slot 0; raw k cannot be recovered from the roped cache, so it is stored)."""
 
     def __init__(self, gen, kv):
         self.gen, self.kv, self.calls = gen, kv, []
@@ -410,6 +420,8 @@ class CallRecorder:
             c = self.kv[layer]
             n = int(c["local_end_index"].item())
             call.update({f"k{layer}": bf16_bits(c["k"][:, :n]), f"v{layer}": bf16_bits(c["v"][:, :n])})
+            if sink_rows_written(n, int(c["global_end_index"].item()) - int(kw["current_start"])):
+                call[f"ksr{layer}"] = bf16_bits(c["k_sink_raw"])
         self.calls.append(call)
         return out
 
@@ -459,7 +471,8 @@ def build_torch_dit(torch, spec: SceneSpec):
 
 
 def call_floor(torch, spec: SceneSpec, gen, prompt, fixture) -> list:
-    """Torch-vs-torch floor per call: rel L2 of pred and of the layer 0/29 KV slot it writes, for two other kernels."""
+    """Torch-vs-torch floor per call: rel L2 of pred and of the layer 0/29 KV slot it writes (and of the layer 0/29
+    k_sink_raw when the call writes into the sink), for the three kernel variants."""
     out = []
     for j in range(int(fixture["n_calls"])):
         row = {}
@@ -477,6 +490,9 @@ def call_floor(torch, spec: SceneSpec, gen, prompt, fixture) -> list:
                 for kind in ("k", "v"):
                     got = bf16_bits(kv[layer][kind][:, :int(kv[layer]["local_end_index"].item())])
                     row[f"{name}_{kind}{layer}"] = rel_l2(*(from_bits(written_slot(a)) for a in (got, fixture[f"c{j}_{kind}{layer}"])))
+                if f"c{j}_ksr{layer}" in fixture.files:                # the call wrote into the sink
+                    row[f"{name}_ksr{layer}"] = rel_l2(from_bits(bf16_bits(kv[layer]["k_sink_raw"])),
+                                                       from_bits(fixture[f"c{j}_ksr{layer}"]))
         out.append(row)
     return out
 
