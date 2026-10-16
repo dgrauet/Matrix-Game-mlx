@@ -142,6 +142,8 @@ torch kernel-variant floor, and a strict end-to-end check on chunk 0 (racing: ch
 
 ### Realtime preset
 
+The torch reference is the bf16 CPU emulation (`cpu_bf16_emulation`: fp32 compute with bf16-rounded outputs, see the parity methodology section); the decoder.8 regression test compares against native torch bf16 conv.
+
 Gates use the `<scene>_realtime` fixtures (torch bf16 CPU reference, upstream native DiT runtime). TAEHV gates
 are MLX rel L2 vs torch, with tolerance ceil_1sig(1.5 x the max over the torch variants, fp32 CPU and bf16 MPS):
 

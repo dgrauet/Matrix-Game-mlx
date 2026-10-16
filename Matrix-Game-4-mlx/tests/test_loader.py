@@ -34,6 +34,20 @@ def test_sha_mismatch_raises(tmp_path, monkeypatch):
         loader.resolve_shared_files(pack)
 
 
+def test_taehv_resolution_skips_wan_vae(tmp_path, monkeypatch):
+    pack, shared = _fake_pack(tmp_path)
+    (shared / "vae.safetensors").unlink()
+    monkeypatch.setenv("MATRIX_GAME_4_MLX_SHARED_DIR", str(shared))
+    out = loader.resolve_shared_files(pack, ("t5_encoder",))
+    assert set(out) == {"t5_encoder.safetensors", "google/umt5-xxl"}
+    with pytest.raises(FileNotFoundError):
+        loader.resolve_shared_files(pack)
+    # Resolved files are still sha-checked
+    (shared / "t5_encoder.safetensors").write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="sha256"):
+        loader.resolve_shared_files(pack, ("t5_encoder",))
+
+
 def test_hub_download_called_with_pinned_revision(tmp_path, monkeypatch):
     pack, shared = _fake_pack(tmp_path)
     monkeypatch.delenv("MATRIX_GAME_4_MLX_SHARED_DIR", raising=False)

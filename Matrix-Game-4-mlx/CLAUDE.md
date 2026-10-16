@@ -80,7 +80,7 @@ matrix_game_mlx/
     offline.py                   # CLI: --input clip | --take recording -> rendered.mp4 + render.json
     loader.py                    # ModelComponents: pack dir, pinned shared MG3 files (sha256), T5 -> DiT -> VAE
     loading.py                   # strict DiT build from the mlx-forge pack
-    stream.py                    # CastleStream: sink priming, chunk push (2 denoising calls + cache update)
+    stream.py                    # CastleStream: sink priming, chunk push (1-2 denoising calls per preset + cache update)
     wrappers.py                  # WanDiffusionWrapper (flow -> x0 in float64), WanTextEncoder, WanVAE22Wrapper, KV caches
     decoder.py                   # incremental Wan VAE decoding with persistent causal features
     taehv.py                     # TAEHV encode/decode (realtime codec), float32-accumulating convs

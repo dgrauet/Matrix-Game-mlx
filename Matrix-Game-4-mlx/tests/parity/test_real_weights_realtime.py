@@ -168,35 +168,38 @@ def test_stream_end_to_end_realtime(scene, comps):
     d, meta = _dir(scene), _meta(scene)
     inputs, ref = np.load(d / "inputs.npz"), np.load(d / "chunks.npz")
     stream = comps.stream(seed=0)
-    recorder = _StepRecorder(stream.gen)
-    stream.gen = recorder
-    first_frame = comps.sink_mode == "first_frame"
-    gated = {0, 1} if first_frame else {0}
-    failures, frame = [], 0
-    for i in range(meta["chunks"]):
-        px = mx.array(inputs[f"pixels_{i}"])
-        recorder.n = 0
-        c = stream.push(px, frame_start=frame, initial_noise=mx.array(inputs[f"initial_noise_{i}"]))
-        frame += px.shape[0]
-        got = dict(control=to_np(c.control), pred=to_np(c.latent), kv_k_layer0=to_np(stream.kv[0]["k"]),
-                   kv_k_layer29=to_np(stream.kv[29]["k"]))
-        assert recorder.n == int(ref[f"n_denoising_{i}"]), (i, recorder.n, int(ref[f"n_denoising_{i}"]))
-        if first_frame and i == 0:
-            # No denoising call on either side: pred is the sink latent itself
-            np.testing.assert_array_equal(got["pred"], to_np(comps.sink_latent), err_msg="chunk 0 pred vs sink latent")
-            np.testing.assert_array_equal(got["pred"], ref["pred_0"], err_msg="chunk 0 pred vs torch")
-        m = {k: rel_l2(v, ref[f"{k}_{i}"]) for k, v in got.items()}
-        m["decoded_psnr"] = psnr(c.pixels, ref[f"decoded_{i}"])
-        print(f"{scene} realtime end-to-end chunk {i}{'' if i in gated else ' (info)'}: "
-              + ", ".join(f"{k}={v:.4g}" for k, v in m.items()))
-        if i in gated:
-            # Pred gate: the spec's 2e-2, or 1.5 x the torch-vs-variant floor of that chunk when torch itself exceeds
-            # it (M2 rule; one-step realtime chunks do, see the module docstring)
-            floor = rel_l2(np.load(d / f"floor_chunk_{i}.npz")["pred"], ref[f"pred_{i}"])
-            pred_tol = max(2e-2, 1.5 * floor)
-            checks = dict(control=(m["control"], 2e-2), pred=(m["pred"], pred_tol),
-                          kv_k_layer0=(m["kv_k_layer0"], 2e-2), kv_k_layer29=(m["kv_k_layer29"], 2e-2))
-            failures += [(i, k, v, tol) for k, (v, tol) in checks.items() if not v < tol]
-            if not m["decoded_psnr"] > 35.0:
-                failures.append((i, "decoded_psnr", m["decoded_psnr"], 35.0))
+    try:
+        recorder = _StepRecorder(stream.gen)
+        stream.gen = recorder
+        first_frame = comps.sink_mode == "first_frame"
+        gated = {0, 1} if first_frame else {0}
+        failures, frame = [], 0
+        for i in range(meta["chunks"]):
+            px = mx.array(inputs[f"pixels_{i}"])
+            recorder.n = 0
+            c = stream.push(px, frame_start=frame, initial_noise=mx.array(inputs[f"initial_noise_{i}"]))
+            frame += px.shape[0]
+            got = dict(control=to_np(c.control), pred=to_np(c.latent), kv_k_layer0=to_np(stream.kv[0]["k"]),
+                       kv_k_layer29=to_np(stream.kv[29]["k"]))
+            assert recorder.n == int(ref[f"n_denoising_{i}"]), (i, recorder.n, int(ref[f"n_denoising_{i}"]))
+            if first_frame and i == 0:
+                # No denoising call on either side: pred is the sink latent itself
+                np.testing.assert_array_equal(got["pred"], to_np(comps.sink_latent), err_msg="chunk 0 pred vs sink latent")
+                np.testing.assert_array_equal(got["pred"], ref["pred_0"], err_msg="chunk 0 pred vs torch")
+            m = {k: rel_l2(v, ref[f"{k}_{i}"]) for k, v in got.items()}
+            m["decoded_psnr"] = psnr(c.pixels, ref[f"decoded_{i}"])
+            print(f"{scene} realtime end-to-end chunk {i}{'' if i in gated else ' (info)'}: "
+                  + ", ".join(f"{k}={v:.4g}" for k, v in m.items()))
+            if i in gated:
+                # Pred gate: the spec's 2e-2, or 1.5 x the torch-vs-variant floor of that chunk when torch itself exceeds
+                # it (M2 rule; one-step realtime chunks do, see the module docstring)
+                floor = rel_l2(np.load(d / f"floor_chunk_{i}.npz")["pred"], ref[f"pred_{i}"])
+                pred_tol = max(2e-2, 1.5 * floor)
+                checks = dict(control=(m["control"], 2e-2), pred=(m["pred"], pred_tol),
+                              kv_k_layer0=(m["kv_k_layer0"], 2e-2), kv_k_layer29=(m["kv_k_layer29"], 2e-2))
+                failures += [(i, k, v, tol) for k, (v, tol) in checks.items() if not v < tol]
+                if not m["decoded_psnr"] > 35.0:
+                    failures.append((i, "decoded_psnr", m["decoded_psnr"], 35.0))
+    finally:
+        stream.close()
     assert not failures, failures

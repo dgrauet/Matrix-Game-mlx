@@ -28,19 +28,27 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def resolve_shared_files(pack: Path) -> Dict[str, Path]:
-    """Fetch T5/VAE/tokenizer from the pinned MG3 repo (or MATRIX_GAME_4_MLX_SHARED_DIR) and verify sha256."""
+def resolve_shared_files(pack: Path, components=None) -> Dict[str, Path]:
+    """Fetch T5/VAE/tokenizer from the pinned MG3 repo (or MATRIX_GAME_4_MLX_SHARED_DIR) and verify sha256.
+
+    `components` limits the resolved component files to those names (keys of the pack's shared components, e.g.
+    {"t5_encoder"} for the TAEHV realtime preset, which does not need the Wan VAE); default is all. The tokenizer is
+    always resolved, and every resolved file is sha-checked."""
     shared = json.loads((Path(pack) / "split_model.json").read_text())["shared"]
     local = os.environ.get("MATRIX_GAME_4_MLX_SHARED_DIR")
+    wanted = shared["components"] if components is None else {k: shared["components"][k] for k in components}
+    skipped = set(shared["components"].values()) - set(wanted.values())
     resolved = {}
     for entry in shared["files"]:
         rel = entry["path"]
+        if rel in skipped:
+            continue
         path = Path(local) / rel if local else Path(hf_hub_download(shared["repo_id"], rel, revision=shared["revision"]))
         digest = sha256_file(path)
         if digest != entry["sha256"]:
             raise ValueError(f"sha256 mismatch for {rel}: expected {entry['sha256']}, got {digest} ({path})")
         resolved[rel] = path
-    out = {name: resolved[name] for name in shared["components"].values()}
+    out = {name: resolved[name] for name in wanted.values()}
     out[shared["tokenizer"]] = resolved[next(r for r in resolved if r.startswith(shared["tokenizer"] + "/"))].parent
     return out
 
@@ -71,7 +79,7 @@ class ModelComponents:
         from matrix_game_mlx.inference.loading import build_dit
         from matrix_game_mlx.inference.stream import encode_sink_image
         from matrix_game_mlx.inference.wrappers import WanTextEncoder
-        shared = resolve_shared_files(self.pack)
+        shared = resolve_shared_files(self.pack, ("t5_encoder", "vae") if self.vae_backend == "wan" else ("t5_encoder",))
         text = WanTextEncoder(str(shared["t5_encoder.safetensors"]), str(shared["google/umt5-xxl"]))
         self.prompt = text([self.prompt_text])["prompt_embeds"].astype(mx.bfloat16)
         mx.eval(self.prompt)

@@ -118,6 +118,40 @@ def test_encode_sink_image_taehv_clears_state(tmp_path):
     assert mx.array_equal(vae.encode_stream(pixels), fresh.encode_stream(pixels))
 
 
+def _dirty_pair():
+    """A TAEHV codec with live streaming encoder/decoder state, plus a fresh twin with identical weights."""
+    vae, fresh = _taehv(), _taehv()
+    fresh.core.update(vae.core.parameters())
+    rng = np.random.default_rng(3)
+    vae.encode_stream(mx.array(rng.uniform(-1, 1, (1, 3, 1, 480, 864)).astype(np.float32)))
+    vae.decode_stream(mx.array(rng.normal(size=LATENT_SHAPE).astype(np.float32)).astype(mx.bfloat16)
+                      .transpose(0, 2, 1, 3, 4))
+    assert vae._streaming_encoder is not None and vae._streaming_decoder is not None and vae._streaming_encode_frames > 0
+    return vae, fresh
+
+
+def _assert_clean_and_equal_to_fresh(vae, fresh):
+    assert vae._streaming_encoder is None and vae._streaming_decoder is None and vae._streaming_encode_frames == 0
+    pixels = mx.array(np.random.default_rng(2).uniform(-1, 1, (1, 3, 1, 480, 864)).astype(np.float32))
+    assert mx.array_equal(vae.encode_stream(pixels), fresh.encode_stream(pixels))
+
+
+def test_encode_sink_image_taehv_clears_dirty_state(tmp_path):
+    from PIL import Image
+    from matrix_game_mlx.inference.stream import encode_sink_image
+    path = tmp_path / "sink.png"
+    Image.fromarray(np.random.default_rng(1).integers(0, 255, (700, 1000, 3), dtype=np.uint8)).save(path)
+    vae, fresh = _dirty_pair()
+    encode_sink_image(vae, path, "taehv")
+    _assert_clean_and_equal_to_fresh(vae, fresh)
+
+
+def test_castle_stream_init_clears_dirty_taehv_state():
+    vae, fresh = _dirty_pair()
+    CastleStream(_FakeGenerator(), vae, mx.zeros((1, 2, 4)), vae_backend="taehv", steps=(1000,), first_steps=(1000,))
+    _assert_clean_and_equal_to_fresh(vae, fresh)
+
+
 def test_unknown_backend_raises(tmp_path):
     from matrix_game_mlx.inference.stream import encode_sink_image
     with pytest.raises(ValueError, match="Expected wan or taehv VAE backend"):

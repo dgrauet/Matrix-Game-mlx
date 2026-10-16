@@ -1,4 +1,4 @@
-"""Scene-configured chunk sessions with the Wan streaming codec (MLX port of matrix_game/inference/stream.py)."""
+"""Scene-configured chunk1 sessions with Wan or TAEHV streaming codecs (MLX port of matrix_game/inference/stream.py)."""
 from dataclasses import dataclass, field
 
 import mlx.core as mx
