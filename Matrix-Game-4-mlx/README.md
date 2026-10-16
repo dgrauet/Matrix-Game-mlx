@@ -2,14 +2,14 @@
 
 MLX inference port of [Matrix-Game 4.0](https://github.com/SkyworkAI/Matrix-Game) for Apple Silicon.
 It targets offline rendering: a causal video-to-video renderer that turns a clip into a stylized one
-using the quality preset, with the ancient-egypt style supported first.
+using the quality preset, for the ancient-egypt, castle and racing scenes.
 
 ## Status
 
 | Milestone | Scope | Status |
 | --- | --- | --- |
 | M1 | ancient-egypt, quality preset (Wan VAE, steps `1000,500`), offline CLI, real-weight parity | Done: parity-validated; a 19 s recorded take (909 frames, 48 FPS) rendered in 1 h 52 min (29.4 s/chunk, peak 24.4 GB) |
-| M2 | castle and racing (first-frame sink, absolute RoPE, racing RNG role), fixtures for both | Next |
+| M2 | castle and racing (first-frame sink, absolute RoPE, racing RNG role), fixtures for both | Done: parity-validated, same methodology as ancient-egypt |
 | M3 | realtime preset: TAEHV encode/decode (`taehv.py`), one-step schedule | Next |
 
 ## Quick start
@@ -31,7 +31,7 @@ python -m matrix_game_mlx.inference.offline --take /path/to/take-1 --output outp
 The output directory gets `rendered.mp4` (same frame count and FPS as the input; the last incomplete
 four-frame block is padded internally, then trimmed) and `render.json` (configuration, frames, seconds,
 `seconds_per_chunk`, `peak_memory_gb`). Other flags: `--seed` (default 0), `--sink-image` (overrides the
-scene's sink image), `--preset quality` (the only preset in M1).
+scene's sink image), `--preset quality` (the only preset so far).
 
 ## Weights
 
@@ -104,9 +104,20 @@ attention bias included (`x.new_zeros`).
 
 ## Scenes
 
-Only ancient-egypt is parity-validated in milestone 1. `--scene castle` and `--scene racing` are exposed (the pack
-holds their DiT weights and sink images), but their first-frame sink, absolute RoPE and racing RNG role have no
-torch fixtures yet (milestone 2); the CLI logs a warning when they are selected.
+All three scenes (`--scene {ancient-egypt,castle,racing}`) are parity-validated in the quality preset against
+upstream PyTorch with the same methodology (see below): per-block and per-call teacher-forced gates at 1.5x the
+torch kernel-variant floor, and a strict end-to-end check on chunk 0 (racing: chunks 0 and 1).
+
+| Scene | Sink policy | End-to-end result |
+| --- | --- | --- |
+| ancient-egypt | fixed sink | chunk 0 pred rel L2 1.71e-2, decoded 44.9 dB |
+| castle | fixed sink | chunk 0 pred 1.41e-2, 43.7 dB; blocks at most 0.56x gate. Chunk 1 (reported) 0.455 vs torch-vs-torch 0.478 |
+| racing | first_frame sink, absolute sink RoPE | chunk 0 = sink latent, bitwise, 56.4 dB; chunk 1 pred 2.47e-2 (gate 1.5x torch floor 3.07e-2), 45.8 dB; blocks at most 0.56x gate |
+
+- Castle amplifies bf16 rounding faster than ancient-egypt: at chunk 1 MLX stays within torch's own spread.
+- Racing's chunk 0 is the sink latent itself (no denoising). Its chunk 1 pred is gated at 1.5x the torch floor
+  because torch's own spread exceeds 2e-2 there. Chunk 2 (reported) is 4.5e-2, 39.6 dB. The `--long` chunk 22,
+  past the 21-latent window (eviction with absolute RoPE), passes its per-call gates.
 
 ## Known deviations from upstream
 
@@ -127,14 +138,16 @@ directly (single module fp32 `max_abs < 1e-3`, block `< 5e-3`). Real-weight pari
   1.5x the largest rel L2 between torch and three torch kernel variants of the same call (native bf16 SDPA,
   native CPU bf16 without emulation, float64 accumulation), so MLX must stay within the noise torch shows
   against itself. The rest of the cache (history, sink, rolled window), the end indices and `k_sink_raw`
-  must match exactly. A `--long` chunk 22 runs past the 21-frame window (rolling eviction, fixed-sink re-RoPE).
+  must match exactly. A `--long` chunk 22 runs past the 21-frame window (rolling eviction, and re-RoPE of the
+  fixed sink or eviction with absolute RoPE for racing).
 - **Per block.** For chunk 0's first denoising call, each of the 30 blocks gets torch's exact input, `e0`,
   context and sink KV; its output must be within 1.5x the largest torch-variant rel L2 on that block. This
   catches a systematic divergence that per-call noise would hide.
 - **End to end, chunk 0 strict.** The full MLX stream runs from the same inputs. Chunk 0 is gated with the
   spec thresholds (control, pred and KV rel L2 `< 2e-2`, decoded PSNR `> 35 dB`). The autoregressive stream
   amplifies bf16 rounding chunk over chunk (torch against itself reaches ~0.3 rel L2 by chunk 2), so chunks 1
-  and 2 are reported only.
+  and 2 are reported only. Racing's chunk 0 is the sink latent, so its chunk 1 is gated too, against 1.5x the
+  torch floor of that chunk.
 
 Fixtures are generated with the real upstream model. The prompt embeddings come from the MLX umT5 and are
 stored in the fixtures, so both sides see the same context; the text encoder has its own real-weight test
@@ -142,11 +155,12 @@ against upstream's bf16 umT5 (`tests/test_text_encoder.py`, gate 1.5x the torch-
 
 ```bash
 cd Matrix-Game-4-mlx
-MATRIX_GAME_4_MLX_WEIGHTS_DIR=... python -m tests.parity.gen_fixtures --device auto [--long]
+MATRIX_GAME_4_MLX_WEIGHTS_DIR=... python -m tests.parity.gen_fixtures --scene castle --device auto [--long]
 ```
 
 | Flag | Effect |
 | --- | --- |
+| `--scene {ancient-egypt,castle,racing}` | Scene to generate (default ancient-egypt) |
 | `--device {auto,mps,cpu}` | Torch device; `auto` tries MPS first. The DiT falls back to CPU (MPS has no float64), the VAE stays on MPS |
 | `--chunks N` | Number of chunks (default 3) |
 | `--long` | Also run 25 chunks (pred and decoded) and the chunk-22 per-call fixture |
@@ -155,9 +169,12 @@ MATRIX_GAME_4_MLX_WEIGHTS_DIR=... python -m tests.parity.gen_fixtures --device a
 | `--call-floors-only` | Re-measure only the torch kernel-variant floors of the per-call fixtures |
 | `--blocks-only` | Regenerate only the per-block fixture of chunk 0 call 0 and its floors |
 
-They are written to `$MG4_FIXTURES_DIR/egypt_quality/` (default `~/.cache/matrix-game-4-mlx/fixtures`):
-about 1.7 GB for the default run and 6.2 GB with `--long` (the chunk-22 per-call fixture alone is 3.8 GB).
-Recorded in `meta.json` (M2 Pro, VAE on MPS, DiT on CPU): the 3-chunk run took 219 s
+They are written to `$MG4_FIXTURES_DIR/<scene>_quality/` (`egypt_quality`, `castle_quality`, `racing_quality`;
+default `~/.cache/matrix-game-4-mlx/fixtures`): about 1.5 GB per scene without `--long` (ancient-egypt 1.7 GB)
+and 6.2 GB with `--long` (the chunk-22 per-call fixture alone is 3.8 GB). A full castle set takes about 1 h to
+generate, a racing set with `--long` about 1 h 15. For racing the torch DiT runs on the CPU (no sink-priming
+smoke on MPS is possible).
+Recorded in `meta.json` for ancient-egypt (M2 Pro, VAE on MPS, DiT on CPU): the 3-chunk run took 219 s
 (`run_seconds`), the 25-chunk `--long` run 2668 s (about 44 min, `long_seconds`), plus 335 s for the floor
 run and 1267 s for the per-call floors. Native torch bf16 GEMMs on the CPU run at
 about 1 GFLOPS on Apple Silicon (a 5B forward would take about an hour), so the generator emulates them:
@@ -174,5 +191,6 @@ cd Matrix-Game-4-mlx
 python -m pytest tests -v
 ```
 
-Install the `parity` extra for the upstream oracle. Tests marked `needs_fixtures` read the torch reference
+The real-weight parity suite runs once per scene whose fixtures exist (a missing or partial set is skipped with
+its `gen_fixtures` command) and loads one DiT at a time. Install the `parity` extra for the upstream oracle. Tests marked `needs_fixtures` read the torch reference
 fixtures from `MG4_FIXTURES_DIR`; tests marked `needs_weights` need `MATRIX_GAME_4_MLX_WEIGHTS_DIR`.

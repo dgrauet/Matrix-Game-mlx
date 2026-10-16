@@ -51,6 +51,14 @@ wrapper-level APIs keep upstream shapes `[B, F, C, h, w]`.
 - KV-cache end indices are Python ints instead of 1-element tensors
 - Test-only `renoise` argument on `CastleStream.push`
 
+## Validation Status
+
+Ancient-egypt, castle and racing are parity-validated (quality preset) with the same methodology: per-block and
+per-call teacher-forced gates at 1.5x the torch kernel-variant floor, strict end-to-end on chunk 0 (racing: chunks
+0 and 1, since its first_frame sink makes chunk 0 the sink latent). Fixtures: `python -m tests.parity.gen_fixtures
+--scene {ancient-egypt,castle,racing}` into `$MG4_FIXTURES_DIR/{egypt,castle,racing}_quality`; the real-weight
+suite runs per scene whose fixtures exist, one DiT loaded at a time. Racing's torch DiT runs on the CPU.
+
 ## File Map
 
 ```text
