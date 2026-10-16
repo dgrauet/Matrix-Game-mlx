@@ -52,3 +52,23 @@ def test_expected_denoising_calls_per_chunk():
     assert n_denoising_calls(SCENE_SPECS["racing"], 0) == 0
     assert n_denoising_calls(SCENE_SPECS["racing"], 1) == len(STEPS)
     assert n_denoising_calls(SCENE_SPECS["castle"], 0) == len(STEPS)
+
+
+def test_renoise_count_follows_scene_policy():
+    from tests.parity.gen_fixtures import SCENE_SPECS, STEPS, n_renoise
+    assert [n_renoise(SCENE_SPECS["racing"], i) for i in (0, 1, 2, 22)] == [0, len(STEPS) - 1, len(STEPS) - 1, len(STEPS) - 1]
+    assert [n_renoise(SCENE_SPECS["castle"], i) for i in (0, 1)] == [len(STEPS) - 1] * 2
+    assert n_renoise(SCENE_SPECS["ancient-egypt"], 0) == 1
+
+
+def test_queued_renoise_is_consumed_per_chunk():
+    """Racing chunk 0 queues nothing (upstream draws no renoise), other chunks queue one tensor that must be drawn."""
+    import numpy as np
+    from tests.parity.gen_fixtures import LATENT_SHAPE, SCENE_SPECS, injected_renoise, n_renoise
+    spec = SCENE_SPECS["racing"]
+    for chunk, drawn in ((0, False), (1, True)):
+        tensors = [torch.from_numpy(np.zeros(LATENT_SHAPE, np.float32))][:n_renoise(spec, chunk)]
+        with injected_renoise(torch, tensors) as left:
+            if drawn:
+                torch.randn(1, *LATENT_SHAPE[2:])
+        assert not left

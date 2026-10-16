@@ -30,7 +30,7 @@ UPSTREAM_COMMIT = "5446525"
 LATENT_SHAPE = (1, 1, 48, 30, 54)
 STEPS = (1000, 500)
 PAN_STEP = 8
-LONG_CALL_CHUNK = 22    # position 23 > 21-frame window: rolling eviction and fixed-sink re-RoPE run
+LONG_CALL_CHUNK = 22    # position 23 > 21-frame window: rolling eviction (and fixed-sink re-RoPE for kv_only/fixed) run
 KV_LAYERS = (0, 29)
 
 
@@ -66,7 +66,12 @@ DEFAULT_SCENE = "ancient-egypt"
 
 def n_denoising_calls(spec: SceneSpec, chunk: int) -> int:
     """Control-conditioned calls of a chunk: first_frame chunk 0 reuses the sink latent as pred (no denoising)."""
-    return 0 if spec.sink_mode == "first_frame" and chunk == 0 else len(STEPS)
+    return 0 if spec.sink_mode == "first_frame" and chunk == 0 else len(STEPS)   # first_steps == STEPS (make_stream)
+
+
+def n_renoise(spec: SceneSpec, chunk: int) -> int:
+    """Renoise draws of a chunk: upstream draws one between consecutive denoising steps only."""
+    return max(n_denoising_calls(spec, chunk) - 1, 0)
 
 
 def first_denoising_call(n_calls: list, drops: dict) -> tuple:
@@ -89,7 +94,8 @@ def log(msg: str) -> None:
 
 def pan_frames(spec: SceneSpec, n: int) -> np.ndarray:
     """Deterministic pan over the sink image: 480x864 crops of the native frame, shifted 8 px per frame
-    (ping-pong when the window reaches the image edge). Returns float32 [n, 3, 480, 864] in [-1, 1]."""
+    (ping-pong when the window reaches the image edge); a center crop, so for first_frame scenes (sink fitted to the
+    frame) frame 0 is not the sink framing. Returns float32 [n, 3, 480, 864] in [-1, 1]."""
     from PIL import Image
     with Image.open(spec.sink_image) as image:
         arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
@@ -308,7 +314,12 @@ def load_stream(torch, spec: SceneSpec, device_pref: str, vae, prompt_np: np.nda
     ensure_accelerate(torch)
     gen = build_dit(str(CONFIG_DIR), str(spec.checkpoint), is_causal=True, dtype="bfloat16", timestep_shift=5)
     gen = gen.eval().requires_grad_(False)
-    if device_pref in ("auto", "mps") and torch.backends.mps.is_available():
+    if spec.sink_mode == "first_frame":
+        # No sink-priming forward at construction, so there is no MPS smoke call: stay on CPU (as the egypt fixtures)
+        if device_pref == "mps":
+            raise RuntimeError(f"--device mps is unsupported for {spec.scene}: first_frame sink mode has no MPS smoke "
+                               "call; use --device auto or cpu")
+    elif device_pref in ("auto", "mps") and torch.backends.mps.is_available():
         try:
             gen = gen.to("mps")
             t0 = time.perf_counter()
@@ -328,13 +339,13 @@ def load_stream(torch, spec: SceneSpec, device_pref: str, vae, prompt_np: np.nda
     return stream, "cpu"
 
 
-def run_chunks(torch, stream, pixels, noises, renoises, n_chunks, on_chunk):
+def run_chunks(torch, spec, stream, pixels, noises, renoises, n_chunks, on_chunk):
     recorder = GenRecorder(stream.gen)
     stream.gen = recorder
     for i, (a, b) in enumerate(chunk_slices(n_chunks)):
         t0 = time.perf_counter()
         recorder.preds.clear()
-        with injected_renoise(torch, [torch.from_numpy(renoises[i])]) as left:
+        with injected_renoise(torch, [torch.from_numpy(renoises[i])][:n_renoise(spec, i)]) as left:
             chunk = stream.push(torch.from_numpy(pixels[a:b]), frame_start=a,
                                 initial_noise=torch.from_numpy(noises[i]))
         if left:
@@ -406,13 +417,13 @@ class CallRecorder:
         return self.gen.parameters()
 
 
-def record_push(torch, stream, pixels, frame_start, noise, renoise):
+def record_push(torch, spec, stream, index, pixels, frame_start, noise, renoise):
     """One upstream push with every generator call recorded; returns (chunk, state before, control, calls)."""
     state = kv_state(stream.kv)
     real, recorder = stream.gen, CallRecorder(stream.gen, stream.kv)
     stream.gen = recorder
     try:
-        with injected_renoise(torch, [torch.from_numpy(renoise)]) as left:
+        with injected_renoise(torch, [torch.from_numpy(renoise)][:n_renoise(spec, index)]) as left:
             chunk = stream.push(torch.from_numpy(pixels), frame_start=frame_start, initial_noise=torch.from_numpy(noise))
     finally:
         stream.gen = real
@@ -489,7 +500,7 @@ def call_fixtures(out: Path) -> None:
     with cpu_bf16_emulation(torch):
         stream, _ = load_stream(torch, spec, meta["device_dit"], vae, inputs["prompt_embeds"], sink)
         for i, (a, b) in enumerate(chunk_slices(meta["chunks"])):
-            chunk, state, control, calls = record_push(torch, stream, inputs[f"pixels_{i}"], a,
+            chunk, state, control, calls = record_push(torch, spec, stream, i, inputs[f"pixels_{i}"], a,
                                                        inputs[f"initial_noise_{i}"], inputs[f"renoise_{i}"])
             if not np.array_equal(to_np(chunk.latent), np.load(out / f"chunk_{i}.npz")["pred"]):
                 raise RuntimeError(f"Recorded chunk {i} does not reproduce the fixture bitwise")
@@ -497,6 +508,7 @@ def call_fixtures(out: Path) -> None:
             names.append(f"calls_chunk{i}")
             log(f"per-call fixture chunk {i}: {len(calls)} calls")
         if (out / "long_inputs.npz").exists():
+            # For first_frame scenes chunk 0 is the clean pass on the stored sink pred at current_start=0.
             # The KV state at a chunk boundary only depends on the sink priming and each chunk's clean pass (the
             # denoising writes land in the slot that pass overwrites), so replaying the stored long preds through
             # the clean pass rebuilds it; the encoder cache advances on the same pixels.
@@ -511,7 +523,7 @@ def call_fixtures(out: Path) -> None:
                 stream.index, stream.frame = i + 1, b
             stream.decoder = types.SimpleNamespace(push=lambda z: torch.zeros(4, 3, 480, 864))   # not under test
             i = LONG_CALL_CHUNK
-            chunk, state, control, calls = record_push(torch, stream, long_inputs[f"pixels_{i}"], stream.frame,
+            chunk, state, control, calls = record_push(torch, spec, stream, i, long_inputs[f"pixels_{i}"], stream.frame,
                                                        long_inputs[f"initial_noise_{i}"], long_inputs[f"renoise_{i}"])
             if not np.array_equal(to_np(chunk.latent), np.load(out / f"long_chunk_{i}.npz")["pred"]):
                 raise RuntimeError(f"Rebuilt long state does not reproduce long chunk {i} bitwise")
@@ -595,12 +607,12 @@ def block_fixtures(out: Path) -> None:
     for i, blk in enumerate(blocks):
         x = torch.from_numpy(from_bits(acts[f"x{i}"])).to(torch.bfloat16)
         row = {}
-        for name in FLOOR_VARIANTS:
+        for variant in FLOOR_VARIANTS:
             kv, xc = load_kv_state(torch, gen, fixture)
-            with floor_variant(torch, name):
+            with floor_variant(torch, variant):
                 y = blk(x, **dict(kwargs[i], kv_cache=kv[i], crossattn_cache=xc[i]))
-            row[name] = rel_l2(y, from_bits(acts[f"x{i + 1}"]))
-        row["gate"] = 1.5 * max(row[name] for name in FLOOR_VARIANTS)
+            row[variant] = rel_l2(y, from_bits(acts[f"x{i + 1}"]))
+        row["gate"] = 1.5 * max(row[variant] for variant in FLOOR_VARIANTS)
         floors.append(row)
         log(f"block {i}: {row}")
     meta["block_floors"] = dict(
@@ -652,7 +664,7 @@ def _torch_run(args, spec, out, meta, prompt, pixels, noises, renoises):
         log(f"chunk {i}: {seconds:.1f}s")
 
     t0 = time.perf_counter()
-    meta["forward_seconds"] = run_chunks(torch, stream, pixels, noises, renoises, args.chunks, save_chunk)
+    meta["forward_seconds"] = run_chunks(torch, spec, stream, pixels, noises, renoises, args.chunks, save_chunk)
     meta["run_seconds"] = time.perf_counter() - t0
 
     if args.long:
@@ -672,7 +684,7 @@ def _torch_run(args, spec, out, meta, prompt, pixels, noises, renoises):
             log(f"long chunk {i}: {seconds:.1f}s")
 
         t0 = time.perf_counter()
-        run_chunks(torch, stream, long_pixels, long_noise[0::2], long_noise[1::2], n_long, save_long)
+        run_chunks(torch, spec, stream, long_pixels, long_noise[0::2], long_noise[1::2], n_long, save_long)
         meta["long_chunks"], meta["long_seconds"] = n_long, time.perf_counter() - t0
 
     return sink
@@ -711,7 +723,7 @@ def floor_reference(out: Path) -> None:
                                          torch.from_numpy(inputs["sink_latent"]))
         if device_dit != meta["device_dit"]:
             raise RuntimeError(f"Floor DiT device {device_dit} != fixture DiT device {meta['device_dit']}")
-        run_chunks(torch, stream, np.concatenate(pixels), [inputs[f"initial_noise_{i}"] for i in range(n_chunks)],
+        run_chunks(torch, spec, stream, np.concatenate(pixels), [inputs[f"initial_noise_{i}"] for i in range(n_chunks)],
                    [inputs[f"renoise_{i}"] for i in range(n_chunks)], n_chunks, save)
     del stream
     gc.collect()
