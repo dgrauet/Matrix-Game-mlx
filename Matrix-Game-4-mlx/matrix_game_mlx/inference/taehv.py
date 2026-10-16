@@ -241,6 +241,9 @@ class _TAEHVCore(nn.Module):
         super().__init__()
         # each architecture setting is guessed from the checkpoint name, unless it was passed explicitly
         self.arch_name = str(arch_name or checkpoint_path or "")
+        for marker in ("taehv1_5", "taeh3", "taeltx", "taecvx", "_super"):
+            if marker in self.arch_name:
+                raise NotImplementedError(f"only taew2_2 is ported, got {self.arch_name!r} ({marker})")
         if "taew2_2" in self.arch_name: patch_size, latent_channels = patch_size or 2, latent_channels or 48
         self.patch_size = patch_size or 1
         self.latent_channels = latent_channels or 16
@@ -465,11 +468,11 @@ class TAEHV(nn.Module):
     spatial_compression_ratio = 16
     temporal_compression_ratio = 4
 
-    def __init__(self, checkpoint_path=None, dtype=mx.bfloat16, *, arch_name=None, **kwargs):
+    def __init__(self, checkpoint_path=None, dtype=mx.bfloat16, *, arch_name=None, load=True, **kwargs):
         """Build the adapter; a ``.safetensors`` checkpoint is loaded as a pack (see ``from_pack``).
 
-        Any other checkpoint path (e.g. a torch ``.pth``) only selects the architecture by name; weights must
-        then be loaded into ``self.core`` by the caller.
+        Any other checkpoint path (e.g. a torch ``.pth``) raises ValueError unless ``load=False``, which only
+        selects the architecture by name; weights must then be loaded into ``self.core`` by the caller.
         """
         super().__init__()
         if checkpoint_path is None:
@@ -499,7 +502,12 @@ class TAEHV(nn.Module):
             latents_mean=[0.0] * self.latent_channels,
             latents_std=[1.0] * self.latent_channels,
         )
-        if str(checkpoint_path).endswith(".safetensors"):
+        if load:
+            if not str(checkpoint_path).endswith(".safetensors"):
+                raise ValueError(
+                    f"cannot load weights from {checkpoint_path!s} (expected a .safetensors pack); "
+                    "pass load=False to build the network without weights"
+                )
             weights = mx.load(str(checkpoint_path))
             self.core.load_weights([(k.removeprefix("taehv."), v) for k, v in weights.items()], strict=True)
         self.core.set_dtype(dtype)

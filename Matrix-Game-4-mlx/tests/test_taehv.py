@@ -153,7 +153,7 @@ def adapters(ref, tmp_path_factory):
     path = tmp_path_factory.mktemp("ckpt") / "taew2_2.pth"
     torch.save(ref.state_dict(), path)
     r = up.TAEHV(str(path)).eval()
-    m = mt.TAEHV(str(path), dtype=mx.float32)
+    m = mt.TAEHV(str(path), dtype=mx.float32, load=False)
     m.core.load_weights(list(_convert(ref.state_dict()).items()), strict=True)
     return r, m
 
@@ -165,6 +165,17 @@ def _nc(x):                                                    # torch NCTHW -> 
 def test_adapter_rejects_other_arch():
     with pytest.raises(ValueError):
         mt.TAEHV("taehv.pth")
+
+
+def test_adapter_requires_safetensors_unless_load_false(tmp_path):
+    with pytest.raises(ValueError, match="load=False"):
+        mt.TAEHV(str(tmp_path / "taew2_2.pth"))
+
+
+@pytest.mark.parametrize("name", ["taehv1_5", "taeh3", "taeltx", "taecvx", "taew2_2_super"])
+def test_core_rejects_dropped_archs(name):
+    with pytest.raises(NotImplementedError):
+        mt._TAEHVCore(checkpoint_path=None, arch_name=name)
 
 
 def test_adapter_streaming_matches_torch(adapters):
