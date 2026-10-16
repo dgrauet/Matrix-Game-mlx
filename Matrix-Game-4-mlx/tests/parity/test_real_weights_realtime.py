@@ -14,8 +14,10 @@ DiT is preset-independent and gated per block / per call by the quality suite (t
 - End to end: the realtime MLX stream fed torch's sink latent, prompt embeddings and initial noises. Only the first
   denoised chunk is gated with the spec thresholds (control / pred / layer 0 and 29 K cache rel L2 < 2e-2, decoded
   PSNR > 35 dB): chunk 0, plus chunk 1 for racing, whose chunk 0 is the sink latent itself (no denoising, pred bitwise
-  the sink) and whose chunk-1 pred gate is 1.5 x the torch floor of that chunk (floor_chunk_1.npz, the M2 rule). The
-  other chunks are reported (-s).
+  the sink). The pred gate is max(2e-2, 1.5 x the torch floor of that chunk) (floor_chunk_i.npz, the M2 rule): with a
+  single denoising step torch against its own SDPA variant already exceeds 2e-2 (egypt chunk 0: 2.3e-2), and the MLX
+  gap is the DiT's alone (2.80e-2 with torch's exact control injected vs 2.75e-2 with MLX's TAEHV control). The other
+  chunks are reported (-s).
 
 One scene's MLX DiT is held at a time (tests/conftest.py groups this module's items by scene); the quality module's
 DiT is freed by its own module-scoped fixture before this module loads.
@@ -188,9 +190,10 @@ def test_stream_end_to_end_realtime(scene, comps):
         print(f"{scene} realtime end-to-end chunk {i}{'' if i in gated else ' (info)'}: "
               + ", ".join(f"{k}={v:.4g}" for k, v in m.items()))
         if i in gated:
-            # Racing chunk 1 (first denoised chunk after the sink frame): pred gate 1.5 x the torch-vs-variant floor
-            # of that chunk, as the quality suite (M2 rule)
-            pred_tol = 2e-2 if i == 0 else 1.5 * rel_l2(np.load(d / f"floor_chunk_{i}.npz")["pred"], ref[f"pred_{i}"])
+            # Pred gate: the spec's 2e-2, or 1.5 x the torch-vs-variant floor of that chunk when torch itself exceeds
+            # it (M2 rule; one-step realtime chunks do, see the module docstring)
+            floor = rel_l2(np.load(d / f"floor_chunk_{i}.npz")["pred"], ref[f"pred_{i}"])
+            pred_tol = max(2e-2, 1.5 * floor)
             checks = dict(control=(m["control"], 2e-2), pred=(m["pred"], pred_tol),
                           kv_k_layer0=(m["kv_k_layer0"], 2e-2), kv_k_layer29=(m["kv_k_layer29"], 2e-2))
             failures += [(i, k, v, tol) for k, (v, tol) in checks.items() if not v < tol]
