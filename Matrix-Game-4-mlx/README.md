@@ -2,7 +2,8 @@
 
 MLX inference port of [Matrix-Game 4.0](https://github.com/SkyworkAI/Matrix-Game) for Apple Silicon.
 It targets offline rendering: a causal video-to-video renderer that turns a clip into a stylized one
-using the quality preset, for the ancient-egypt, castle and racing scenes.
+using the quality preset (Wan VAE) or the realtime preset (TAEHV codec, one denoising step), for the
+ancient-egypt, castle and racing scenes.
 
 ## Status
 
@@ -10,7 +11,7 @@ using the quality preset, for the ancient-egypt, castle and racing scenes.
 | --- | --- | --- |
 | M1 | ancient-egypt, quality preset (Wan VAE, steps `1000,500`), offline CLI, real-weight parity | Done: parity-validated; a 19 s recorded take (909 frames, 48 FPS) rendered in 1 h 52 min (29.4 s/chunk, peak 24.4 GB) |
 | M2 | castle and racing (first-frame sink, absolute RoPE, racing RNG role), fixtures for both | Done: parity-validated, same methodology as ancient-egypt (racing RNG role transcribed from upstream, not parity-validated: parity injects noise on both sides); acceptance renders: 97-frame pan renders of castle (37.7 s/chunk) and racing (27.3 s/chunk), peak 24.4 GB |
-| M3 | realtime preset: TAEHV encode/decode (`taehv.py`), one-step schedule | Next |
+| M3 | realtime preset: TAEHV encode/decode (`taehv.py`), one-step schedule, upstream `native` DiT runtime | Done: parity-validated on the three scenes (`<scene>_realtime` fixtures, torch bf16 CPU reference); acceptance renders: 97-frame pans of egypt (3.57 s/chunk), castle (3.58 s/chunk) and racing (3.51 s/chunk), peak 14.96 GB (~1.1 processed frames/s, M2 Pro 32 GB) |
 
 ## Quick start
 
@@ -31,7 +32,11 @@ python -m matrix_game_mlx.inference.offline --take /path/to/take-1 --output outp
 The output directory gets `rendered.mp4` (same frame count and FPS as the input; the last incomplete
 four-frame block is padded internally, then trimmed) and `render.json` (configuration, frames, seconds,
 `seconds_per_chunk`, `peak_memory_gb`). Other flags: `--seed` (default 0), `--sink-image` (overrides the
-scene's sink image), `--preset quality` (the only preset so far).
+scene's sink image), `--preset {quality,realtime}` (default `quality`, as upstream's offline.py). Realtime example:
+
+```bash
+python -m matrix_game_mlx.inference.offline --scene castle --preset realtime --input lowpoly.mp4 --output output/castle-realtime
+```
 
 ## Weights
 
@@ -45,7 +50,7 @@ matrix-game-4.0-mlx/
   config.json                    # DiT config, codecs, per-scene entries (component, inference, sink_image)
   split_model.json               # pinned shared files: repo, revision, sha256
   dit_ancient_egypt.safetensors  # also dit_castle, dit_racing
-  taehv.safetensors              # realtime codec (M3)
+  taehv.safetensors              # realtime codec (TAEHV)
   fps-egypt/                     # inference.json, sink.png (also fps-castle, driving_game)
   licenses/                      # third-party licenses (TAEHV)
 ```
@@ -91,6 +96,17 @@ GEMM or attention kernel remains. The float32 elementwise and reduce kernels are
 torch-opmath activations listed under Numerics. The float64 CPU-stream work costs about 0.54 s per DiT forward (RoPE ~0.49 s over 30 layers,
 timestep MLP ~0.05 s, flow-to-x0 negligible), so 1.1 to 1.6 s per chunk (3 to 5 % of the 33.2 s steady-state chunk).
 
+Realtime preset (97-frame pans, 24 fps, seed 0, same machine and MLX version, peak 14.96 GB), against the
+quality preset on the same inputs (castle 37.7 s/chunk, racing 27.3 s/chunk, peak 24.4 GB):
+
+| Scene | realtime s/chunk |
+| --- | --- |
+| ancient-egypt | 3.57 |
+| castle | 3.58 |
+| racing | 3.51 |
+
+That is about 1.1 processed frames per second. Outputs are in `output/{egypt,castle,racing}-pan-realtime/`.
+
 ## Numerics
 
 Upstream's float64 islands (RoPE complex product and tables, flow-to-x0, timestep sinusoid) run in float64,
@@ -101,6 +117,11 @@ timestep-MLP linears (one row per timestep entry, B x F) accumulate in float64, 
 outputs at any row count). The scheduler's sigma grid reproduces `torch.linspace` bitwise. The umT5 text
 encoder runs in bf16, as upstream's loader runs it (`WanTextEncoder(...).to(device, torch.bfloat16)`),
 attention bias included (`x.new_zeros`).
+
+TAEHV (realtime codec): MLX bf16 `conv2d` on Metal loses precision on some kernel paths (decoder.8, the
+256 to 128 3x3 conv: 3.06e-2 rel L2 vs fp64, where torch CPU bf16 gets 1.66e-3). All TAEHV convs therefore
+accumulate in float32 and round once to bf16 (torch semantics), which brings that conv to 1.3e-4 vs torch bf16.
+Parameters stay bf16.
 
 ## Scenes
 
@@ -119,6 +140,29 @@ torch kernel-variant floor, and a strict end-to-end check on chunk 0 (racing: ch
   because torch's own spread exceeds 2e-2 there. Chunk 2 (reported) is 4.5e-2, 39.6 dB. The `--long` chunk 22,
   past the 21-latent window (eviction with absolute RoPE), passes its per-call gates.
 
+### Realtime preset
+
+Gates use the `<scene>_realtime` fixtures (torch bf16 CPU reference, upstream native DiT runtime). TAEHV gates
+are MLX rel L2 vs torch, with tolerance ceil_1sig(1.5 x the max over the torch variants, fp32 CPU and bf16 MPS):
+
+| Scene | Sink | Control | Decoded | Decoded PSNR (torch variants) |
+| --- | --- | --- | --- | --- |
+| ancient-egypt | 8.3e-3 (tol 2e-2) | 7.5-8.3e-3 (tol 2e-2) | 4.1-5.3e-3 (tol 1e-2/2e-2) | 56.5-57.6 dB (53.5-54.5 dB) |
+| castle | 7.6e-3 | 6.9-7.5e-3 | 3.5-5.4e-3 | 55.1-56.9 dB (51.5-52.5 dB) |
+| racing | 8.0e-3 | 7.4-8.1e-3 | 3.4-5.0e-3 | 56.6-59.6 dB (53.7-56.2 dB) |
+
+End to end (gated chunk 0; racing chunks 0 and 1; pred gate = max(2e-2, 1.5 x the torch floor of the chunk)):
+
+| Scene | End-to-end result |
+| --- | --- |
+| ancient-egypt | chunk 0: control 8.3e-3, pred 2.75e-2 (gate 3.5e-2; torch floor 2.31e-2), KV < 6e-3, decoded 41.8 dB |
+| castle | chunk 0: control 7.5e-3, pred 2.03e-2 (gate 2.96e-2; torch floor 1.97e-2), decoded 42.7 dB |
+| racing | chunk 0: pred = sink bitwise, decoded 59.6 dB; chunk 1: pred 1.51e-2 (gate 2.9e-2), decoded 51.1 dB |
+
+The pred gate follows the torch floor because, with one denoising step, torch against its own SDPA variant
+already exceeds 2e-2 (egypt chunk 0: 2.31e-2). Injecting torch's exact control into the MLX stream gives 2.80e-2,
+so the gap is the DiT's alone, which is preset-independent and gated per call and per block by the quality fixtures.
+
 ## Known deviations from upstream
 
 - float64 runs on the MLX CPU stream (RoPE, flow-to-x0, timestep MLP accumulation) because MLX has no float64
@@ -126,6 +170,10 @@ torch kernel-variant floor, and a strict end-to-end check on chunk 0 (racing: ch
 - KV-cache end indices are Python ints instead of 1-element tensors.
 - `CastleStream.push` has a test-only `renoise` argument.
 - Only the inference path (`kv_cache is not None`) is ported; training branches raise `NotImplementedError`.
+- Realtime DiT runtime is upstream's `native`. Upstream's realtime default is the CUDA-only `ring-fused`, out of
+  scope (upstream logs that ring changes the reduction order and that native is the baseline).
+- No CUDA VAE graph (`vae_graph`): it only captures the same TAEHV ops.
+- TAEHV convs accumulate in float32 and round once to bf16 (see Numerics).
 
 ## Parity methodology
 
@@ -157,6 +205,7 @@ against upstream's bf16 umT5 (`tests/test_text_encoder.py`, gate 1.5x the torch-
 ```bash
 cd Matrix-Game-4-mlx
 MATRIX_GAME_4_MLX_WEIGHTS_DIR=... python -m tests.parity.gen_fixtures --scene castle --device auto [--long]
+MATRIX_GAME_4_MLX_WEIGHTS_DIR=... python -m tests.parity.gen_fixtures --scene castle --preset realtime
 ```
 
 | Flag | Effect |
@@ -168,9 +217,11 @@ MATRIX_GAME_4_MLX_WEIGHTS_DIR=... python -m tests.parity.gen_fixtures --scene ca
 | `--floor-only` | Regenerate only the torch floor chunks from the saved inputs |
 | `--calls-only` | Regenerate only the per-call fixtures |
 | `--call-floors-only` | Re-measure only the torch kernel-variant floors of the per-call fixtures |
+| `--preset {quality,realtime}` | Preset to generate (default quality); realtime writes `<scene>_realtime` |
+| `--taehv-only` | Realtime only: regenerate only the TAEHV fixtures (~20 s) |
 | `--blocks-only` | Regenerate only the per-block fixture (chunk 0 call 0; chunk 1 call 0 for racing) and its floors |
 
-They are written to `$MG4_FIXTURES_DIR/<scene>_quality/` (`egypt_quality`, `castle_quality`, `racing_quality`;
+They are written to `$MG4_FIXTURES_DIR/<scene>_quality/` or `<scene>_realtime/` (`egypt_quality`, `castle_quality`, `racing_quality`, `egypt_realtime`, `castle_realtime`, `racing_realtime`;
 default `~/.cache/matrix-game-4-mlx/fixtures`): about 1.5 GB per scene without `--long` (ancient-egypt 1.7 GB)
 and about 6 GB with `--long` (ancient-egypt 5.7 GiB, racing 5.2 GiB) (the chunk-22 per-call fixture alone is 3.8 GB). A full castle set takes about 1 h to
 generate, a racing set with `--long` about 1 h 15. For racing the torch DiT runs on the CPU (no sink-priming
@@ -182,6 +233,9 @@ about 1 GFLOPS on Apple Silicon (a 5B forward would take about an hour), so the 
 bf16 linear, conv and SDPA calls on the CPU compute in fp32 and round the output to bf16 (fp32-accumulate
 kernel semantics). Every other op, including the float64 islands, runs unchanged, and `meta.json` records the
 emulation and the device of each part.
+
+A realtime fixture set takes about 10 min per scene and is about 200 MB; `--taehv-only` (~20 s) and `--floor-only` are
+partial modes.
 
 ## Tests
 

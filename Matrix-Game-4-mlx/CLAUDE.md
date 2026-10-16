@@ -3,7 +3,8 @@
 ## Project Overview
 
 MLX inference port of Matrix-Game 4.0 (`../Matrix-Game-4/`, SkyworkAI/Matrix-Game). We port the
-causal video-to-video renderer for offline rendering on Apple Silicon. Model conversion is handled by
+causal video-to-video renderer for offline rendering on Apple Silicon, with a quality preset (Wan VAE) and a realtime
+preset (TAEHV codec, one denoising step). Model conversion is handled by
 [mlx-forge](https://github.com/dgrauet/mlx-forge); the converted pack is local for now
 (`MATRIX_GAME_4_MLX_WEIGHTS_DIR`), its Hub publication as `dgrauet/matrix-game-4.0-mlx` is planned. Inference only.
 
@@ -34,7 +35,8 @@ in the same test process (the tests import upstream as the oracle via `tests/con
 
 DiT and T5 run in bf16 end to end, with no fp32 residual stream (upstream casts the whole DiT to bf16
 without autocast, unlike MG3; upstream's loader also casts the T5 to bf16). The VAE is stored fp32 and cast to bf16
-at load. fp32 islands, as upstream: RMSNorm/LayerNorm statistics, scheduler `add_noise`, and torch's
+at load. TAEHV (realtime codec) keeps bf16 parameters, but its convs accumulate in float32 and round once to bf16
+(MLX's bf16 Metal conv2d loses precision on some kernel paths). fp32 islands, as upstream: RMSNorm/LayerNorm statistics, scheduler `add_noise`, and torch's
 opmath for SiLU / tanh-GELU / VAE `RMS_norm`. float64 islands, as upstream, on the MLX CPU stream (no
 float64 on the GPU): RoPE tables and complex product, timestep sinusoid and timestep-MLP accumulation,
 flow-to-x0. A float32 GEMM or attention kernel in a smeltr op summary is a leak; the CPU-stream float64
@@ -50,6 +52,8 @@ wrapper-level APIs keep upstream shapes `[B, F, C, h, w]`.
 - float64 islands run on the MLX CPU stream instead of the GPU
 - KV-cache end indices are Python ints instead of 1-element tensors
 - Test-only `renoise` argument on `CastleStream.push`
+- Realtime DiT runs upstream's `native` runtime (not the CUDA-only `ring-fused`), no CUDA VAE graph (`vae_graph`)
+- TAEHV convs accumulate in float32 and round once to bf16 (torch semantics)
 
 ## Validation Status
 
@@ -58,6 +62,13 @@ per-call teacher-forced gates at 1.5x the torch kernel-variant floor, strict end
 0 and 1, since its first_frame sink makes chunk 0 the sink latent; chunk 1 pred gated at 1.5x the torch floor). Fixtures: `python -m tests.parity.gen_fixtures
 --scene {ancient-egypt,castle,racing}` into `$MG4_FIXTURES_DIR/{egypt,castle,racing}_quality`; the real-weight
 suite runs per scene whose fixtures exist, one DiT loaded at a time. Racing's torch DiT runs on the CPU.
+
+The realtime preset (M3) is parity-validated on the three scenes against fixtures `$MG4_FIXTURES_DIR/{egypt,castle,racing}_realtime`
+(`python -m tests.parity.gen_fixtures --scene {ancient-egypt,castle,racing} --preset realtime`, ~10 min and ~200 MB per
+scene; `--taehv-only` ~20 s and `--floor-only` partial modes). TAEHV gates are MLX rel L2 vs torch at
+ceil_1sig(1.5 x max torch variant); end to end, chunk 0 is gated (racing chunks 0 and 1) and the pred gate is
+max(2e-2, 1.5 x the torch floor of the chunk), since with one step torch against itself already exceeds 2e-2. Renders
+(97-frame pans, M2 Pro 32 GB): about 3.5 s/chunk on all three scenes, peak 14.96 GB. Default preset stays `quality`.
 
 ## File Map
 
@@ -72,6 +83,7 @@ matrix_game_mlx/
     stream.py                    # CastleStream: sink priming, chunk push (2 denoising calls + cache update)
     wrappers.py                  # WanDiffusionWrapper (flow -> x0 in float64), WanTextEncoder, WanVAE22Wrapper, KV caches
     decoder.py                   # incremental Wan VAE decoding with persistent causal features
+    taehv.py                     # TAEHV encode/decode (realtime codec), float32-accumulating convs
     scheduler.py                 # flow-matching scheduler, bitwise torch.linspace sigma grid
     rollout.py                   # warp_steps, set_attention_window
     preprocessing.py             # RGB crop/resize and tensor <-> uint8
@@ -108,7 +120,7 @@ installed for Homebrew Python 3.14)
 
 - The server and the game/interactive layers
 - `rtx5090*` files
-- Ring / fused / cudagraph runtimes
+- Ring / fused / cudagraph runtimes (realtime uses the `native` DiT runtime) and the CUDA VAE graph
 - Training branches (teacher forcing, ctx slots, kv_mem, kv_capture, flex_attention masks,
   sequence parallel)
 
