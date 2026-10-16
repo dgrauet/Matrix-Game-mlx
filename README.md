@@ -1,23 +1,58 @@
-<p align="center">
-<h1 align="center">Matrix-Game</h1>
+<h1 align="center">Matrix-Game 4.0</h1>
 <h3 align="center">Skywork AI</h3>
+<p align="center">Streaming Neural Rendering for Playable Games</p>
+
+<p align="center">
+  <a href="https://matrix-game-v4-0.github.io/page/">Project Website</a> |
+  <a href="https://huggingface.co/Skywork/Matrix-Game-4.0">Models &amp; Game Assets</a> |
+  <a href="Matrix-Game-4">Code &amp; Quick Start</a> |
+  <a href="#previous-versions">Previous Versions</a>
 </p>
 
-## 🔥🔥🔥 News!!
-* March 27, 2026: 🔥 We released [Matrix-Game-3.0](https://github.com/SkyworkAI/Matrix-Game/tree/main/Matrix-Game-3). This  is a real-time and streaming interactive world model with long-horizon Memory.
-* Aug 12, 2025: 🔥 We released [Matrix-Game-2.0](https://github.com/SkyworkAI/Matrix-Game/tree/main/Matrix-Game-2). This is an interactive world foundation model for real-time long video generation.
-* May 12, 2025: 🔥 We released [Matrix-Game-1.0](https://github.com/SkyworkAI/Matrix-Game/tree/main/Matrix-Game-1). The first open-source release of Skywork AI's Matrix-Game series world models.
+**Matrix-Game** is Skywork AI's series of open-source interactive world models.
+**Matrix-Game 4.0** combines executable game engines with a causal video model:
+the engine handles gameplay, physics and player input, while the model transforms
+low-poly RGB frames into detailed visuals through streaming neural rendering.
 
+https://github.com/user-attachments/assets/53a0cfb7-4193-42c8-9819-7c023389a3d7
 
-## 📝 Overview
+## News
 
-**Matrix-Game** is a series of open-source world models launched by Skywork AI.
+- **October 15, 2026:** Released **Matrix-Game 4.0**. [Inference, browser demo and game source code](Matrix-Game-4) are now available, with model weights and game assets for Medieval Castle, Ancient Egypt and City Racing on [Hugging Face](https://huggingface.co/Skywork/Matrix-Game-4.0).
+- **March 27, 2026:** Released [Matrix-Game 3.0](Matrix-Game-3), a real-time streaming interactive world model with long-horizon memory.
+- **August 12, 2025:** Released [Matrix-Game 2.0](Matrix-Game-2), an interactive world foundation model for real-time long video generation.
+- **May 12, 2025:** Released [Matrix-Game 1.0](Matrix-Game-1), the first open-source release of the Matrix-Game series.
+
+## Matrix-Game 4.0
+
+- **Engine-grounded gameplay:** game logic and physical state remain in an executable engine, separate from neural rendering.
+- **Streaming generation:** a causal, few-step video model renders successive chunks conditioned on low-poly RGB and text prompts.
+- **Three scene models:** Medieval Castle and Ancient Egypt for third-person shooting, and City Racing for driving.
+
+Start with the [v4 README](Matrix-Game-4/README.md) for installation, resource
+downloads, offline rendering and the online browser demo. The release includes
+the three native games and shared single-GPU inference code.
+
+| Scene | Model Weights |
+| --- | --- |
+| Medieval Castle | [fps-castle](https://huggingface.co/Skywork/Matrix-Game-4.0/tree/main/fps-castle) |
+| Ancient Egypt | [fps-egypt](https://huggingface.co/Skywork/Matrix-Game-4.0/tree/main/fps-egypt) |
+| City Racing | [driving_game](https://huggingface.co/Skywork/Matrix-Game-4.0/tree/main/driving_game) |
+
+Game assets, sink images and inference configuration files are included in the
+[Hugging Face repository](https://huggingface.co/Skywork/Matrix-Game-4.0).
+See the [project website](https://matrix-game-v4-0.github.io/page/) for demos and
+the broader project overview.
+
+## Matrix-Game 4.0 MLX Port (Apple Silicon)
+
+[Matrix-Game-4-mlx](Matrix-Game-4-mlx): offline rendering of Matrix-Game 4.0 with MLX (ancient-egypt, castle and racing, quality preset, per four-frame chunk in steady state on an M2 Pro 32 GB: ~33 s ancient-egypt, 37.7 s castle, 27.3 s racing; about 67 min for a 10 s game take recorded at 48 FPS), validated scene by scene against the upstream PyTorch code with real weights. The realtime preset (TAEHV codec, one denoising step) runs at ~3.6 s per chunk (97-frame pans: egypt 3.57 s, castle 3.58 s, racing 3.51 s; peak 14.96 GB), parity-validated against the upstream PyTorch realtime path. Weights: [dgrauet/matrix-game-4.0-mlx](https://huggingface.co/dgrauet/matrix-game-4.0-mlx) (downloaded automatically).
+
+## Matrix-Game 3.0 MLX Port (Apple Silicon)
 
 This repository provides an implementation of Matrix-Game-3.0 for Apple Silicon using [MLX](https://ml-explore.github.io/mlx/).
 
 Models are converted with [mlx-forge](https://github.com/dgrauet/mlx-forge) and hosted on [HuggingFace](https://huggingface.co/dgrauet/matrix-game-3.0-mlx).
-
-https://github.com/user-attachments/assets/f5387c64-1d18-414a-935f-00a1f6eec8de
 
 ## 🚀 Usage
 
@@ -144,6 +179,18 @@ model, default `mg_lightvae_v2` VAE):
 - **Reference implementation** for porting video diffusion models to MLX
 - **Interactive exploration** (choose actions between clips, ~5 min wait per clip)
 
-## 📄 License
+## Previous Versions
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+Earlier implementations remain available in their original directories:
+
+- [Matrix-Game 3.0](Matrix-Game-3): streaming interaction with long-horizon memory.
+- [Matrix-Game 2.0](Matrix-Game-2): real-time interactive long video generation.
+- [Matrix-Game 1.0](Matrix-Game-1): the first Matrix-Game world model.
+
+## License
+
+Matrix-Game 4.0 is released under **Apache-2.0**; see the
+[v4 license](Matrix-Game-4/LICENSE).
+Third-party components and assets retain their respective licenses.
+Earlier versions retain their existing license terms; see the repository's
+[MIT license](LICENSE) and the notices within each version directory.

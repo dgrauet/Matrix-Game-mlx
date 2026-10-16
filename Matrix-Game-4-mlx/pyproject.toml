@@ -1,0 +1,16 @@
+[project]
+name = "matrix-game-4-mlx"
+version = "0.1.0"
+description = "MLX inference port of Matrix-Game 4.0 (offline rendering)"
+requires-python = ">=3.11"
+dependencies = ["mlx>=0.31.0", "numpy", "Pillow", "imageio-ffmpeg", "huggingface_hub",
+                "safetensors", "tokenizers", "transformers", "ftfy", "regex"]
+
+[project.optional-dependencies]
+parity = ["torch", "diffusers", "einops"]
+
+[tool.setuptools.package-data]
+matrix_game_mlx = ["configs/*.json"]
+
+[tool.pytest.ini_options]
+markers = ["needs_weights: requires the converted MLX pack", "needs_fixtures: requires torch reference fixtures"]
