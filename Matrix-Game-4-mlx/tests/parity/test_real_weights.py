@@ -22,7 +22,8 @@ Three levels:
 - End to end: the full MLX stream from the same inputs. The autoregressive stream amplifies bf16 rounding chunk
   over chunk (torch against itself reaches ~0.3 rel L2 by chunk 2), so only the first denoised chunk is gated, with
   the spec thresholds: chunk 0, plus chunk 1 for racing, whose chunk 0 is the sink latent itself (no denoising,
-  pred bitwise equal to the sink). The other chunks are reported.
+  pred bitwise equal to the sink). Racing chunk 1's pred gate is 1.5 x the torch-vs-variant floor of that chunk
+  (floor_chunk_1.npz), which already exceeds 2e-2. The other chunks are reported.
 """
 import gc
 import json
@@ -331,7 +332,10 @@ def test_stream_end_to_end(scene, comps):
         print(f"{scene} end-to-end chunk {i}{'' if i in gated else ' (info)'}: "
               + ", ".join(f"{k}={v:.4g}" for k, v in m.items()))
         if i in gated:
+            # Racing chunk 1 sits on top of a full chunk-0 clean pass, so torch against its own kernel variant already
+            # exceeds the spec's 2e-2 there (floor_chunk_1: ~3.1e-2); its pred gate is 1.5 x that torch floor instead.
+            pred_tol = 2e-2 if i == 0 else 1.5 * rel_l2(np.load(d / f"floor_chunk_{i}.npz")["pred"], ref["pred"])
             assert m["control"] < 2e-2, m
-            assert m["pred"] < 2e-2, m
+            assert m["pred"] < pred_tol, (m, pred_tol)
             assert m["kv_k_layer0"] < 2e-2 and m["kv_k_layer29"] < 2e-2, m
             assert m["decoded_psnr"] > 35.0, m
