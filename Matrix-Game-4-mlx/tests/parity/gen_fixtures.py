@@ -1,10 +1,11 @@
-"""Generate PyTorch reference fixtures with the real upstream model (ancient-egypt, quality preset).
+"""Generate PyTorch reference fixtures with the real upstream model (quality preset; ancient-egypt, castle, racing).
 
 Run manually from Matrix-Game-4-mlx/ (not collected by pytest):
-    MATRIX_GAME_4_MLX_WEIGHTS_DIR=... python -m tests.parity.gen_fixtures --device auto [--long]
+    MATRIX_GAME_4_MLX_WEIGHTS_DIR=... python -m tests.parity.gen_fixtures --device auto [--scene castle] [--long]
 
-Writes `$MG4_FIXTURES_DIR/egypt_quality/`: inputs.npz, chunk_{i}.npz, floor_chunk_{i}.npz, calls_chunk{i}.npz,
-blocks_chunk0_call0.npz, meta.json (and long_*.npz plus calls_long22.npz with --long). `--floor-only`,
+Writes `$MG4_FIXTURES_DIR/<scene>_quality/` (egypt_quality, castle_quality, racing_quality): inputs.npz,
+chunk_{i}.npz, floor_chunk_{i}.npz, calls_chunk{i}.npz, blocks_<call>.npz (blocks_chunk0_call0.npz unless chunk 0
+has no denoising call), meta.json (and long_*.npz plus calls_long22.npz with --long). `--floor-only`,
 `--calls-only`, `--call-floors-only` and `--blocks-only` regenerate only those parts from the saved fixtures.
 """
 import argparse
@@ -13,17 +14,16 @@ import gc
 import json
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
+from matrix_game_mlx.scenes import scene_sink_policy
 from tests.conftest import UPSTREAM_ROOT, fixtures_dir, psnr, rel_l2, to_np
 
-SCENE = "ancient-egypt"
 SRC = Path("/Users/dgrauet/Work/mlx/tools/mlx-forge/models/matrix-game-4.0-mlx-src")
 CONFIG_DIR = SRC / "wan2.2-fun-5b-control"
-CHECKPOINT = SRC / "fps-egypt" / "model.safetensors"
-SINK_IMAGE = SRC / "fps-egypt" / "sink.png"
 VAE_REPO, VAE_FILE, VAE_REVISION = "alibaba-pai/Wan2.2-Fun-5B-Control", "Wan2.2_VAE.pth", \
     "b8bc1a65ab71d054ba4636dc0dac104aa4df2686"
 UPSTREAM_COMMIT = "5446525"
@@ -34,15 +34,64 @@ LONG_CALL_CHUNK = 22    # position 23 > 21-frame window: rolling eviction and fi
 KV_LAYERS = (0, 29)
 
 
+@dataclass(frozen=True)
+class SceneSpec:
+    """One scene's fixture set: scene name, output dir, torch checkpoint dir, and the upstream sink policy."""
+    scene: str
+    fixture_dir: str
+    src_dir: str
+
+    @property
+    def sink_mode(self) -> str:
+        return scene_sink_policy(self.scene)[0]
+
+    @property
+    def sink_rope_mode(self) -> str:
+        return scene_sink_policy(self.scene)[1]
+
+    @property
+    def checkpoint(self) -> Path:
+        return SRC / self.src_dir / "model.safetensors"
+
+    @property
+    def sink_image(self) -> Path:
+        return SRC / self.src_dir / "sink.png"
+
+
+SCENE_SPECS = {s.scene: s for s in (SceneSpec("ancient-egypt", "egypt_quality", "fps-egypt"),
+                                    SceneSpec("castle", "castle_quality", "fps-castle"),
+                                    SceneSpec("racing", "racing_quality", "driving_game"))}
+DEFAULT_SCENE = "ancient-egypt"
+
+
+def n_denoising_calls(spec: SceneSpec, chunk: int) -> int:
+    """Control-conditioned calls of a chunk: first_frame chunk 0 reuses the sink latent as pred (no denoising)."""
+    return 0 if spec.sink_mode == "first_frame" and chunk == 0 else len(STEPS)
+
+
+def first_denoising_call(n_calls: list, drops: dict) -> tuple:
+    """(fixture name, call index) of the first control-conditioned call; n_calls: [(name, call count)] in chunk
+    order, drops: name -> per-call drop_control flags."""
+    for name, count in n_calls:
+        for j in range(count):
+            if not drops[name][j]:
+                return name, j
+    raise RuntimeError("No control-conditioned call recorded")
+
+
+def spec_of(meta: dict) -> SceneSpec:
+    return SCENE_SPECS[meta["scene"]]
+
+
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def pan_frames(n: int) -> np.ndarray:
+def pan_frames(spec: SceneSpec, n: int) -> np.ndarray:
     """Deterministic pan over the sink image: 480x864 crops of the native frame, shifted 8 px per frame
     (ping-pong when the window reaches the image edge). Returns float32 [n, 3, 480, 864] in [-1, 1]."""
     from PIL import Image
-    with Image.open(SINK_IMAGE) as image:
+    with Image.open(spec.sink_image) as image:
         arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
     h, w = arr.shape[:2]
     top, span = (h - 480) // 2, w - 864
@@ -62,7 +111,7 @@ def chunk_slices(n_chunks: int):
         start += count
 
 
-def mlx_prompt_embeds() -> np.ndarray:
+def mlx_prompt_embeds(spec: SceneSpec) -> np.ndarray:
     """Scene prompt through the MLX WanTextEncoder (bf16), returned as float32 [1, 512, 4096]."""
     import mlx.core as mx
     from matrix_game_mlx.inference.loader import pack_dir, resolve_shared_files
@@ -70,7 +119,7 @@ def mlx_prompt_embeds() -> np.ndarray:
     from matrix_game_mlx.scenes import SCENES
     shared = resolve_shared_files(pack_dir())
     text = WanTextEncoder(str(shared["t5_encoder.safetensors"]), str(shared["google/umt5-xxl"]))
-    embeds = text([SCENES[SCENE]["prompt"]])["prompt_embeds"].astype(mx.bfloat16)
+    embeds = text([SCENES[spec.scene]["prompt"]])["prompt_embeds"].astype(mx.bfloat16)
     out = to_np(embeds)
     del text, embeds
     gc.collect()
@@ -78,7 +127,7 @@ def mlx_prompt_embeds() -> np.ndarray:
     return out
 
 
-def mlx_sink_latent() -> np.ndarray:
+def mlx_sink_latent(spec: SceneSpec) -> np.ndarray:
     """MLX's own sink encoding (VAE evidence only; the stream parity feeds the torch sink to both sides)."""
     import mlx.core as mx
     from matrix_game_mlx.inference.loader import pack_dir, resolve_shared_files
@@ -86,7 +135,7 @@ def mlx_sink_latent() -> np.ndarray:
     from matrix_game_mlx.inference.wrappers import WanVAE22Wrapper
     shared = resolve_shared_files(pack_dir())
     vae = WanVAE22Wrapper(str(shared["vae.safetensors"]), dtype=mx.bfloat16)
-    out = to_np(encode_sink_image(vae, SINK_IMAGE, "wan"))
+    out = to_np(encode_sink_image(vae, spec.sink_image, "wan", first_frame=spec.sink_mode == "first_frame"))
     del vae
     gc.collect()
     mx.clear_cache()
@@ -181,24 +230,25 @@ def vae_roundtrip(torch, vae, pixels: np.ndarray) -> np.ndarray:
     return IncrementalDecoder(vae).push(latent).float().cpu().numpy()
 
 
-def load_vae(torch, device_pref: str, pixels_0: np.ndarray, meta: dict):
+def load_vae(torch, spec: SceneSpec, device_pref: str, pixels_0: np.ndarray, meta: dict):
     """Pick the VAE device: MPS smoke call + CPU cross-check (PSNR > 50 dB), else CPU."""
     from huggingface_hub import hf_hub_download
     from matrix_game.inference.stream import encode_sink_image
     from matrix_game.inference.wrappers import WanVAE22Wrapper
+    first_frame = spec.sink_mode == "first_frame"
     vae = WanVAE22Wrapper(vae_path=hf_hub_download(VAE_REPO, VAE_FILE, revision=VAE_REVISION)).eval()
     vae = vae.requires_grad_(False)
     if device_pref in ("auto", "mps") and torch.backends.mps.is_available():
         try:
             vae = vae.to("mps", torch.bfloat16)
             t0 = time.perf_counter()
-            sink = encode_sink_image(vae, SINK_IMAGE, "wan")
+            sink = encode_sink_image(vae, spec.sink_image, "wan", first_frame=first_frame)
             mps_dec = vae_roundtrip(torch, vae, pixels_0)
             log(f"VAE MPS smoke ok ({time.perf_counter() - t0:.1f}s); cross-checking first chunk on CPU")
             vae = vae.to("cpu")
             t0 = time.perf_counter()
             cpu_dec = vae_roundtrip(torch, vae, pixels_0)
-            cpu_sink = encode_sink_image(vae, SINK_IMAGE, "wan")
+            cpu_sink = encode_sink_image(vae, spec.sink_image, "wan", first_frame=first_frame)
             meta["vae_mps_vs_cpu"] = dict(decoded_psnr=psnr(mps_dec, cpu_dec), sink_rel_l2=rel_l2(sink, cpu_sink),
                                           cpu_seconds=time.perf_counter() - t0)
             log(f"VAE MPS vs CPU: {meta['vae_mps_vs_cpu']}")
@@ -246,23 +296,23 @@ def ensure_accelerate(torch) -> None:
     sys.modules["accelerate"] = types.SimpleNamespace(init_empty_weights=init_empty_weights)
 
 
-def make_stream(gen, vae, prompt, sink):
+def make_stream(spec: SceneSpec, gen, vae, prompt, sink):
     from matrix_game.inference.stream import CastleStream
     return CastleStream(gen, vae, prompt, seed=0, vae_backend="wan", steps=STEPS, first_steps=STEPS,
-                        sink_latent=sink, sink_mode="kv_only", sink_rope_mode="fixed")
+                        sink_latent=sink, sink_mode=spec.sink_mode, sink_rope_mode=spec.sink_rope_mode)
 
 
-def load_stream(torch, device_pref: str, vae, prompt_np: np.ndarray, sink):
+def load_stream(torch, spec: SceneSpec, device_pref: str, vae, prompt_np: np.ndarray, sink):
     """Build the DiT, try MPS with the sink-priming forward as smoke call, else CPU."""
     from matrix_game.inference.loading import build_dit
     ensure_accelerate(torch)
-    gen = build_dit(str(CONFIG_DIR), str(CHECKPOINT), is_causal=True, dtype="bfloat16", timestep_shift=5)
+    gen = build_dit(str(CONFIG_DIR), str(spec.checkpoint), is_causal=True, dtype="bfloat16", timestep_shift=5)
     gen = gen.eval().requires_grad_(False)
     if device_pref in ("auto", "mps") and torch.backends.mps.is_available():
         try:
             gen = gen.to("mps")
             t0 = time.perf_counter()
-            stream = make_stream(gen, vae, torch.from_numpy(prompt_np).to("mps", torch.bfloat16), sink)
+            stream = make_stream(spec, gen, vae, torch.from_numpy(prompt_np).to("mps", torch.bfloat16), sink)
             log(f"DiT MPS smoke (sink priming) ok ({time.perf_counter() - t0:.1f}s)")
             return stream, "mps"
         except Exception as exc:  # noqa: BLE001 - any MPS failure means CPU fallback
@@ -273,7 +323,7 @@ def load_stream(torch, device_pref: str, vae, prompt_np: np.ndarray, sink):
             gc.collect()
             torch.mps.empty_cache()
     t0 = time.perf_counter()
-    stream = make_stream(gen, vae, torch.from_numpy(prompt_np).to(torch.bfloat16), sink)
+    stream = make_stream(spec, gen, vae, torch.from_numpy(prompt_np).to(torch.bfloat16), sink)
     log(f"DiT CPU sink priming {time.perf_counter() - t0:.1f}s")
     return stream, "cpu"
 
@@ -385,19 +435,19 @@ def floor_variant(torch, name: str):
             "fp64_acc": lambda: cpu_bf16_emulation(torch, acc=torch.float64)}[name]()
 
 
-def build_torch_dit(torch):
+def build_torch_dit(torch, spec: SceneSpec):
     """Upstream causal DiT on CPU, configured as CastleStream does (21-latent window, 1 sink, 8192 RoPE rows)."""
     from matrix_game.inference.loading import build_dit
     from matrix_game.inference.rollout import set_attention_window
     ensure_accelerate(torch)                     # after upstream imports (transformers probes accelerate)
-    gen = build_dit(str(CONFIG_DIR), str(CHECKPOINT), is_causal=True, dtype="bfloat16", timestep_shift=5)
+    gen = build_dit(str(CONFIG_DIR), str(spec.checkpoint), is_causal=True, dtype="bfloat16", timestep_shift=5)
     gen = gen.eval().requires_grad_(False)
     set_attention_window(gen, 21, 1)
     gen.model.set_rope_max_len(8192)
     return gen
 
 
-def call_floor(torch, gen, prompt, fixture) -> list:
+def call_floor(torch, spec: SceneSpec, gen, prompt, fixture) -> list:
     """Torch-vs-torch floor per call: rel L2 of pred and of the layer 0/29 KV slot it writes, for two other kernels."""
     out = []
     for j in range(int(fixture["n_calls"])):
@@ -410,7 +460,7 @@ def call_floor(torch, gen, prompt, fixture) -> list:
                                                 "control_latent": torch.from_numpy(from_bits(fixture["control"])).to(torch.bfloat16)},
                               timestep=torch.from_numpy(fixture[f"c{j}_t"]), kv_cache=kv, crossattn_cache=xc,
                               current_start=int(fixture[f"c{j}_start"]), drop_control=bool(fixture[f"c{j}_drop"]),
-                              sink_rope_mode="fixed")
+                              sink_rope_mode=spec.sink_rope_mode)
             row[f"{name}_pred"] = rel_l2(pred, from_bits(fixture[f"c{j}_pred"]))
             for layer in KV_LAYERS:
                 for kind in ("k", "v"):
@@ -429,6 +479,7 @@ def call_fixtures(out: Path) -> None:
     from matrix_game.inference.wrappers import WanVAE22Wrapper
     torch.set_grad_enabled(False)
     meta = json.loads((out / "meta.json").read_text())
+    spec = spec_of(meta)
     inputs = np.load(out / "inputs.npz")
     t0 = time.perf_counter()
     vae = WanVAE22Wrapper(vae_path=hf_hub_download(VAE_REPO, VAE_FILE, revision=VAE_REVISION)).eval()
@@ -436,7 +487,7 @@ def call_fixtures(out: Path) -> None:
     sink = torch.from_numpy(inputs["sink_latent"])
     names = []
     with cpu_bf16_emulation(torch):
-        stream, _ = load_stream(torch, meta["device_dit"], vae, inputs["prompt_embeds"], sink)
+        stream, _ = load_stream(torch, spec, meta["device_dit"], vae, inputs["prompt_embeds"], sink)
         for i, (a, b) in enumerate(chunk_slices(meta["chunks"])):
             chunk, state, control, calls = record_push(torch, stream, inputs[f"pixels_{i}"], a,
                                                        inputs[f"initial_noise_{i}"], inputs[f"renoise_{i}"])
@@ -450,7 +501,7 @@ def call_fixtures(out: Path) -> None:
             # denoising writes land in the slot that pass overwrites), so replaying the stored long preds through
             # the clean pass rebuilds it; the encoder cache advances on the same pixels.
             long_inputs = np.load(out / "long_inputs.npz")
-            stream = make_stream(stream.gen, vae, stream.prompt, sink)
+            stream = make_stream(spec, stream.gen, vae, stream.prompt, sink)
             for i, (a, b) in enumerate(chunk_slices(LONG_CALL_CHUNK)):
                 stream_encode(torch, vae, long_inputs[f"pixels_{i}"], stream.encoder_features)
                 pred = torch.from_numpy(np.load(out / f"long_chunk_{i}.npz")["pred"]).to(stream.dtype)
@@ -476,14 +527,15 @@ def call_floors(out: Path, gen=None, prompt=None, names=None) -> None:
     import torch
     torch.set_grad_enabled(False)
     meta = json.loads((out / "meta.json").read_text())
+    spec = spec_of(meta)
     if gen is None:
-        gen = build_torch_dit(torch)
+        gen = build_torch_dit(torch, spec)
         prompt = torch.from_numpy(np.load(out / "inputs.npz")["prompt_embeds"]).to(torch.bfloat16)
         names = sorted(p.stem for p in out.glob("calls_*.npz"))
     t0 = time.perf_counter()
     floors = {}
     for name in names:
-        floors[name] = call_floor(torch, gen, prompt, np.load(out / f"{name}.npz"))
+        floors[name] = call_floor(torch, spec, gen, prompt, np.load(out / f"{name}.npz"))
         log(f"floor {name}: {floors[name]}")
     meta["call_floors"] = dict(
         variants="native_sdpa: cpu_bf16_emulation(sdpa=False); native_cpu_bf16: no emulation; "
@@ -495,16 +547,23 @@ def call_floors(out: Path, gen=None, prompt=None, names=None) -> None:
 
 
 def block_fixtures(out: Path) -> None:
-    """Per-block isolated fixture for chunk 0's first denoising call (calls_chunk0.npz, call 0): every block's torch
-    input/output and the shared e0 / context (blocks_chunk0_call0.npz), and each block's torch kernel-variant
-    floor with the derived gate 1.5 x max variant (meta.json "block_floors")."""
+    """Per-block isolated fixture for the first control-conditioned call (chunk 0 call 0, or chunk 1 call 0 when chunk
+    0 only has the clean pass; meta.json "block_call"): every block's torch input/output and the shared e0 / context
+    (blocks_<call>.npz), and each block's torch kernel-variant floor with the derived gate 1.5 x max variant
+    (meta.json "block_floors")."""
     import torch
     torch.set_grad_enabled(False)
     meta = json.loads((out / "meta.json").read_text())
-    fixture = np.load(out / "calls_chunk0.npz")
+    spec = spec_of(meta)
+    fixtures = {f"calls_chunk{i}": np.load(out / f"calls_chunk{i}.npz") for i in range(meta["chunks"])}
+    name, j = first_denoising_call(
+        [(n, int(f["n_calls"])) for n, f in fixtures.items()],
+        {n: [bool(f[f"c{k}_drop"]) for k in range(int(f["n_calls"]))] for n, f in fixtures.items()})
+    fixture = fixtures[name]
+    meta["block_call"] = [name, j]
     prompt = torch.from_numpy(np.load(out / "inputs.npz")["prompt_embeds"]).to(torch.bfloat16)
     t0 = time.perf_counter()
-    gen = build_torch_dit(torch)
+    gen = build_torch_dit(torch, spec)
     blocks = gen.model.blocks
     acts, kwargs = {}, {}
 
@@ -517,20 +576,21 @@ def block_fixtures(out: Path) -> None:
     hooks = [blk.register_forward_pre_hook(capture(i), with_kwargs=True) for i, blk in enumerate(blocks)]
     hooks.append(blocks[-1].register_forward_hook(lambda module, args, y: acts.__setitem__(f"x{len(blocks)}", bf16_bits(y))))
     kv, xc = load_kv_state(torch, gen, fixture)
-    call = dict(noisy_image_or_video=torch.from_numpy(from_bits(fixture["c0_x"])).to(torch.bfloat16),
+    call = dict(noisy_image_or_video=torch.from_numpy(from_bits(fixture[f"c{j}_x"])).to(torch.bfloat16),
                 conditional_dict={"prompt_embeds": prompt,
                                   "control_latent": torch.from_numpy(from_bits(fixture["control"])).to(torch.bfloat16)},
-                timestep=torch.from_numpy(fixture["c0_t"]), current_start=int(fixture["c0_start"]), sink_rope_mode="fixed")
+                timestep=torch.from_numpy(fixture[f"c{j}_t"]), current_start=int(fixture[f"c{j}_start"]),
+                sink_rope_mode=spec.sink_rope_mode)
     try:
         with cpu_bf16_emulation(torch):
             _, pred = gen(kv_cache=kv, crossattn_cache=xc, **call)
     finally:
         for h in hooks:
             h.remove()
-    if not np.array_equal(bf16_bits(pred), fixture["c0_pred"]):
-        raise RuntimeError("Hooked call does not reproduce calls_chunk0 call 0 bitwise")
+    if not np.array_equal(bf16_bits(pred), fixture[f"c{j}_pred"]):
+        raise RuntimeError(f"Hooked call does not reproduce {name} call {j} bitwise")
     acts["e0"], acts["context"] = bf16_bits(kwargs[0]["e"]), bf16_bits(kwargs[0]["context"])
-    np.savez(out / "blocks_chunk0_call0.npz", **acts)
+    np.savez(out / f"blocks_{name.removeprefix('calls_')}_call{j}.npz", **acts)
     floors = []
     for i, blk in enumerate(blocks):
         x = torch.from_numpy(from_bits(acts[f"x{i}"])).to(torch.bfloat16)
@@ -544,13 +604,13 @@ def block_fixtures(out: Path) -> None:
         floors.append(row)
         log(f"block {i}: {row}")
     meta["block_floors"] = dict(
-        call="calls_chunk0 call 0", metric="rel L2 of the block output vs torch, on torch's exact block input",
+        call=f"{name} call {j}", metric="rel L2 of the block output vs torch, on torch's exact block input",
         variants=list(FLOOR_VARIANTS), gate_rule="1.5 x max variant", blocks=floors, seconds=time.perf_counter() - t0)
     (out / "meta.json").write_text(json.dumps(meta, indent=2))
     log(f"per-block fixture done in {meta['block_floors']['seconds']:.0f}s")
 
 
-def torch_reference(args, out: Path, meta: dict, prompt, pixels, noises, renoises):
+def torch_reference(args, spec: SceneSpec, out: Path, meta: dict, prompt, pixels, noises, renoises):
     """Upstream CastleStream on the chosen devices; writes inputs.npz and chunk_*.npz, returns the sink latent."""
     import torch
     torch.set_grad_enabled(False)
@@ -559,19 +619,19 @@ def torch_reference(args, out: Path, meta: dict, prompt, pixels, noises, renoise
     meta["repo_commit"] = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=UPSTREAM_ROOT,
                                          capture_output=True, text=True).stdout.strip()
     with cpu_bf16_emulation(torch):
-        return _torch_run(args, out, meta, prompt, pixels, noises, renoises)
+        return _torch_run(args, spec, out, meta, prompt, pixels, noises, renoises)
 
 
-def _torch_run(args, out, meta, prompt, pixels, noises, renoises):
+def _torch_run(args, spec, out, meta, prompt, pixels, noises, renoises):
     import torch
     # UPSTREAM_ROOT is on sys.path via tests.conftest.
     log("loading torch VAE")
-    vae, meta["device_vae"] = load_vae(torch, args.device, pixels[:1], meta)
+    vae, meta["device_vae"] = load_vae(torch, spec, args.device, pixels[:1], meta)
     from matrix_game.inference.stream import encode_sink_image
-    sink = encode_sink_image(vae, SINK_IMAGE, "wan").float().cpu()
+    sink = encode_sink_image(vae, spec.sink_image, "wan", first_frame=spec.sink_mode == "first_frame").float().cpu()
     log(f"VAE device: {meta['device_vae']}")
     log("loading torch DiT")
-    stream, meta["device_dit"] = load_stream(torch, args.device, vae, prompt, sink)
+    stream, meta["device_dit"] = load_stream(torch, spec, args.device, vae, prompt, sink)
     log(f"DiT device: {meta['device_dit']}; VAE device: {meta['device_vae']}")
 
     inputs = dict(prompt_embeds=prompt, sink_latent=sink.numpy())
@@ -582,9 +642,10 @@ def _torch_run(args, out, meta, prompt, pixels, noises, renoises):
     meta["chunk_seconds"] = []
 
     def save_chunk(i, chunk, preds, seconds):
-        if len(preds) != len(STEPS):
-            raise RuntimeError(f"Expected {len(STEPS)} denoising calls, recorded {len(preds)}")
-        np.savez_compressed(out / f"chunk_{i}.npz", control=to_np(chunk.control), pred_step0=preds[0],
+        if len(preds) != n_denoising_calls(spec, i):
+            raise RuntimeError(f"Expected {n_denoising_calls(spec, i)} denoising calls, recorded {len(preds)}")
+        step0 = dict(pred_step0=preds[0]) if preds else {}
+        np.savez_compressed(out / f"chunk_{i}.npz", control=to_np(chunk.control), **step0,
                             pred=to_np(chunk.latent), decoded=to_np(chunk.pixels),
                             kv_k_layer0=to_np(stream.kv[0]["k"]), kv_k_layer29=to_np(stream.kv[29]["k"]))
         meta["chunk_seconds"].append(seconds)
@@ -596,7 +657,7 @@ def _torch_run(args, out, meta, prompt, pixels, noises, renoises):
 
     if args.long:
         n_long = 25
-        long_pixels = pan_frames(1 + 4 * (n_long - 1))
+        long_pixels = pan_frames(spec, 1 + 4 * (n_long - 1))
         long_rng = np.random.default_rng(4321)
         long_noise = [long_rng.standard_normal(LATENT_SHAPE, dtype=np.float32) for _ in range(2 * n_long)]
         long_inputs = {}
@@ -604,7 +665,7 @@ def _torch_run(args, out, meta, prompt, pixels, noises, renoises):
             long_inputs[f"pixels_{i}"] = long_pixels[a:b]
             long_inputs[f"initial_noise_{i}"], long_inputs[f"renoise_{i}"] = long_noise[2 * i], long_noise[2 * i + 1]
         np.savez(out / "long_inputs.npz", **long_inputs)
-        stream = make_stream(stream.gen.gen, vae, stream.prompt, sink)
+        stream = make_stream(spec, stream.gen.gen, vae, stream.prompt, sink)
 
         def save_long(i, chunk, preds, seconds):
             np.savez_compressed(out / f"long_chunk_{i}.npz", pred=to_np(chunk.latent), decoded=to_np(chunk.pixels))
@@ -630,6 +691,7 @@ def floor_reference(out: Path) -> None:
     from matrix_game.inference.wrappers import WanVAE22Wrapper
     torch.set_grad_enabled(False)
     meta = json.loads((out / "meta.json").read_text())
+    spec = spec_of(meta)
     inputs = np.load(out / "inputs.npz")
     n_chunks = meta["chunks"]
     pixels = [inputs[f"pixels_{i}"] for i in range(n_chunks)]
@@ -639,12 +701,13 @@ def floor_reference(out: Path) -> None:
     floors = [{} for _ in range(n_chunks)]
 
     def save(i, chunk, preds, seconds):
-        floors[i].update(pred_step0=preds[0], pred=to_np(chunk.latent), decoded=to_np(chunk.pixels),
+        step0 = dict(pred_step0=preds[0]) if preds else {}
+        floors[i].update(**step0, pred=to_np(chunk.latent), decoded=to_np(chunk.pixels),
                          kv_k_layer0=to_np(stream.kv[0]["k"]), kv_k_layer29=to_np(stream.kv[29]["k"]))
         log(f"floor chunk {i}: {seconds:.1f}s")
 
     with cpu_bf16_emulation(torch, sdpa=False):
-        stream, device_dit = load_stream(torch, meta["device_dit"], vae, inputs["prompt_embeds"],
+        stream, device_dit = load_stream(torch, spec, meta["device_dit"], vae, inputs["prompt_embeds"],
                                          torch.from_numpy(inputs["sink_latent"]))
         if device_dit != meta["device_dit"]:
             raise RuntimeError(f"Floor DiT device {device_dit} != fixture DiT device {meta['device_dit']}")
@@ -668,8 +731,9 @@ def floor_reference(out: Path) -> None:
     log(f"floor fixtures done in {meta['floor']['seconds']:.0f}s")
 
 
-def main(argv=None):
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--scene", choices=tuple(SCENE_SPECS), default=DEFAULT_SCENE)
     parser.add_argument("--device", choices=("auto", "mps", "cpu"), default="auto")
     parser.add_argument("--chunks", type=int, default=3)
     parser.add_argument("--long", action="store_true", help="Also run 25 chunks (pred and decoded only)")
@@ -680,41 +744,50 @@ def main(argv=None):
     parser.add_argument("--call-floors-only", action="store_true",
                         help="Only (re)measure the torch kernel-variant floor of the existing per-call fixtures")
     parser.add_argument("--blocks-only", action="store_true",
-                        help="Only (re)generate the per-block fixture of chunk 0 call 0 and its floors")
-    args = parser.parse_args(argv)
+                        help="Only (re)generate the per-block fixture of the first denoising call and its floors")
+    return parser.parse_args(argv)
+
+
+def scene_out_dir(args) -> Path:
+    return fixtures_dir() / SCENE_SPECS[args.scene].fixture_dir
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    spec, out = SCENE_SPECS[args.scene], scene_out_dir(args)
     if args.floor_only:
-        floor_reference(fixtures_dir() / "egypt_quality")
+        floor_reference(out)
         return
     if args.calls_only:
-        call_fixtures(fixtures_dir() / "egypt_quality")
+        call_fixtures(out)
         return
     if args.call_floors_only:
-        call_floors(fixtures_dir() / "egypt_quality")
+        call_floors(out)
         return
     if args.blocks_only:
-        block_fixtures(fixtures_dir() / "egypt_quality")
+        block_fixtures(out)
         return
-    out = fixtures_dir() / "egypt_quality"
     out.mkdir(parents=True, exist_ok=True)
     t_start = time.perf_counter()
-    meta = dict(scene=SCENE, preset="quality", steps=list(STEPS), sink_mode="kv_only", sink_rope_mode="fixed",
-                chunks=args.chunks, pan_step_px=PAN_STEP, noise_seed=1234, checkpoint=str(CHECKPOINT),
+    meta = dict(scene=spec.scene, preset="quality", steps=list(STEPS), sink_mode=spec.sink_mode,
+                sink_rope_mode=spec.sink_rope_mode, chunks=args.chunks, pan_step_px=PAN_STEP, noise_seed=1234,
+                checkpoint=str(spec.checkpoint),
                 upstream_commit=UPSTREAM_COMMIT, prompt_embeds_source="mlx WanTextEncoder bf16")
 
     log("prompt embeddings (MLX T5)")
-    prompt = mlx_prompt_embeds()
+    prompt = mlx_prompt_embeds(spec)
     n_frames = 1 + 4 * (args.chunks - 1)
-    pixels = pan_frames(n_frames)
+    pixels = pan_frames(spec, n_frames)
     rng = np.random.default_rng(1234)
     noises, renoises = [], []
     for _ in range(args.chunks):
         noises.append(rng.standard_normal(LATENT_SHAPE, dtype=np.float32))
         renoises.append(rng.standard_normal(LATENT_SHAPE, dtype=np.float32))
 
-    sink = torch_reference(args, out, meta, prompt, pixels, noises, renoises)
+    sink = torch_reference(args, spec, out, meta, prompt, pixels, noises, renoises)
     gc.collect()
     log("MLX sink encoding (VAE evidence)")
-    mlx_sink = mlx_sink_latent()
+    mlx_sink = mlx_sink_latent(spec)
     meta["mlx_vs_torch_sink_rel_l2"] = rel_l2(mlx_sink, sink.numpy())
     meta["total_seconds"] = time.perf_counter() - t_start
     (out / "meta.json").write_text(json.dumps(meta, indent=2))
