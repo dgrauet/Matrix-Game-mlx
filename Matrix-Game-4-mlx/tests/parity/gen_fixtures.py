@@ -1,12 +1,29 @@
-"""Generate PyTorch reference fixtures with the real upstream model (quality preset; ancient-egypt, castle, racing).
+"""Generate PyTorch reference fixtures with the real upstream model (ancient-egypt, castle, racing; quality and
+realtime presets).
 
 Run manually from Matrix-Game-4-mlx/ (not collected by pytest):
     MATRIX_GAME_4_MLX_WEIGHTS_DIR=... python -m tests.parity.gen_fixtures --device auto [--scene castle] [--long]
 
-Writes `$MG4_FIXTURES_DIR/<scene>_quality/` (egypt_quality, castle_quality, racing_quality): inputs.npz,
-chunk_{i}.npz, floor_chunk_{i}.npz, calls_chunk{i}.npz, blocks_<call>.npz (blocks_chunk0_call0.npz unless chunk 0
-has no denoising call), meta.json (and long_*.npz plus calls_long22.npz with --long). `--floor-only`,
-`--calls-only`, `--call-floors-only` and `--blocks-only` regenerate only those parts from the saved fixtures.
+Quality (default `--preset quality`) writes `$MG4_FIXTURES_DIR/<scene>_quality/` (egypt_quality, castle_quality,
+racing_quality): inputs.npz, chunk_{i}.npz, floor_chunk_{i}.npz, calls_chunk{i}.npz, blocks_<call>.npz
+(blocks_chunk0_call0.npz unless chunk 0 has no denoising call), meta.json (and long_*.npz plus calls_long22.npz with
+--long). `--floor-only`, `--calls-only`, `--call-floors-only` and `--blocks-only` regenerate only those parts from
+the saved fixtures.
+
+Realtime (`--preset realtime`: TAEHV taew2_2 codec, one denoising step at t=1000) writes
+`$MG4_FIXTURES_DIR/<scene>_realtime/` (egypt_realtime, castle_realtime, racing_realtime), 3 chunks (9 frames):
+inputs.npz (pan pixels, initial noises, torch TAEHV sink latent, prompt embeds), chunks.npz (end to end per chunk i:
+control_i, pred_i, decoded_i, kv_k_layer0_i, kv_k_layer29_i, n_denoising_i), taehv_calls.npz (torch TAEHV alone:
+streaming-encoded control_i and teacher-forced decoded_i, decode_stream of the end-to-end preds), taehv_floor.npz
+(the same TAEHV sequence with the torch fp32 CPU and bf16 MPS variants), floor_chunk_{i}.npz (end-to-end floor:
+native bf16 CPU SDPA, as quality) and meta.json (taehv_floors, floor). The DiT is preset-independent and already
+gated per block / per call by the quality fixtures, so realtime has no per-call or per-block fixtures and no long
+run. `--taehv-only` regenerates taehv_calls.npz / taehv_floor.npz / meta taehv_floors from inputs.npz and chunks.npz
+(seconds); `--floor-only` the end-to-end floor. Commands (one scene at a time, ~10-15 min each, mostly the CPU DiT):
+    python -m tests.parity.gen_fixtures --scene ancient-egypt --preset realtime
+    python -m tests.parity.gen_fixtures --scene castle --preset realtime
+    python -m tests.parity.gen_fixtures --scene racing --preset realtime
+(`--print-commands [--preset P]` prints them.)
 """
 import argparse
 import contextlib
@@ -57,6 +74,10 @@ class SceneSpec:
     def sink_image(self) -> Path:
         return SRC / self.src_dir / "sink.png"
 
+    def preset_dir(self, preset: str) -> str:
+        """Fixture dir of a preset: <scene-short>_<preset> (fixture_dir is the quality one)."""
+        return f"{self.fixture_dir.removesuffix('_quality')}_{preset}"
+
 
 SCENE_SPECS = {s.scene: s for s in (SceneSpec("ancient-egypt", "egypt_quality", "fps-egypt"),
                                     SceneSpec("castle", "castle_quality", "fps-castle"),
@@ -64,14 +85,32 @@ SCENE_SPECS = {s.scene: s for s in (SceneSpec("ancient-egypt", "egypt_quality", 
 DEFAULT_SCENE = "ancient-egypt"
 
 
-def n_denoising_calls(spec: SceneSpec, chunk: int) -> int:
+@dataclass(frozen=True)
+class PresetSpec:
+    """Upstream resolve_model_arguments per preset: denoising steps (first_steps == steps) and codec."""
+    name: str
+    steps: tuple
+    vae_backend: str
+
+
+PRESET_SPECS = {p.name: p for p in (PresetSpec("quality", STEPS, "wan"), PresetSpec("realtime", (1000,), "taehv"))}
+TAEHV_CHECKPOINT = SRC / "base" / "taew2_2.pth"
+TAEHV_VARIANTS = ("fp32_cpu", "bf16_mps")
+
+
+def generation_command(scene: str, preset: str = "quality") -> str:
+    """The gen_fixtures command line that writes a scene's fixture set (printed by --print-commands, cited by skips)."""
+    return f"python -m tests.parity.gen_fixtures --scene {scene}" + ("" if preset == "quality" else f" --preset {preset}")
+
+
+def n_denoising_calls(spec: SceneSpec, chunk: int, steps: tuple = STEPS) -> int:
     """Control-conditioned calls of a chunk: first_frame chunk 0 reuses the sink latent as pred (no denoising)."""
-    return 0 if spec.sink_mode == "first_frame" and chunk == 0 else len(STEPS)   # first_steps == STEPS (make_stream)
+    return 0 if spec.sink_mode == "first_frame" and chunk == 0 else len(steps)   # first_steps == steps (make_stream)
 
 
-def n_renoise(spec: SceneSpec, chunk: int) -> int:
+def n_renoise(spec: SceneSpec, chunk: int, steps: tuple = STEPS) -> int:
     """Renoise draws of a chunk: upstream draws one between consecutive denoising steps only."""
-    return max(n_denoising_calls(spec, chunk) - 1, 0)
+    return max(n_denoising_calls(spec, chunk, steps) - 1, 0)
 
 
 def first_denoising_call(n_calls: list, drops: dict) -> tuple:
@@ -302,13 +341,58 @@ def ensure_accelerate(torch) -> None:
     sys.modules["accelerate"] = types.SimpleNamespace(init_empty_weights=init_empty_weights)
 
 
-def make_stream(spec: SceneSpec, gen, vae, prompt, sink):
+def make_stream(spec: SceneSpec, gen, vae, prompt, sink, preset: str = "quality"):
     from matrix_game.inference.stream import CastleStream
-    return CastleStream(gen, vae, prompt, seed=0, vae_backend="wan", steps=STEPS, first_steps=STEPS,
+    p = PRESET_SPECS[preset]
+    return CastleStream(gen, vae, prompt, seed=0, vae_backend=p.vae_backend, steps=p.steps, first_steps=p.steps,
                         sink_latent=sink, sink_mode=spec.sink_mode, sink_rope_mode=spec.sink_rope_mode)
 
 
-def load_stream(torch, spec: SceneSpec, device_pref: str, vae, prompt_np: np.ndarray, sink):
+def load_taehv(torch, device: str = "cpu", dtype=None):
+    """Upstream TAEHV adapter on taew2_2.pth, cast as upstream's loader does (`.to(device, bf16)`) by default."""
+    from matrix_game.inference.taehv import TAEHV
+    return TAEHV(str(TAEHV_CHECKPOINT)).to(device, dtype or torch.bfloat16).eval().requires_grad_(False)
+
+
+class DeviceBridge:
+    """The TAEHV as upstream CastleStream sees it, moving latents to the codec's device first.
+
+    Upstream's taehv push encodes pixels already moved to the codec (`next(vae.parameters())`) but hands the DiT's pred
+    to `decode_stream` as is; with the DiT on MPS and the TAEHV on CPU (the reference device) that call would mix
+    devices. Moving the pred is numerically neutral (same dtype)."""
+
+    def __init__(self, vae):
+        self.vae = vae
+
+    def parameters(self):
+        return self.vae.parameters()
+
+    def _device(self):
+        return next(self.vae.parameters()).device
+
+    def encode_stream(self, x, *args, **kw):
+        return self.vae.encode_stream(x.to(self._device()), *args, **kw)
+
+    def decode_stream(self, z, *args, **kw):
+        return self.vae.decode_stream(z.to(self._device()), *args, **kw)
+
+    def clear_cache(self):
+        self.vae.clear_cache()
+
+
+def taehv_floor_summary(ref: np.ndarray, variants: dict, with_psnr: bool = False) -> dict:
+    """Rel L2 of each torch variant vs the reference on one quantity, their max (and min PSNR for decoded frames)."""
+    if not variants:
+        raise ValueError("No TAEHV floor variant ran")
+    row = {name: rel_l2(value, ref) for name, value in variants.items()}
+    row["max"] = max(row.values())
+    if with_psnr:
+        row.update({f"{name}_psnr": psnr(value, ref) for name, value in variants.items()})
+        row["min_psnr"] = min(row[f"{name}_psnr"] for name in variants)
+    return row
+
+
+def load_stream(torch, spec: SceneSpec, device_pref: str, vae, prompt_np: np.ndarray, sink, preset: str = "quality"):
     """Build the DiT, try MPS with the sink-priming forward as smoke call, else CPU."""
     from matrix_game.inference.loading import build_dit
     ensure_accelerate(torch)
@@ -323,7 +407,7 @@ def load_stream(torch, spec: SceneSpec, device_pref: str, vae, prompt_np: np.nda
         try:
             gen = gen.to("mps")
             t0 = time.perf_counter()
-            stream = make_stream(spec, gen, vae, torch.from_numpy(prompt_np).to("mps", torch.bfloat16), sink)
+            stream = make_stream(spec, gen, vae, torch.from_numpy(prompt_np).to("mps", torch.bfloat16), sink, preset)
             log(f"DiT MPS smoke (sink priming) ok ({time.perf_counter() - t0:.1f}s)")
             return stream, "mps"
         except Exception as exc:  # noqa: BLE001 - any MPS failure means CPU fallback
@@ -334,18 +418,20 @@ def load_stream(torch, spec: SceneSpec, device_pref: str, vae, prompt_np: np.nda
             gc.collect()
             torch.mps.empty_cache()
     t0 = time.perf_counter()
-    stream = make_stream(spec, gen, vae, torch.from_numpy(prompt_np).to(torch.bfloat16), sink)
+    stream = make_stream(spec, gen, vae, torch.from_numpy(prompt_np).to(torch.bfloat16), sink, preset)
     log(f"DiT CPU sink priming {time.perf_counter() - t0:.1f}s")
     return stream, "cpu"
 
 
-def run_chunks(torch, spec, stream, pixels, noises, renoises, n_chunks, on_chunk):
+def run_chunks(torch, spec, stream, pixels, noises, renoises, n_chunks, on_chunk, steps=STEPS):
+    """Push n_chunks chunks with the prepared initial noises (and renoise draws; renoises may be None when the
+    preset never draws one)."""
     recorder = GenRecorder(stream.gen)
     stream.gen = recorder
     for i, (a, b) in enumerate(chunk_slices(n_chunks)):
         t0 = time.perf_counter()
         recorder.preds.clear()
-        with injected_renoise(torch, [torch.from_numpy(renoises[i])][:n_renoise(spec, i)]) as left:
+        with injected_renoise(torch, [torch.from_numpy(renoises[i])] if n_renoise(spec, i, steps) else []) as left:
             chunk = stream.push(torch.from_numpy(pixels[a:b]), frame_start=a,
                                 initial_noise=torch.from_numpy(noises[i]))
         if left:
@@ -711,22 +797,27 @@ def floor_reference(out: Path) -> None:
     """Torch-vs-torch floor for the 3-chunk set, from the saved inputs (main fixtures are not touched).
 
     DiT tensors: the same upstream stream with only the CPU SDPA kernel changed (native bf16 instead of
-    fp32-emulated). control: the same streaming encoder on the other VAE device (the SDPA variant does not
-    touch the VAE, so its control would equal the fixture bitwise).
+    fp32-emulated). control (quality only): the same streaming encoder on the other VAE device (the SDPA variant does
+    not touch the VAE, so its control would equal the fixture bitwise). Realtime: the TAEHV control floor is
+    meta.json "taehv_floors" (taehv_fixtures), so floor_chunk_{i}.npz carries no control.
     """
     import torch
-    from huggingface_hub import hf_hub_download
-    from matrix_game.inference.wan.modules.vae2_2 import count_conv3d
-    from matrix_game.inference.wrappers import WanVAE22Wrapper
     torch.set_grad_enabled(False)
     meta = json.loads((out / "meta.json").read_text())
-    spec = spec_of(meta)
+    spec, preset = spec_of(meta), PRESET_SPECS[meta.get("preset", "quality")]
     inputs = np.load(out / "inputs.npz")
     n_chunks = meta["chunks"]
     pixels = [inputs[f"pixels_{i}"] for i in range(n_chunks)]
     t0 = time.perf_counter()
-    vae = WanVAE22Wrapper(vae_path=hf_hub_download(VAE_REPO, VAE_FILE, revision=VAE_REVISION)).eval()
-    vae = vae.requires_grad_(False).to(meta["device_vae"], torch.bfloat16)
+    if preset.vae_backend == "wan":
+        from huggingface_hub import hf_hub_download
+        from matrix_game.inference.wrappers import WanVAE22Wrapper
+        vae = WanVAE22Wrapper(vae_path=hf_hub_download(VAE_REPO, VAE_FILE, revision=VAE_REVISION)).eval()
+        vae = vae.requires_grad_(False).to(meta["device_vae"], torch.bfloat16)
+        codec = vae
+    else:
+        vae = load_taehv(torch, meta["device_taehv"])
+        codec = DeviceBridge(vae)
     floors = [{} for _ in range(n_chunks)]
 
     def save(i, chunk, preds, seconds):
@@ -736,56 +827,230 @@ def floor_reference(out: Path) -> None:
         log(f"floor chunk {i}: {seconds:.1f}s")
 
     with cpu_bf16_emulation(torch, sdpa=False):
-        stream, device_dit = load_stream(torch, spec, meta["device_dit"], vae, inputs["prompt_embeds"],
-                                         torch.from_numpy(inputs["sink_latent"]))
+        stream, device_dit = load_stream(torch, spec, meta["device_dit"], codec, inputs["prompt_embeds"],
+                                         torch.from_numpy(inputs["sink_latent"]), preset.name)
         if device_dit != meta["device_dit"]:
             raise RuntimeError(f"Floor DiT device {device_dit} != fixture DiT device {meta['device_dit']}")
+        renoises = [inputs[f"renoise_{i}"] for i in range(n_chunks)] if preset.name == "quality" else None
         run_chunks(torch, spec, stream, np.concatenate(pixels), [inputs[f"initial_noise_{i}"] for i in range(n_chunks)],
-                   [inputs[f"renoise_{i}"] for i in range(n_chunks)], n_chunks, save)
+                   renoises, n_chunks, save, preset.steps)
     del stream
     gc.collect()
-    control_device = "cpu" if meta["device_vae"] == "mps" else "mps"
-    vae = vae.to(control_device)
-    feats = [None] * count_conv3d(vae.model.encoder)
-    with cpu_bf16_emulation(torch):
-        for i in range(n_chunks):
-            floors[i]["control"] = stream_encode(torch, vae, pixels[i], feats).float().cpu().numpy()
-    for i, tensors in enumerate(floors):
-        np.savez_compressed(out / f"floor_chunk_{i}.npz", **tensors)
     meta["floor"] = dict(
         dit_variant="native bf16 CPU SDPA (cpu_bf16_emulation(sdpa=False)); everything else as the fixture run",
-        control_variant=f"torch streaming VAE encoder on {control_device} (fixture: {meta['device_vae']})",
-        chunks=n_chunks, seconds=time.perf_counter() - t0)
+        chunks=n_chunks)
+    if preset.vae_backend == "wan":
+        from matrix_game.inference.wan.modules.vae2_2 import count_conv3d
+        control_device = "cpu" if meta["device_vae"] == "mps" else "mps"
+        vae = vae.to(control_device)
+        feats = [None] * count_conv3d(vae.model.encoder)
+        with cpu_bf16_emulation(torch):
+            for i in range(n_chunks):
+                floors[i]["control"] = stream_encode(torch, vae, pixels[i], feats).float().cpu().numpy()
+        meta["floor"]["control_variant"] = f"torch streaming VAE encoder on {control_device} (fixture: {meta['device_vae']})"
+    else:
+        meta["floor"]["control_variant"] = "none here: TAEHV floors in meta.json taehv_floors"
+    for i, tensors in enumerate(floors):
+        np.savez_compressed(out / f"floor_chunk_{i}.npz", **tensors)
+    meta["floor"]["seconds"] = time.perf_counter() - t0
     (out / "meta.json").write_text(json.dumps(meta, indent=2))
     log(f"floor fixtures done in {meta['floor']['seconds']:.0f}s")
 
 
+def taehv_sequence(torch, taehv, spec: SceneSpec, pixels: list, preds: list) -> dict:
+    """The realtime codec work of one torch TAEHV instance, as upstream does it: sink image encode
+    (encode_sink_image, which clears the streaming state before and after), then on fresh streaming state
+    encode_stream of each chunk's pixels (control_i, NCTHW -> [1, 1, 48, h, w]) and decode_stream of each given pred
+    (decoded_i, [T, 3, H, W]). Inputs go to the instance's device and dtype; outputs are bf16-rounded float32."""
+    from matrix_game.inference.stream import encode_sink_image
+    p = next(taehv.parameters())
+    out_np = lambda t: t.detach().to("cpu", torch.bfloat16).float().numpy()  # noqa: E731
+    out = dict(sink=out_np(encode_sink_image(taehv, spec.sink_image, "taehv", first_frame=spec.sink_mode == "first_frame")))
+    taehv.clear_cache()
+    for i, px in enumerate(pixels):
+        x = torch.from_numpy(px).permute(1, 0, 2, 3).unsqueeze(0).to(p.device, p.dtype)
+        out[f"control_{i}"] = out_np(taehv.encode_stream(x).latent_dist.mode().permute(0, 2, 1, 3, 4))
+    for i, z in enumerate(preds):
+        z = torch.from_numpy(z).to(p.device, p.dtype).permute(0, 2, 1, 3, 4)
+        out[f"decoded_{i}"] = out_np(taehv.decode_stream(z).sample[0].permute(1, 0, 2, 3))
+    taehv.clear_cache()
+    return out
+
+
+def taehv_fixtures(out: Path) -> None:
+    """Realtime TAEHV per-call fixtures and floors, from inputs.npz and the end-to-end chunks.npz.
+
+    taehv_calls.npz: the torch reference TAEHV (bf16 CPU, cpu_bf16_emulation as the end-to-end run) alone: streaming
+    encode of the pan pixels (control_i) and teacher-forced streaming decode of the torch end-to-end preds
+    (decoded_i). Both must equal the end-to-end run bitwise (same codec work inside CastleStream), and the sink the
+    stored one. taehv_floor.npz: the same sequence with the torch variants fp32 CPU (weights and activations fp32,
+    outputs rounded to bf16) and bf16 MPS (when available); meta.json "taehv_floors": per quantity, the variants'
+    rel L2 vs the reference and their max (decoded: PSNR and min PSNR too).
+    """
+    import torch
+    torch.set_grad_enabled(False)
+    meta = json.loads((out / "meta.json").read_text())
+    spec = spec_of(meta)
+    inputs, chunks = np.load(out / "inputs.npz"), np.load(out / "chunks.npz")
+    n_chunks = meta["chunks"]
+    pixels = [inputs[f"pixels_{i}"] for i in range(n_chunks)]
+    preds = [chunks[f"pred_{i}"] for i in range(n_chunks)]
+    t0 = time.perf_counter()
+    with cpu_bf16_emulation(torch):
+        ref = taehv_sequence(torch, load_taehv(torch, meta["device_taehv"]), spec, pixels, preds)
+    for key, want in [("sink", inputs["sink_latent"])] + [(f"{k}_{i}", chunks[f"{k}_{i}"]) for i in range(n_chunks)
+                                                          for k in ("control", "decoded")]:
+        if not np.array_equal(ref[key], want):
+            raise RuntimeError(f"Torch TAEHV alone does not reproduce the end-to-end {key} bitwise "
+                               f"(rel L2 {rel_l2(ref[key], want):.3e})")
+    np.savez_compressed(out / "taehv_calls.npz", **{k: v for k, v in ref.items() if k != "sink"})
+    log(f"TAEHV reference calls reproduce the end-to-end run ({time.perf_counter() - t0:.1f}s)")
+    variants = {}
+    for name in TAEHV_VARIANTS:
+        device, dtype = {"fp32_cpu": ("cpu", torch.float32), "bf16_mps": ("mps", torch.bfloat16)}[name]
+        if device == "mps" and not torch.backends.mps.is_available():
+            log("TAEHV floor: MPS unavailable, bf16_mps variant skipped")
+            continue
+        try:
+            variants[name] = taehv_sequence(torch, load_taehv(torch, device, dtype), spec, pixels, preds)
+        except Exception as exc:  # noqa: BLE001 - an MPS failure only drops that variant
+            if device != "mps":
+                raise
+            log(f"TAEHV floor: bf16_mps failed ({type(exc).__name__}: {exc}); variant skipped")
+            continue
+        log(f"TAEHV floor variant {name} done")
+    np.savez_compressed(out / "taehv_floor.npz", **{f"{v}_{k}": a for v, d in variants.items() for k, a in d.items()})
+    summary = lambda key, with_psnr=False: taehv_floor_summary(  # noqa: E731
+        ref[key], {v: d[key] for v, d in variants.items()}, with_psnr)
+    meta["taehv_floors"] = dict(
+        reference=f"torch TAEHV bf16 on {meta['device_taehv']} (cpu_bf16_emulation), as the end-to-end run",
+        variants={"fp32_cpu": "torch TAEHV fp32 on CPU (weights, inputs and activations fp32; outputs rounded to bf16)",
+                  "bf16_mps": "torch TAEHV bf16 on MPS"} if "bf16_mps" in variants else
+                 {"fp32_cpu": "torch TAEHV fp32 on CPU (weights, inputs and activations fp32; outputs rounded to bf16)"},
+        metric="rel L2 vs the reference (decoded: also PSNR, peak-to-peak 2); max / min_psnr over the variants",
+        sink=summary("sink"),
+        chunks=[dict(control=summary(f"control_{i}"), decoded=summary(f"decoded_{i}", True)) for i in range(n_chunks)],
+        seconds=time.perf_counter() - t0)
+    (out / "meta.json").write_text(json.dumps(meta, indent=2))
+    log(f"TAEHV floors: sink {meta['taehv_floors']['sink']}")
+    for i, row in enumerate(meta["taehv_floors"]["chunks"]):
+        log(f"TAEHV floors chunk {i}: control {row['control']['max']:.3e}, decoded {row['decoded']['max']:.3e} "
+            f"(min PSNR {row['decoded']['min_psnr']:.1f} dB)")
+
+
+def realtime_reference(args, spec: SceneSpec, out: Path, meta: dict, prompt, pixels, noises) -> None:
+    """Upstream realtime CastleStream (TAEHV bf16 on CPU, DiT as load_stream picks); writes inputs.npz, chunks.npz."""
+    import torch
+    torch.set_grad_enabled(False)
+    from matrix_game.inference.stream import encode_sink_image
+    preset = PRESET_SPECS["realtime"]
+    meta["torch_version"] = torch.__version__
+    meta["cpu_bf16"] = "emulated: fp32 linear/conv/SDPA with bf16-rounded outputs (cpu_bf16_emulation)"
+    meta["repo_commit"] = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=UPSTREAM_ROOT,
+                                         capture_output=True, text=True).stdout.strip()
+    with cpu_bf16_emulation(torch):
+        taehv = load_taehv(torch, meta["device_taehv"])
+        sink = encode_sink_image(taehv, spec.sink_image, "taehv", first_frame=spec.sink_mode == "first_frame").float().cpu()
+        log("loading torch DiT")
+        stream, meta["device_dit"] = load_stream(torch, spec, args.device, DeviceBridge(taehv), prompt, sink, preset.name)
+        log(f"DiT device: {meta['device_dit']}; TAEHV device: {meta['device_taehv']}")
+        inputs = dict(prompt_embeds=prompt, sink_latent=sink.numpy())
+        for i, (a, b) in enumerate(chunk_slices(args.chunks)):
+            inputs[f"pixels_{i}"], inputs[f"initial_noise_{i}"] = pixels[a:b], noises[i]
+        np.savez(out / "inputs.npz", **inputs)
+        record, meta["chunk_seconds"] = {}, []
+
+        def save_chunk(i, chunk, preds, seconds):
+            if len(preds) != n_denoising_calls(spec, i, preset.steps):
+                raise RuntimeError(f"Expected {n_denoising_calls(spec, i, preset.steps)} denoising calls, recorded {len(preds)}")
+            record.update({f"control_{i}": to_np(chunk.control), f"pred_{i}": to_np(chunk.latent),
+                           f"decoded_{i}": to_np(chunk.pixels), f"kv_k_layer0_{i}": to_np(stream.kv[0]["k"]),
+                           f"kv_k_layer29_{i}": to_np(stream.kv[29]["k"]), f"n_denoising_{i}": np.array(len(preds))})
+            meta["chunk_seconds"].append(seconds)
+            log(f"chunk {i}: {seconds:.1f}s")
+
+        t0 = time.perf_counter()
+        meta["forward_seconds"] = run_chunks(torch, spec, stream, pixels, noises, None, args.chunks, save_chunk,
+                                             preset.steps)
+        meta["run_seconds"] = time.perf_counter() - t0
+    np.savez_compressed(out / "chunks.npz", **record)
+
+
+def realtime_main(args, spec: SceneSpec, out: Path) -> None:
+    """Realtime fixture set: end-to-end reference, TAEHV calls and floors, end-to-end floor (module docstring)."""
+    out.mkdir(parents=True, exist_ok=True)
+    t_start = time.perf_counter()
+    preset = PRESET_SPECS["realtime"]
+    meta = dict(scene=spec.scene, preset=preset.name, steps=list(preset.steps), sink_mode=spec.sink_mode,
+                sink_rope_mode=spec.sink_rope_mode, chunks=args.chunks, pan_step_px=PAN_STEP, noise_seed=1234,
+                checkpoint=str(spec.checkpoint), taehv_checkpoint=str(TAEHV_CHECKPOINT), device_taehv="cpu",
+                upstream_commit=UPSTREAM_COMMIT, prompt_embeds_source="mlx WanTextEncoder bf16")
+    log("prompt embeddings (MLX T5)")
+    prompt = mlx_prompt_embeds(spec)
+    pixels = pan_frames(spec, 1 + 4 * (args.chunks - 1))
+    rng = np.random.default_rng(1234)
+    noises = [rng.standard_normal(LATENT_SHAPE, dtype=np.float32) for _ in range(args.chunks)]
+    realtime_reference(args, spec, out, meta, prompt, pixels, noises)
+    meta["total_seconds"] = time.perf_counter() - t_start
+    (out / "meta.json").write_text(json.dumps(meta, indent=2))
+    log(f"end to end done in {meta['total_seconds']:.0f}s: {out}")
+    gc.collect()                                 # one torch DiT alive at a time
+    taehv_fixtures(out)
+    floor_reference(out)
+
+
+QUALITY_ONLY = ("long", "calls_only", "call_floors_only", "blocks_only")
+
+
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--scene", choices=tuple(SCENE_SPECS), default=DEFAULT_SCENE)
+    parser.add_argument("--preset", choices=tuple(PRESET_SPECS), default="quality",
+                        help="quality: Wan VAE, steps (1000, 500); realtime: TAEHV taew2_2, steps (1000,)")
     parser.add_argument("--device", choices=("auto", "mps", "cpu"), default="auto")
     parser.add_argument("--chunks", type=int, default=3)
-    parser.add_argument("--long", action="store_true", help="Also run 25 chunks (pred and decoded only)")
+    parser.add_argument("--long", action="store_true", help="Also run 25 chunks (pred and decoded only; quality)")
     parser.add_argument("--floor-only", action="store_true",
                         help="Only (re)generate floor_chunk_*.npz from the existing inputs.npz and meta.json")
     parser.add_argument("--calls-only", action="store_true",
-                        help="Only (re)generate the per-call fixtures calls_*.npz from the existing fixtures")
+                        help="Only (re)generate the per-call fixtures calls_*.npz from the existing fixtures (quality)")
     parser.add_argument("--call-floors-only", action="store_true",
-                        help="Only (re)measure the torch kernel-variant floor of the existing per-call fixtures")
+                        help="Only (re)measure the torch kernel-variant floor of the existing per-call fixtures (quality)")
     parser.add_argument("--blocks-only", action="store_true",
-                        help="Only (re)generate the per-block fixture of the first denoising call and its floors")
-    return parser.parse_args(argv)
+                        help="Only (re)generate the per-block fixture of the first denoising call and its floors (quality)")
+    parser.add_argument("--taehv-only", action="store_true",
+                        help="Only (re)generate taehv_calls.npz, taehv_floor.npz and meta taehv_floors from the "
+                             "existing inputs.npz and chunks.npz (realtime)")
+    parser.add_argument("--print-commands", action="store_true",
+                        help="Print the generation command of every scene for --preset, then exit")
+    args = parser.parse_args(argv)
+    if args.preset == "realtime":
+        bad = [f"--{name.replace('_', '-')}" for name in QUALITY_ONLY if getattr(args, name)]
+        if bad:
+            parser.error(f"{', '.join(bad)}: quality preset only")
+    elif args.taehv_only:
+        parser.error("--taehv-only: realtime preset only")
+    return args
 
 
 def scene_out_dir(args) -> Path:
-    return fixtures_dir() / SCENE_SPECS[args.scene].fixture_dir
+    return fixtures_dir() / SCENE_SPECS[args.scene].preset_dir(args.preset)
 
 
 def main(argv=None):
     args = parse_args(argv)
     spec, out = SCENE_SPECS[args.scene], scene_out_dir(args)
+    if args.print_commands:
+        print("\n".join(generation_command(scene, args.preset) for scene in SCENE_SPECS))
+        return
     if args.floor_only:
         floor_reference(out)
+        return
+    if args.taehv_only:
+        taehv_fixtures(out)
+        return
+    if args.preset == "realtime":
+        realtime_main(args, spec, out)
         return
     if args.calls_only:
         call_fixtures(out)
