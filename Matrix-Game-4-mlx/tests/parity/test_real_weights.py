@@ -27,6 +27,7 @@ Three levels:
 import gc
 import json
 import math
+import sys
 
 import numpy as np
 import pytest
@@ -70,7 +71,9 @@ def ceil_1sig(x: float) -> float:
     if x == 0:
         return 0.0
     e = math.floor(math.log10(x))
-    d = math.ceil(round(x / 10 ** e, 9))       # 1.5 x 2e-4 must give 3e-4, not 4e-4
+    # Mantissa rounded to 9 decimals first: 1.5 x 2e-4 = 3.0000000000000004e-4 must give 3e-4, not 4e-4. A real
+    # excess below 1e-9 relative is deliberately ignored too (rounds down by at most that much).
+    d = math.ceil(round(x / 10 ** e, 9))
     return float(f"1e{e + 1}") if d == 10 else float(f"{d}e{e}")
 
 
@@ -114,6 +117,10 @@ def comps(scene, loaded):
     _require(scene)
     if loaded.get("scene") != scene:
         loaded.clear()
+        for name in ("last_type", "last_value", "last_traceback", "last_exc"):
+            # A failed test's postmortem traceback (set by pytest, cleared only at the next call phase) would keep
+            # the previous scene's DiT alive while this one loads: two 5B DiTs on a 32 GB machine.
+            sys.__dict__.pop(name, None)
         gc.collect()
         mx.clear_cache()
         meta = _meta(scene)
@@ -158,7 +165,8 @@ M1_EGYPT_CALL_TOL = {
 
 
 def test_call_tol_rule_reproduces_m1_egypt_table():
-    """call_tol on egypt's meta.json floors gives exactly the milestone-1 table (pins the rounding rule)."""
+    """call_tol on egypt's meta.json floors gives exactly the milestone-1 table (pins the rounding rule). The table
+    includes calls_long22: egypt fixtures regenerated without --long fail here by design (they are not M1's)."""
     if _meta("ancient-egypt") is None:
         pytest.skip(f"{_dir('ancient-egypt')} missing: generate it with python -m tests.parity.gen_fixtures")
     derived = {}
@@ -178,6 +186,8 @@ def test_sink_encoding_production_path(scene, comps):
     from matrix_game_mlx.inference.stream import encode_sink_image
     torch_sink = np.load(_dir(scene) / "inputs.npz")["sink_latent"]
     assert comps.sink_image == comps.pack / comps.cfg["scenes"][scene]["sink_image"]
+    # Independent of the pack config: the image torch encoded is <checkpoint dir>/sink.png (gen_fixtures SceneSpec)
+    assert comps.sink_image == comps.pack / SCENE_SPECS[scene].src_dir / "sink.png"
     err = rel_l2(encode_sink_image(comps.vae, comps.sink_image, "wan", first_frame=comps.sink_mode == "first_frame"),
                  torch_sink)
     print(f"{scene} sink rel L2 {err:.3e}")
@@ -218,9 +228,7 @@ def test_block_parity(scene, comps, block_case, i):
 @pytest.mark.parametrize("scene,name,j", _call_cases())
 def test_call_parity(scene, comps, name, j):
     path = _dir(scene) / f"{name}.npz"
-    if not path.exists():
-        pytest.skip(f"{path.name} missing: generate it with gen_fixtures --scene {scene} --long (then --calls-only)")
-    fx = np.load(path)
+    fx = np.load(path)                       # listed in meta.json call_floors: a missing file is a broken fixture set
     tol = call_tol(_meta(scene)["call_floors"]["calls"][name][j], t_zero=not fx[f"c{j}_t"].any())
     stream = comps.stream(seed=0)
     _inject_state(stream.kv, fx)                                               # torch's state at the chunk boundary
@@ -252,6 +260,9 @@ def test_call_parity(scene, comps, name, j):
         assert (c["global_end_index"], c["local_end_index"]) == (gei, lei), f"layer {i} end indices"
         np.testing.assert_array_equal(to_np(c["k_sink_raw"])[:, keep], from_bits(fx[f"state_ksr{i}"])[:, keep],
                                       err_msg=f"layer {i} k_sink_raw")
+        # Written rows (no torch reference outside layers 0/29): at least every layer must have written them
+        assert not rows or not np.array_equal(to_np(c["k_sink_raw"])[:, ~keep], from_bits(fx[f"state_ksr{i}"])[:, ~keep]), \
+            f"layer {i} k_sink_raw: sink rows not written"
     if rows:
         for layer in KV_LAYERS:
             assert f"c{j}_ksr{layer}" in fx.files and f"ksr{layer}" in tol, \

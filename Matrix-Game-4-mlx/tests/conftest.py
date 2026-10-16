@@ -56,10 +56,12 @@ def weights_dir() -> Optional[Path]:
 
 @pytest.hookimpl(trylast=True)                  # after pytest's own fixture-based reordering
 def pytest_collection_modifyitems(config, items):
-    # Group each module's items by their "scene" parameter (first-appearance order, stable otherwise), so
-    # tests/parity/test_real_weights.py, which keeps one scene's DiT in memory at a time, loads each scene once.
+    # Group the fixture-parity items of each module by their "scene" parameter (first-appearance order, stable
+    # otherwise), so tests/parity/test_real_weights.py, which keeps one scene's DiT in memory at a time, loads each
+    # scene once. Items without the needs_fixtures marker keep their order.
     def scene_key(item):
-        return item.path, getattr(getattr(item, "callspec", None), "params", {}).get("scene")
+        scene = getattr(getattr(item, "callspec", None), "params", {}).get("scene")
+        return item.path, scene if "needs_fixtures" in item.keywords else None
 
     modules, scenes = {}, {}
     for item in items:
