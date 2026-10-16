@@ -256,7 +256,7 @@ def test_real_pack_loads_strict_bf16():
 
 @pytest.mark.needs_weights
 def test_real_decoder8_bf16_conv_matches_torch_bf16():
-    """Regression: decoder.8 (3x3, 256->128 at 120x216) through the MLX Metal bf16 conv2d kernel was 3e-2 rel L2 off
+    """Regression: decoder.8 (3x3, 256->128; arbitrary 120x216 test input) through the MLX Metal bf16 conv2d kernel was 3e-2 rel L2 off
     fp64 (torch CPU bf16: 1.7e-3); TAEHV convs now accumulate in float32 and round once, like torch."""
     from tests.conftest import rel_l2
     m = mt.TAEHV.from_pack(weights_dir() / "taehv.safetensors")

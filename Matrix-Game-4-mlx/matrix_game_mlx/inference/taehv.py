@@ -20,8 +20,8 @@ TWorkItem = namedtuple("TWorkItem", ("input_tensor", "block_index"))
 class Conv2d(nn.Conv2d):
     """nn.Conv2d (NHWC) that accumulates in float32 and rounds the output once to the activation dtype.
 
-    MLX framework constraint: some Metal bf16 conv2d kernel paths lose precision (decoder.8, 256->128 3x3 at
-    120x216: 3e-2 rel L2 vs fp64, where torch CPU bf16 is 1.7e-3). Upcasting input and weight to float32, adding the
+    MLX framework constraint: some Metal bf16 conv2d kernel paths lose precision (decoder.8, 256->128 3x3, measured
+    on a 120x216 input: 3e-2 rel L2 vs fp64, where torch CPU bf16 is 1.7e-3). Upcasting input and weight to float32, adding the
     bias in float32 and rounding the output reproduces torch's fp32-accumulate-then-round bf16 convolution. Parameters
     keep their dtype (bf16 in the realtime preset); float32 activations are unaffected."""
 

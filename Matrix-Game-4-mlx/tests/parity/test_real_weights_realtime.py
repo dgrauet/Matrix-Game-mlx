@@ -84,6 +84,7 @@ def test_taehv_sink_latent(scene, taehv):
     comps = ModelComponents(scene, PRESET)                                # config only, nothing loaded
     # The image torch encoded is <checkpoint dir>/sink.png (gen_fixtures SceneSpec); the pack's copy must be the same
     assert comps.sink_image == comps.pack / SCENE_SPECS[scene].src_dir / "sink.png"
+    assert comps.sink_image.read_bytes() == SCENE_SPECS[scene].sink_image.read_bytes()
     torch_sink = np.load(_dir(scene) / "inputs.npz")["sink_latent"]
     sink = encode_sink_image(taehv, comps.sink_image, "taehv", first_frame=comps.sink_mode == "first_frame")
     floor = meta["taehv_floors"]["sink"]["max"]
