@@ -252,3 +252,20 @@ def test_real_pack_loads_strict_bf16():
     assert params and all(v.dtype == mx.bfloat16 for _, v in params)
     shapes = [tuple(l.conv.weight.shape) for l in m.core.decoder if isinstance(l, mt.TGrow)]
     assert shapes == [(256, 1, 1, 256), (256, 1, 1, 128), (128, 1, 1, 64)]
+
+
+@pytest.mark.needs_weights
+def test_real_decoder8_bf16_conv_matches_torch_bf16():
+    """Regression: decoder.8 (3x3, 256->128 at 120x216) through the MLX Metal bf16 conv2d kernel was 3e-2 rel L2 off
+    fp64 (torch CPU bf16: 1.7e-3); TAEHV convs now accumulate in float32 and round once, like torch."""
+    from tests.conftest import rel_l2
+    m = mt.TAEHV.from_pack(weights_dir() / "taehv.safetensors")
+    layer = m.core.decoder[8]
+    assert isinstance(layer, mt.Conv2d) and tuple(layer.weight.shape) == (128, 3, 3, 256)
+    x = torch.from_numpy(np.random.default_rng(0).standard_normal((1, 256, 120, 216), dtype=np.float32)).to(torch.bfloat16)
+    w = torch.from_numpy(np.array(layer.weight.astype(mx.float32)).transpose(0, 3, 1, 2)).to(torch.bfloat16)
+    want = torch.nn.functional.conv2d(x, w, padding=1).float().numpy()                 # native torch CPU bf16
+    got = layer(mx.array(x.float().numpy()).astype(mx.bfloat16).transpose(0, 2, 3, 1))
+    assert got.dtype == mx.bfloat16
+    err = rel_l2(np.array(got.astype(mx.float32)).transpose(0, 3, 1, 2), want)
+    assert err < 1e-3, err

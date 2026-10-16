@@ -17,8 +17,24 @@ import mlx.nn as nn
 TWorkItem = namedtuple("TWorkItem", ("input_tensor", "block_index"))
 
 
+class Conv2d(nn.Conv2d):
+    """nn.Conv2d (NHWC) that accumulates in float32 and rounds the output once to the activation dtype.
+
+    MLX framework constraint: some Metal bf16 conv2d kernel paths lose precision (decoder.8, 256->128 3x3 at
+    120x216: 3e-2 rel L2 vs fp64, where torch CPU bf16 is 1.7e-3). Upcasting input and weight to float32, adding the
+    bias in float32 and rounding the output reproduces torch's fp32-accumulate-then-round bf16 convolution. Parameters
+    keep their dtype (bf16 in the realtime preset); float32 activations are unaffected."""
+
+    def __call__(self, x):
+        y = mx.conv2d(x.astype(mx.float32), self.weight.astype(mx.float32), self.stride, self.padding, self.dilation,
+                      self.groups)
+        if "bias" in self:
+            y = y + self.bias.astype(mx.float32)
+        return y.astype(x.dtype)
+
+
 def conv(n_in, n_out, **kwargs):
-    return nn.Conv2d(n_in, n_out, 3, padding=1, **kwargs)
+    return Conv2d(n_in, n_out, 3, padding=1, **kwargs)
 
 
 def pixel_unshuffle(x, r):
@@ -61,7 +77,7 @@ class MemBlock(nn.Module):
     def __init__(self, n_in, n_out):
         super().__init__()
         self.conv = [conv(n_in * 2, n_out), nn.ReLU(), conv(n_out, n_out), nn.ReLU(), conv(n_out, n_out)]
-        self.skip = nn.Conv2d(n_in, n_out, 1, bias=False) if n_in != n_out else nn.Identity()
+        self.skip = Conv2d(n_in, n_out, 1, bias=False) if n_in != n_out else nn.Identity()
         self.act = nn.ReLU()
 
     def __call__(self, x, past):
@@ -75,7 +91,7 @@ class TPool(nn.Module):
     def __init__(self, n_f, stride):
         super().__init__()
         self.stride = stride
-        self.conv = nn.Conv2d(n_f * stride, n_f, 1, bias=False)
+        self.conv = Conv2d(n_f * stride, n_f, 1, bias=False)
 
     def __call__(self, x):
         # torch x.reshape(-1, stride*C, H, W) folds consecutive frames as [frame0 C | frame1 C]
@@ -88,7 +104,7 @@ class TGrow(nn.Module):
     def __init__(self, n_f, stride):
         super().__init__()
         self.stride = stride
-        self.conv = nn.Conv2d(n_f, n_f * stride, 1, bias=False)
+        self.conv = Conv2d(n_f, n_f * stride, 1, bias=False)
 
     def __call__(self, x):
         # inverse of TPool: split the stride*C output channels into (stride, C) consecutive frames
