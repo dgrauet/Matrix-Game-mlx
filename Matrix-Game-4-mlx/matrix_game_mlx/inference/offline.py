@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import time
 
-from matrix_game_mlx.scenes import SCENES
+from matrix_game_mlx.scenes import add_model_arguments, resolve_model_arguments, SCENES
 
 
 def frame_blocks(reader):
@@ -29,14 +29,14 @@ def frame_blocks(reader):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scene", choices=tuple(SCENES), default="ancient-egypt")
-    parser.add_argument("--preset", choices=("quality", "realtime"), default="quality")
-    parser.add_argument("--sink-image", type=Path, help="Override the scene sink image")
+    add_model_arguments(parser)
+    parser.set_defaults(preset="quality")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--input", type=Path, help="Clean low-poly RGB video")
     source.add_argument("--take", type=Path, help="Completed game recording directory")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--captions", type=Path, help="Dynamic mode: JSONL with one frame_start/frame_end/prompt record per chunk")
     args = parser.parse_args(argv)
     if args.output.exists():
         parser.error("Output directory already exists")
@@ -51,8 +51,14 @@ def main(argv=None):
         if scene not in SCENES or manifest.get("prompt") != SCENES[scene]["prompt"]:
             parser.error("Recording scene/prompt does not match release profiles")
         args.scene, args.input = scene, args.take / "reference.mkv"
-    if args.sink_image is not None and not args.sink_image.is_file():
-        raise FileNotFoundError(f"Missing resources:\n{args.sink_image}")
+    try:
+        resolve_model_arguments(args)
+    except (ValueError, FileNotFoundError) as exc:
+        parser.error(str(exc))
+    if args.prompt_mode == "dynamic" and args.captions is None:
+        parser.error("Offline dynamic mode requires --captions; an RGB video alone contains no engine captions")
+    if args.prompt_mode != "dynamic" and args.captions is not None:
+        parser.error("--captions requires --prompt-mode dynamic")
     import imageio_ffmpeg
     import mlx.core as mx
     import numpy as np
@@ -61,18 +67,19 @@ def main(argv=None):
     from .preprocessing import crop_and_resize, frames_to_tensor, tensor_to_uint8
 
     reader = imageio_ffmpeg.read_frames(str(args.input), pix_fmt="rgb24")
-    writer = stream = None
+    writer = stream = caption_file = None
     try:
         info = next(reader)
         width, height = info["size"]
         fps = info["fps"]
         if manifest and ((width, height) != (manifest["width"], manifest["height"]) or abs(fps - manifest["fps"]) > .001):
             raise ValueError("Recording dimensions or FPS differ from manifest")
-        from matrix_game_mlx.scenes import model_args
-        sink = ["--sink-image", str(args.sink_image)] if args.sink_image is not None else []
-        components = ModelComponents(model_args(args.scene, args.preset, sink))
+        components = ModelComponents(args)
         components.load()
         stream = components.stream(seed=args.seed)
+        if args.captions:
+            caption_file = args.captions.open()
+        current_prompt = args.prompt
         args.output.mkdir(parents=True)
         partial = args.output / "rendered.partial.mp4"
         writer = imageio_ffmpeg.write_frames(str(partial), (864, 480), fps=fps, codec="libx264",
@@ -82,6 +89,16 @@ def main(argv=None):
         written, padded, chunks = 0, 0, 0
         started = time.perf_counter()
         for index, (raw, valid) in enumerate(frame_blocks(reader)):
+            if caption_file is not None:
+                record = json.loads(caption_file.readline())
+                if record.get("frame_start") != written or record.get("frame_end") != written + valid - 1:
+                    raise ValueError("Caption ranges must match consecutive decoded RGB chunks")
+                candidate = record.get("prompt")
+                if not isinstance(candidate, str) or not candidate.strip() or len(candidate) > 8192:
+                    raise ValueError("Invalid caption")
+                if index % args.prompt_interval_chunks == 0 and candidate != current_prompt:
+                    stream.set_prompt(components.caption_encoder(candidate))
+                    current_prompt = candidate
             frames = [crop_and_resize(Image.fromarray(np.frombuffer(r, np.uint8).reshape(height, width, 3)), 480, 864) for r in raw]
             result = stream.push(frames_to_tensor(frames), frame_start=written)
             rgb = tensor_to_uint8(result.pixels)[:valid]
@@ -96,6 +113,8 @@ def main(argv=None):
                 print(f"{written} frames | {written / (time.perf_counter() - started):.2f} processing FPS", flush=True)
         if written == 0 or (manifest and written != manifest["frames"]):
             raise ValueError("Input frame count differs from recording manifest")
+        if caption_file is not None and caption_file.read().strip():
+            raise ValueError("Caption file extends beyond the input video")
         writer.close()
         writer = None
         # Never label a truncated encoder output as a completed rendering.
@@ -121,6 +140,8 @@ def main(argv=None):
             writer.close()
         if stream is not None:
             stream.close()
+        if caption_file is not None:
+            caption_file.close()
 
 
 if __name__ == "__main__":
