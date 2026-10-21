@@ -23,6 +23,12 @@ def pack_dir(components=None) -> Path:
     return Path(snapshot_download(PACK_REPO_ID, revision=PACK_REVISION, allow_patterns=["*.json", "*.png", *weights]))
 
 
+def scene_sink_image(scene: str) -> Path:
+    """Pack sink image path for `scene`, read from the pack's config.json (no weights are downloaded)."""
+    pack = pack_dir(())
+    return pack / json.loads((pack / "config.json").read_text())["scenes"][scene]["sink_image"]
+
+
 def sha256_file(path: Path) -> str:
     """Hex sha256 of a file, read in 16 MiB blocks."""
     h = hashlib.sha256()
