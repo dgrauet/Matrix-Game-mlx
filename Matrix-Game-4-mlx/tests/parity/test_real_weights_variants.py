@@ -11,8 +11,9 @@ run did on the upstream stream.
 Gated chunks (gen_fixtures.gated_chunks): the first denoised chunk (chunk 0, or chunk 1 for racing with a sink, whose
 chunk 0 is the sink latent itself: no denoising, pred bitwise the sink), plus switch_chunk for switch variants. Per
 gated chunk, by the standing floor method (floor measured per configuration, gen_fixtures.variant_floor):
-control and layer 0 / 29 K cache rel L2 < ceil_1sig(1.5 x floor) (control floor: meta.json floor.control_rel_l2; K
-floor: floor_chunk_i.npz vs the fixture), pred rel L2 < max(2e-2, 1.5 x floor), decoded PSNR > 35 dB. The other
+control and layer 0 / 29 K cache rel L2 < max(2e-2, ceil_1sig(1.5 x floor)) (control floor: meta.json
+floor.control_rel_l2; K floor: floor_chunk_i.npz vs the fixture), pred rel L2 < max(2e-2, 1.5 x floor), decoded PSNR
+> 35 dB. The 2e-2 lower bound is the realtime suite's flat spec threshold (a floor-derived gate never goes below it). The other
 chunks are reported (-s). Every chunk's denoising-call count must match torch's and gen_fixtures.variant_steps.
 
 One variant's MLX components are held at a time (module-scoped `loaded`).
@@ -112,7 +113,7 @@ def _tolerances(meta: dict, floor: dict, ref, i: int) -> dict:
     f = dict(control=meta["floor"]["control_rel_l2"][i], pred=rel_l2(floor["pred"], ref[f"pred_{i}"]),
              kv_k_layer0=rel_l2(floor["kv_k_layer0"], ref[f"kv_k_layer0_{i}"]),
              kv_k_layer29=rel_l2(floor["kv_k_layer29"], ref[f"kv_k_layer29_{i}"]))
-    tol = {k: ceil_1sig(1.5 * f[k]) for k in ("control", "kv_k_layer0", "kv_k_layer29")}
+    tol = {k: max(2e-2, ceil_1sig(1.5 * f[k])) for k in ("control", "kv_k_layer0", "kv_k_layer29")}
     tol["pred"] = max(2e-2, 1.5 * f["pred"])
     return f, tol
 
