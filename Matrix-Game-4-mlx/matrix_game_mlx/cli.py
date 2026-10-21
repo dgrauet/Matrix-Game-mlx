@@ -1,0 +1,23 @@
+"""CLI imports only the dependencies required by the selected workflow."""
+import argparse
+import sys
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="matrix-game-mlx", description="Matrix-Game 4.0 (MLX port)")
+    parser.add_argument("command", choices=("serve", "render", "download", "verify"))
+    parser.add_argument("arguments", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
+    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+    rest = args.arguments
+    if args.command == "serve":
+        raise SystemExit("matrix-game-mlx serve: not ported yet")
+    elif args.command == "render":
+        from .inference.offline import main as run
+    else:
+        from .resources import main as run
+        rest = [args.command] + rest
+    run(rest)
+
+
+if __name__ == "__main__":
+    main()

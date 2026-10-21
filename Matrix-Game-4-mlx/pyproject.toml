@@ -6,8 +6,14 @@ requires-python = ">=3.11"
 dependencies = ["mlx>=0.31.0", "numpy", "Pillow", "imageio-ffmpeg", "huggingface_hub",
                 "safetensors", "tokenizers", "transformers", "ftfy", "regex"]
 
+[project.scripts]
+matrix-game-mlx = "matrix_game_mlx.cli:main"
+
 [project.optional-dependencies]
 parity = ["torch", "diffusers", "einops"]
+
+[tool.setuptools.packages.find]
+include = ["matrix_game_mlx*"]
 
 [tool.setuptools.package-data]
 matrix_game_mlx = ["configs/*.json"]
