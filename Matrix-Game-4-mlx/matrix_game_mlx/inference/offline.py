@@ -68,7 +68,9 @@ def main(argv=None):
         fps = info["fps"]
         if manifest and ((width, height) != (manifest["width"], manifest["height"]) or abs(fps - manifest["fps"]) > .001):
             raise ValueError("Recording dimensions or FPS differ from manifest")
-        components = ModelComponents(args.scene, args.preset, args.sink_image)
+        from matrix_game_mlx.scenes import model_args
+        sink = ["--sink-image", str(args.sink_image)] if args.sink_image is not None else []
+        components = ModelComponents(model_args(args.scene, args.preset, sink))
         components.load()
         stream = components.stream(seed=args.seed)
         args.output.mkdir(parents=True)

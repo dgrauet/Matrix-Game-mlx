@@ -67,8 +67,8 @@ def test_take_resolves_scene_from_manifest(tmp_path, monkeypatch, fields, scene)
     (take / "session.json").write_text(json.dumps(manifest))
     seen = {}
 
-    def fake(scene_name, *a, **k):
-        seen["scene"] = scene_name
+    def fake(args, *a, **k):
+        seen["scene"] = args.scene
         raise RuntimeError("stop")
     monkeypatch.setattr(loader, "ModelComponents", fake)
     import imageio_ffmpeg
@@ -111,8 +111,8 @@ def test_preset_option(monkeypatch, tmp_path):
     from matrix_game_mlx.inference import loader
     seen = []
 
-    def fake(scene, preset, *a, **k):
-        seen.append(preset)
+    def fake(args, *a, **k):
+        seen.append(args.preset)
         raise RuntimeError("stop")
     monkeypatch.setattr(loader, "ModelComponents", fake)
     import imageio_ffmpeg

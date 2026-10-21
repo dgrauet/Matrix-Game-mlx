@@ -165,8 +165,9 @@ def test_unknown_backend_raises(tmp_path):
 def test_model_components_stream_smoke():
     import numpy as np
     from matrix_game_mlx.inference.loader import ModelComponents
+    from matrix_game_mlx.scenes import model_args
 
-    components = ModelComponents("ancient-egypt")
+    components = ModelComponents(model_args("ancient-egypt", "quality"))
     components.load()
     stream = components.stream()
     frame = 0
@@ -184,8 +185,9 @@ def test_model_components_stream_smoke():
 @pytest.mark.needs_weights
 def test_model_components_realtime_stream_smoke():
     from matrix_game_mlx.inference.loader import ModelComponents
+    from matrix_game_mlx.scenes import model_args
 
-    components = ModelComponents("ancient-egypt", "realtime")
+    components = ModelComponents(model_args("ancient-egypt", "realtime"))
     components.load()
     stream = components.stream()
     frame = 0

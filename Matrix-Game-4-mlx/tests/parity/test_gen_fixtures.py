@@ -144,9 +144,10 @@ def test_realtime_steps_match_pack_config():
     if weights_dir() is None:
         pytest.skip("MATRIX_GAME_4_MLX_WEIGHTS_DIR not set")
     from matrix_game_mlx.inference.loader import ModelComponents
+    from matrix_game_mlx.scenes import model_args
     for scene in ("ancient-egypt", "castle", "racing"):
-        comps = ModelComponents(scene, "realtime", pack=weights_dir())
-        assert (comps.steps, comps.vae_backend) == (PRESET_SPECS["realtime"].steps, "taehv")
+        comps = ModelComponents(model_args(scene, "realtime"), pack=weights_dir())
+        assert (comps.args.steps, comps.args.vae_backend) == (PRESET_SPECS["realtime"].steps, "taehv")
 
 
 def test_generation_command():
