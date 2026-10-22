@@ -819,6 +819,18 @@ def _torch_run(args, spec, out, meta, prompt, pixels, noises, renoises):
     return sink
 
 
+def wan_control_floor(torch, vae, pixels: list, fixture_device: str) -> tuple:
+    """Control floor of the Wan codec: the same streaming encoder (fresh caches, cpu_bf16_emulation) on the other VAE
+    device than the fixture's (the vae is moved there). Returns ([control_i float32], description)."""
+    from matrix_game.inference.wan.modules.vae2_2 import count_conv3d
+    control_device = "cpu" if fixture_device == "mps" else "mps"
+    vae = vae.to(control_device)
+    feats = [None] * count_conv3d(vae.model.encoder)
+    with cpu_bf16_emulation(torch):
+        controls = [stream_encode(torch, vae, px, feats).float().cpu().numpy() for px in pixels]
+    return controls, f"torch streaming VAE encoder on {control_device} (fixture: {fixture_device})"
+
+
 def floor_reference(out: Path) -> None:
     """Torch-vs-torch floor for the 3-chunk set, from the saved inputs (main fixtures are not touched).
 
@@ -866,14 +878,9 @@ def floor_reference(out: Path) -> None:
         dit_variant="native bf16 CPU SDPA (cpu_bf16_emulation(sdpa=False)); everything else as the fixture run",
         chunks=n_chunks)
     if preset.vae_backend == "wan":
-        from matrix_game.inference.wan.modules.vae2_2 import count_conv3d
-        control_device = "cpu" if meta["device_vae"] == "mps" else "mps"
-        vae = vae.to(control_device)
-        feats = [None] * count_conv3d(vae.model.encoder)
-        with cpu_bf16_emulation(torch):
-            for i in range(n_chunks):
-                floors[i]["control"] = stream_encode(torch, vae, pixels[i], feats).float().cpu().numpy()
-        meta["floor"]["control_variant"] = f"torch streaming VAE encoder on {control_device} (fixture: {meta['device_vae']})"
+        controls, meta["floor"]["control_variant"] = wan_control_floor(torch, vae, pixels, meta["device_vae"])
+        for i, control in enumerate(controls):
+            floors[i]["control"] = control
     else:
         meta["floor"]["control_variant"] = "none here: TAEHV floors in meta.json taehv_floors"
     for i, tensors in enumerate(floors):
@@ -901,6 +908,26 @@ def taehv_sequence(torch, taehv, spec: SceneSpec, pixels: list, preds: list) -> 
         out[f"decoded_{i}"] = out_np(taehv.decode_stream(z).sample[0].permute(1, 0, 2, 3))
     taehv.clear_cache()
     return out
+
+
+def taehv_variant_sequences(torch, spec: SceneSpec, pixels: list, preds: list) -> dict:
+    """taehv_sequence with each torch TAEHV floor variant (TAEHV_VARIANTS: fp32 CPU, bf16 MPS when available; an MPS
+    failure only drops that variant). Returns {variant: sequence}."""
+    variants = {}
+    for name in TAEHV_VARIANTS:
+        device, dtype = {"fp32_cpu": ("cpu", torch.float32), "bf16_mps": ("mps", torch.bfloat16)}[name]
+        if device == "mps" and not torch.backends.mps.is_available():
+            log("TAEHV floor: MPS unavailable, bf16_mps variant skipped")
+            continue
+        try:
+            variants[name] = taehv_sequence(torch, load_taehv(torch, device, dtype), spec, pixels, preds)
+        except Exception as exc:  # noqa: BLE001 - an MPS failure only drops that variant
+            if device != "mps":
+                raise
+            log(f"TAEHV floor: bf16_mps failed ({type(exc).__name__}: {exc}); variant skipped")
+            continue
+        log(f"TAEHV floor variant {name} done")
+    return variants
 
 
 def taehv_fixtures(out: Path) -> None:
@@ -931,20 +958,7 @@ def taehv_fixtures(out: Path) -> None:
                                f"(rel L2 {rel_l2(ref[key], want):.3e})")
     np.savez_compressed(out / "taehv_calls.npz", **{k: v for k, v in ref.items() if k != "sink"})
     log(f"TAEHV reference calls reproduce the end-to-end run ({time.perf_counter() - t0:.1f}s)")
-    variants = {}
-    for name in TAEHV_VARIANTS:
-        device, dtype = {"fp32_cpu": ("cpu", torch.float32), "bf16_mps": ("mps", torch.bfloat16)}[name]
-        if device == "mps" and not torch.backends.mps.is_available():
-            log("TAEHV floor: MPS unavailable, bf16_mps variant skipped")
-            continue
-        try:
-            variants[name] = taehv_sequence(torch, load_taehv(torch, device, dtype), spec, pixels, preds)
-        except Exception as exc:  # noqa: BLE001 - an MPS failure only drops that variant
-            if device != "mps":
-                raise
-            log(f"TAEHV floor: bf16_mps failed ({type(exc).__name__}: {exc}); variant skipped")
-            continue
-        log(f"TAEHV floor variant {name} done")
+    variants = taehv_variant_sequences(torch, spec, pixels, preds)
     np.savez_compressed(out / "taehv_floor.npz", **{f"{v}_{k}": a for v, d in variants.items() for k, a in d.items()})
     summary = lambda key, with_psnr=False: taehv_floor_summary(  # noqa: E731
         ref[key], {v: d[key] for v, d in variants.items()}, with_psnr)
@@ -1355,30 +1369,14 @@ def variant_floor(out: Path) -> None:
         chunks=n_chunks)
     px = [inputs[f"pixels_{i}"] for i in range(n_chunks)]
     if v.vae_backend == "wan":
-        from matrix_game.inference.wan.modules.vae2_2 import count_conv3d
-        control_device = "cpu" if meta["device_vae"] == "mps" else "mps"
-        vae = vae.to(control_device)
-        feats = [None] * count_conv3d(vae.model.encoder)
-        with cpu_bf16_emulation(torch):
-            for i in range(n_chunks):
-                floors[i]["control"] = stream_encode(torch, vae, px[i], feats).float().cpu().numpy()
-        meta["floor"]["control_variant"] = f"torch streaming VAE encoder on {control_device} (fixture: {meta['device_vae']})"
+        controls, meta["floor"]["control_variant"] = wan_control_floor(torch, vae, px, meta["device_vae"])
+        for i, control in enumerate(controls):
+            floors[i]["control"] = control
         meta["floor"]["control_rel_l2"] = [rel_l2(floors[i]["control"], chunks[f"control_{i}"]) for i in range(n_chunks)]
     else:
         del vae, bridge
         gc.collect()
-        variants = {}
-        for name in TAEHV_VARIANTS:
-            device, dtype = {"fp32_cpu": ("cpu", torch.float32), "bf16_mps": ("mps", torch.bfloat16)}[name]
-            if device == "mps" and not torch.backends.mps.is_available():
-                log("TAEHV control floor: MPS unavailable, bf16_mps variant skipped")
-                continue
-            try:
-                variants[name] = taehv_sequence(torch, load_taehv(torch, device, dtype), spec, px, [])
-            except Exception as exc:  # noqa: BLE001 - an MPS failure only drops that variant
-                if device != "mps":
-                    raise
-                log(f"TAEHV control floor: bf16_mps failed ({type(exc).__name__}: {exc}); variant skipped")
+        variants = taehv_variant_sequences(torch, spec, px, [])
         meta["floor"]["control_variant"] = f"torch TAEHV streaming encode, variants {sorted(variants)} (max rel L2)"
         meta["floor"]["control_rel_l2"] = [taehv_floor_summary(chunks[f"control_{i}"],
                                                                {k: d[f"control_{i}"] for k, d in variants.items()})["max"]
