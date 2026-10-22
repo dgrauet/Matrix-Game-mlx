@@ -33,6 +33,8 @@ Start with the [v4 README](Matrix-Game-4/README.md) for installation, resource
 downloads, offline rendering and the online browser demo. The release includes
 the three native games and shared single-GPU inference code.
 
+An MLX port for Apple Silicon is in [Matrix-Game-4-mlx](Matrix-Game-4-mlx) (`matrix-game-mlx render|download|verify`).
+
 | Scene | Model Weights |
 | --- | --- |
 | Medieval Castle | [fps-castle](https://huggingface.co/Skywork/Matrix-Game-4.0/tree/main/fps-castle) |
