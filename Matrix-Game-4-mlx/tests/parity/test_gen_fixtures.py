@@ -1,5 +1,6 @@
 """Cheap checks of the fixture generator's helpers (no weights, no model build)."""
 import importlib.util
+import json
 import sys
 
 import numpy as np
@@ -138,8 +139,9 @@ def test_realtime_preset_spec():
     assert n_denoising_calls(SCENE_SPECS["castle"], 0, realtime.steps) == 1
 
 
-def test_realtime_steps_match_pack_config():
-    """The generator's realtime steps are the pack's inference.json realtime_steps (what ModelComponents uses)."""
+def test_realtime_steps_match_cli_resolution():
+    """The generator's realtime preset (steps, codec) equals what the CLI's preset resolution gives for every scene;
+    when the pack's inference.json carries realtime_steps / quality_steps, they must equal the resolved defaults."""
     from tests.conftest import weights_dir
     from tests.parity.gen_fixtures import PRESET_SPECS
     if weights_dir() is None:
@@ -149,6 +151,10 @@ def test_realtime_steps_match_pack_config():
     for scene in ("ancient-egypt", "castle", "racing"):
         comps = ModelComponents(model_args(scene, "realtime"), pack=weights_dir())
         assert (comps.args.steps, comps.args.vae_backend) == (PRESET_SPECS["realtime"].steps, "taehv")
+        inference = json.loads((weights_dir() / comps.entry["inference"]).read_text())
+        for key, preset in (("realtime_steps", "realtime"), ("quality_steps", "quality")):
+            if key in inference:
+                assert tuple(inference[key]) == model_args(scene, preset).steps, key
 
 
 def test_generation_command():

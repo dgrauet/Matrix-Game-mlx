@@ -76,9 +76,9 @@ max(2e-2, 1.5 x the torch floor of the chunk), since with one step torch against
 matrix_game_mlx/
   scenes.py                      # scene profiles (prompts, sink policy), model-loading parts only
   configs/                       # ancient-egypt.json, castle.json, racing.json (scene name and prompt)
+  cli.py                         # `matrix-game-mlx` console script: render, download, verify (serve not ported)
   inference/
     offline.py                   # `render`: --input clip | --take recording -> rendered.mp4 + render.json; dynamic captions
-  cli.py                         # `matrix-game-mlx` console script: render, download, verify (serve not ported)
     loader.py                    # ModelComponents: pack dir, pinned shared MG3 files (sha256), T5 -> DiT -> VAE
     loading.py                   # strict DiT build from the mlx-forge pack
     stream.py                    # CastleStream: sink priming, chunk push (1-2 denoising calls per preset + cache update)

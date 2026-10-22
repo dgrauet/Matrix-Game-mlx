@@ -26,6 +26,6 @@ def test_dynamic_render_smoke(tmp_path):
     assert rep["prompt_mode"] == "dynamic" and rep["status"] == "complete"
     assert rep["frames"] == 9
     assert rep["peak_memory_gb"] < 30
-    frames = sum(1 for _ in imageio_ffmpeg.read_frames(str(out / "rendered.mp4")) if not isinstance(_, dict))
+    frames = sum(1 for f in imageio_ffmpeg.read_frames(str(out / "rendered.mp4")) if not isinstance(f, dict))
     assert frames == 9
     print("peak_memory_gb", rep["peak_memory_gb"])

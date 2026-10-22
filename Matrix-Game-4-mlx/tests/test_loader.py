@@ -136,7 +136,7 @@ def test_codec_follows_vae_backend(tmp_path, monkeypatch):
     with pytest.raises(Stop):
         m.load()
     assert calls == [(), ("dit_castle", "taehv")] and shared == [("t5_encoder",)]
-    calls.clear(); shared.clear()
+    shared.clear()
     args = model_args("castle", "realtime", ["--vae-backend", "wan"])
     calls.clear()
     m = loader.ModelComponents(args)

@@ -8,6 +8,7 @@ from typing import Dict
 from huggingface_hub import hf_hub_download, snapshot_download
 
 PACK_REPO_ID = "dgrauet/matrix-game-4.0-mlx"
+WEIGHTS_ENV = "MATRIX_GAME_4_MLX_WEIGHTS_DIR"
 PACK_REVISION = "327ce1f7ae729224ba37b0326fbf0eb4f79e0503"
 
 
@@ -16,7 +17,7 @@ def pack_dir(components=None) -> Path:
 
     From the Hub, the small files (json configs, sink images) are always fetched, plus the `components` safetensors
     (e.g. ("dit_castle", "taehv")); default is every component. Downloads are cached by huggingface_hub."""
-    local = os.environ.get("MATRIX_GAME_4_MLX_WEIGHTS_DIR")
+    local = os.environ.get(WEIGHTS_ENV)
     if local:
         return Path(local)
     weights = ["*.safetensors"] if components is None else [f"{c}.safetensors" for c in components]
@@ -76,7 +77,8 @@ class ModelComponents:
         self.entry = self.cfg["scenes"][args.scene]
         self.component = self.entry["component"]
         self.gen = self.vae = self.prompt = None
-        self.sink_latent = self.sink_sha256 = self.attention_backend = None
+        self.sink_latent = self.sink_sha256 = None
+        self.attention_backend = "mlx-sdpa"
         self.caption_encoder = None
         self._fetch_weights = pack is None
 
@@ -91,7 +93,6 @@ class ModelComponents:
         taehv = args.vae_backend == "taehv"
         if self._fetch_weights:
             self.pack = pack_dir((self.component, "taehv") if taehv else (self.component,))
-        self.attention_backend = "mlx-sdpa"
         shared = resolve_shared_files(self.pack, ("t5_encoder",) if taehv else ("t5_encoder", "vae"))
         inference = json.loads((self.pack / self.entry["inference"]).read_text())
         text = WanTextEncoder(str(shared["t5_encoder.safetensors"]), str(shared["google/umt5-xxl"]))
@@ -135,6 +136,6 @@ class ModelComponents:
                     prompt=a.prompt, hq_first_frame=a.sink_mode == "first_frame" and a.sink_image is not None,
                     prompt_mode=a.prompt_mode, prompt_interval_chunks=a.prompt_interval_chunks,
                     t5_runtime=a.t5_runtime, dit_parallel="single", dit_runtime=a.dit_runtime,
-                    attention_backend=self.attention_backend or "mlx-sdpa", vae_graph=False, early_publish=False,
+                    attention_backend=self.attention_backend, vae_graph=False, early_publish=False,
                     profile_chunks=False, reference_pipeline="stream", experimental_runtime=False,
                     preset=a.preset, component=self.component)

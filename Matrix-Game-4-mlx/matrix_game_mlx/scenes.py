@@ -4,13 +4,14 @@ import json
 import os
 from pathlib import Path
 
+from matrix_game_mlx.inference.loader import WEIGHTS_ENV
+
 SCENES = {
     name: json.loads((Path(__file__).parent / "configs" / (name + ".json")).read_text())
     for name in ("castle", "ancient-egypt", "racing")
 }
 
 OPTIMIZED_RUNTIMES = ("rtx5090", "rtx5090-sage")
-WEIGHTS_ENV = "MATRIX_GAME_4_MLX_WEIGHTS_DIR"
 
 
 def scene_sink_policy(scene: str) -> tuple:

@@ -2,7 +2,20 @@ import json
 
 import pytest
 
+from matrix_game_mlx import scenes
 from matrix_game_mlx.inference.offline import frame_blocks, main
+
+
+@pytest.fixture(autouse=True)
+def fake_pack(tmp_path_factory, monkeypatch):
+    """Offline pack holding only config.json; pack_dir never hits the Hub (nor a local pack)."""
+    pack = tmp_path_factory.mktemp("pack")
+    cfg = {"scenes": {s: {"component": f"dit_{s}", "inference": f"{s}.json", "sink_image": f"{s}_sink.png"}
+                      for s in scenes.SCENES}}
+    (pack / "config.json").write_text(json.dumps(cfg))
+    monkeypatch.delenv("MATRIX_GAME_4_MLX_WEIGHTS_DIR", raising=False)
+    monkeypatch.setattr("matrix_game_mlx.inference.loader.pack_dir", lambda components=None: pack)
+    return pack
 
 
 @pytest.mark.parametrize("n,expected", [(1, [(1, 1)]), (2, [(1, 1), (4, 1)]), (5, [(1, 1), (4, 4)]),

@@ -1043,7 +1043,7 @@ def realtime_main(args, spec: SceneSpec, out: Path) -> None:
 # Variants: prompt switch, no sink, free codec / step composition (realtime layout, 3 chunks), and captions.
 
 PROMPT_B = ("a racing game on a rainy city street at night, neon reflections on wet asphalt, realistic AAA game "
-            "rendering")                 # first caption of tests/data/racing_captions.jsonl (Task 7 data path)
+            "rendering")                 # third record (chunk 2) of tests/data/racing_captions.jsonl
 VARIANT_CHUNKS = 3
 VARIANT_NOISE_SEED, VARIANT_RENOISE_SEED = 1234, 5678
 CAPTION_FLOOR_VARIANTS = ("fp32", "fp64_acc")

@@ -51,14 +51,16 @@ The offline default preset is `quality`, as upstream's offline renderer. Weights
 | `--preset {rtx5090,rtx5090-sage}` | Rejected: CUDA-only presets |
 | `--vae-backend {wan,taehv}` | Supported (default from the preset: `taehv` for realtime, `wan` otherwise) |
 | `--dit-runtime native` | Supported (the only runtime) |
-| `--dit-runtime` other values (ring, fused, cudagraph) | Rejected: CUDA-only; the MLX port runs `native` only |
+| `--dit-runtime` other values (`kernels`, `cudagraph`, `ring`, `ring-graph`, `ring-fused`, `rtx5090`, `rtx5090-sage`) | Rejected: CUDA-only; the MLX port runs `native` only |
 | `--steps`, `--first-steps` | Supported (comma-separated timesteps, strictly decreasing from 1000) |
 | `--vae-graph` | Rejected: CUDA graphs, not available on MLX |
+| `--no-vae-graph` | Accepted, no effect (VAE graphs are never used on MLX) |
 | `--prompt-mode {fixed,dynamic}`, `--prompt`, `--prompt-interval-chunks` | Supported; dynamic is racing only (see below) |
 | `--captions FILE` | Supported, dynamic mode only (required there) |
 | `--t5-runtime {native,graph}` | Accepted; `graph` behaves as `native` (no CUDA graphs) |
 | `--sink-image PATH`, `--no-sink-image` | Supported (mutually exclusive) |
-| `--resources DIR` | Supported (scene resources, see `download`) |
+| `--resources DIR` | Accepted; `render` does not read weights or the sink image from it (those come from the MLX pack). It sets the game-asset root and is the default `download --resources` target |
+| `--asset-root DIR` | Accepted: overrides the game-asset root derived from `--resources`; `render` does not read it |
 | `--input CLIP` / `--take DIR`, `--output DIR`, `--seed N` | Supported |
 | `--model-dir`, `--checkpoint`, `--taehv-path` | Rejected: weights come only from the MLX pack (`MATRIX_GAME_4_MLX_WEIGHTS_DIR` selects a local pack) |
 
