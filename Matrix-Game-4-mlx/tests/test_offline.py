@@ -7,8 +7,11 @@ from matrix_game_mlx.inference.offline import frame_blocks, main
 
 
 @pytest.fixture(autouse=True)
-def fake_pack(tmp_path_factory, monkeypatch):
-    """Offline pack holding only config.json; pack_dir never hits the Hub (nor a local pack)."""
+def fake_pack(request, tmp_path_factory, monkeypatch):
+    """Offline pack holding only config.json; pack_dir never hits the Hub (nor a local pack).
+    needs_weights tests use the real pack and are left untouched."""
+    if request.node.get_closest_marker("needs_weights"):
+        return None
     pack = tmp_path_factory.mktemp("pack")
     cfg = {"scenes": {s: {"component": f"dit_{s}", "inference": f"{s}.json", "sink_image": f"{s}_sink.png"}
                       for s in scenes.SCENES}}
