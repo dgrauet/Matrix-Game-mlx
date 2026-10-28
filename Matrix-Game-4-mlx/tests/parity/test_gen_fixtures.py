@@ -219,11 +219,13 @@ VARIANTS = {
     "racing_nosink_realtime": ("racing", "taehv", (1000,), (1000,), False, None),
     "castle_taehv_2step": ("castle", "taehv", (1000, 500), (1000, 500), True, None),
     "egypt_wan_custom_first": ("ancient-egypt", "wan", (1000,), (1000, 750, 500, 250), True, None),
+    "racing_take_realtime": ("racing", "taehv", (1000,), (1000,), True, None),
+    "racing_take_quality": ("racing", "wan", (1000, 500), (1000, 500), True, None),
 }
 
 
 def test_variant_specs():
-    """Exactly the six task variants, with their codec / steps / first steps / sink / prompt-switch chunk."""
+    """Exactly the registered variants, with their codec / steps / first steps / sink / prompt-switch chunk."""
     from tests.parity.gen_fixtures import VARIANT_SPECS
     assert set(VARIANT_SPECS) == set(VARIANTS)
     for name, (scene, backend, steps, first, sink, switch) in VARIANTS.items():
@@ -414,3 +416,20 @@ def test_run_variant_switches_prompt_and_serves_renoise():
     with pytest.raises(RuntimeError, match="not consumed"):
         run_variant(torch, egypt, _FakeStream(egypt, consume_renoise=False), pixels, *variant_noises(egypt), None,
                     lambda *a: None)
+
+
+def test_existing_variants_are_not_take_based():
+    from tests.parity.gen_fixtures import VARIANT_SPECS
+    assert {n for n, v in VARIANT_SPECS.items() if v.take} == {"racing_take_realtime", "racing_take_quality"}
+
+
+def test_take_frames_shape_and_range():
+    from tests import racing_game
+    from tests.parity.gen_fixtures import take_frames
+    take = racing_game.default_take()
+    if not (take / "reference.mkv").is_file():
+        pytest.skip(f"no scripted racing take at {take}")
+    frames = take_frames(take, 9)
+    assert frames.shape == (9, 3, 480, 864) and frames.dtype == np.float32
+    assert frames.min() >= -1.0 and frames.max() <= 1.0
+    assert not np.array_equal(frames[0], frames[8])     # the car is moving
