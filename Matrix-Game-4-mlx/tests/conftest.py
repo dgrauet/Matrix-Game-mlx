@@ -8,6 +8,8 @@ from typing import Optional
 import numpy as np
 import pytest
 
+from tests import racing_game
+
 MLX_ROOT = str(Path(__file__).resolve().parents[1])
 UPSTREAM_ROOT = str(Path(__file__).resolve().parents[2] / "Matrix-Game-4")
 for p in (MLX_ROOT, UPSTREAM_ROOT):
@@ -73,3 +75,5 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(pytest.mark.skip(reason="MATRIX_GAME_4_MLX_WEIGHTS_DIR not set"))
         if "needs_fixtures" in item.keywords and not fixtures_dir().is_dir():
             item.add_marker(pytest.mark.skip(reason="no torch fixtures in MG4_FIXTURES_DIR"))
+        if "needs_racing_game" in item.keywords and racing_game.racing_game_missing():
+            item.add_marker(pytest.mark.skip(reason=racing_game.racing_game_missing()))
