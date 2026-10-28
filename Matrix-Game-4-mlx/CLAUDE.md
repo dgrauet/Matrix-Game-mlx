@@ -103,7 +103,13 @@ tests/
   parity/test_real_weights_captions.py  # caption embeddings vs torch
   parity/test_gen_fixtures.py    # generator helper checks
   test_cli_smoke.py              # needs_weights: realtime dynamic render through the CLI (peak < 30 GB)
+  racing_game.py                 # helpers: locate/build-check/run the upstream racing game, scripted take (env MG4_RESOURCES, MG4_RACING_TAKE)
+  test_racing_game.py            # needs_racing_game: headless smoke of the built upstream game (free, race, pursuit)
+  test_racing_take.py            # scripted take: input script, complete and finalizable, reproducible
+  test_racing_take_render.py     # realtime and dynamic-caption renders of the take finalize; captions file matches the take (needs weights)
   data/racing_captions.jsonl     # hand-made 9-frame captions (3 records)
+  data/racing/take_input_script.json  # scripted racing take inputs ({frame, key, down}; 720 frames at 48 FPS)
+  data/racing/take_captions.jsonl     # 9-frame offline captions for a racing take
 ```
 
 ## Tech Stack
@@ -115,6 +121,12 @@ Python 3.11+, MLX >= 0.31.0, NumPy, Pillow, imageio-ffmpeg, HuggingFace `tokeniz
 
 Fast suite: `python -m pytest -m "not needs_weights and not needs_fixtures"`. Variant fixtures: `python -m tests.parity.gen_fixtures --variant NAME` / `--captions-only` (`--print-variant-commands` lists them). CLI: `matrix-game-mlx render|download|verify`; quality + dynamic captions needs more than 32 GB (T5 resident).
 
+Racing game tests carry the marker `needs_racing_game` (built game in `../Matrix-Game-4/game/racing/bin`, assets under
+`$MG4_RESOURCES/racing`, default `../Matrix-Game-4/resources`; the recorded take is `$MG4_RACING_TAKE`, default
+`$MG4_RESOURCES/racing/captures/take-001`). Parity variants `racing_take_realtime` / `racing_take_quality`
+(`python -m tests.parity.gen_fixtures --variant NAME`) use the first 9 frames of that take (`VariantSpec.take`,
+`take_frames`); fixtures `$MG4_FIXTURES_DIR/racing_take_{realtime,quality}`. See README "City racing on macOS".
+
 Run from this directory: `/opt/homebrew/bin/python3.14 -m pytest tests -v` (the MLX/torch stack is
 installed for Homebrew Python 3.14)
 
@@ -125,7 +137,7 @@ installed for Homebrew Python 3.14)
 
 ## What NOT to Port
 
-- `serve` (the server, browser demo) and the game/interactive layers
+- `serve` (the server, browser demo); the game is upstream's native racing game, built and used as is (README "City racing on macOS")
 - `rtx5090*` files
 - Ring / fused / cudagraph runtimes (realtime uses the `native` DiT runtime) and the CUDA VAE graph
 - Training branches (teacher forcing, ctx slots, kv_mem, kv_capture, flex_attention masks,
