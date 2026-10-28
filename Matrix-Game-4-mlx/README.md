@@ -144,9 +144,11 @@ From `Matrix-Game-4/`:
 
 ```bash
 game/racing/bin/CitySampleBBoxGame --data-dir resources/racing                    # free drive
-game/racing/bin/CitySampleBBoxGame --data-dir resources/racing --race --hud       # time trial
+game/racing/bin/CitySampleBBoxGame --data-dir resources/racing --race --hud       # time trial (default route)
 game/racing/bin/CitySampleBBoxGame --data-dir resources/racing --pursuit --hud    # single-player pursuit
 ```
+
+`--race --route downtown|avenue|skyway` picks the time-trial route.
 
 W/S accelerate/reverse, A/D steer, Space applies the handbrake. P pauses a race, Enter resumes, and R
 requests recovery in a time trial (pursuit recovery is disabled).
@@ -180,11 +182,11 @@ python game/racing/tools/finalize-offline-demo.py captures/take-001 --check-only
 
 ### Render
 
-The scene comes from the take's `session.json`:
+Racing takes must be rendered with `--scene racing` (a racing take's `session.json` carries no scene key, so only shooter takes can omit it):
 
 ```bash
-matrix-game-mlx render --take ../Matrix-Game-4/captures/take-001 --preset realtime --output output/racing-take
-matrix-game-mlx render --take ../Matrix-Game-4/captures/take-001 --preset quality --output output/racing-take-quality
+matrix-game-mlx render --scene racing --take ../Matrix-Game-4/captures/take-001 --preset realtime --output output/racing-take
+matrix-game-mlx render --scene racing --take ../Matrix-Game-4/captures/take-001 --preset quality --output output/racing-take-quality
 ```
 
 Renders need the converted pack's `dit_racing.safetensors` (the Hub pack has it; a partial local cache may not).
@@ -200,11 +202,11 @@ Measured on an M2 Pro 32 GB with a 720-frame (15 s) take:
 Dynamic captions use `--prompt-mode dynamic --captions FILE` (see "Dynamic captions (racing)" above). The
 JSONL has one record per chunk, `{"frame_start", "frame_end", "prompt"}` with `frame_end` inclusive and
 zero-based: frame 0 alone, then consecutive groups of four, the last range possibly shorter. For a
-720-frame take that is frame 0, then 179 groups of four. A complete example for the first 9 frames is
-`tests/data/racing/take_captions.jsonl`:
+720-frame take that is frame 0, then 179 groups of four. A complete example (181 records, one
+per chunk of the 720-frame scripted take) is `tests/data/racing/take_captions.jsonl`:
 
 ```bash
-matrix-game-mlx render --take ../Matrix-Game-4/captures/take-001 --preset realtime --prompt-mode dynamic \
+matrix-game-mlx render --scene racing --take ../Matrix-Game-4/captures/take-001 --preset realtime --prompt-mode dynamic \
   --captions captions.jsonl --output output/racing-take-dynamic
 ```
 
@@ -221,7 +223,7 @@ python game/racing/tools/finalize-offline-demo.py captures/take-001 \
 ```
 
 `game/racing/tools/compose-demo.py` provides optional HUD relayout and input visualization (`--help` for
-options).
+options). Both tools, and the video handling of the finalizer, need `ffmpeg` on the PATH.
 
 ### Not ported
 
