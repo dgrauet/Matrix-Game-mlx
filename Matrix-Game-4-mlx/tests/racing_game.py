@@ -31,7 +31,7 @@ def download_command() -> str:
 
 
 def build_command() -> str:
-    """The game build command (README "Dependencies and build"); needs the assets first (ctest uses them)."""
+    """The game build command (README "Build"); needs the assets first (ctest uses them)."""
     return f'cd Matrix-Game-4 && bash scripts/build_racing.sh -DRACING_ASSET_ROOT="{racing_data_dir()}"'
 
 
