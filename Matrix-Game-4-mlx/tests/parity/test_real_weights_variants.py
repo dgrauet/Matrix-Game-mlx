@@ -56,6 +56,9 @@ def _require(name: str) -> dict:
     assert (meta["variant"], meta["scene"], meta["vae_backend"], tuple(meta["steps"]), tuple(meta["first_steps"]),
             meta["sink"], meta["switch_chunk"], meta["prompt_b"]) == \
         (v.name, v.scene, v.vae_backend, v.steps, v.first_steps, v.sink, v.switch_chunk, v.prompt_b), meta
+    if v.take:
+        assert meta.get("take_reference_sha256"), \
+            f"{name}: fixture lacks take_reference_sha256 (not generated from a take): regenerate it"
     return meta
 
 

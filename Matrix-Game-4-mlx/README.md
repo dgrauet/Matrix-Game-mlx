@@ -95,6 +95,153 @@ matrix-game-mlx verify --manifest releases/game-assets.json --scene ancient-egyp
 Unlike upstream, there is no `models.json` step: the model weights come from the MLX pack (see Weights).
 Archives are never extracted.
 
+## City racing on macOS
+
+The upstream racing game (`../Matrix-Game-4/game/racing`, a native C++20/SDL2/OpenGL program) builds and runs
+on macOS unchanged. You play or script a drive, the game records a take (clean reference video, alpha UI,
+audio, inputs, telemetry), and `matrix-game-mlx render --take` turns the take into a stylized video. Online
+play is not ported (see "Not ported" below). Game, finalize and compose commands run in `Matrix-Game-4/`
+(the upstream checkout), `matrix-game-mlx` commands in `Matrix-Game-4-mlx/`.
+
+### Dependencies
+
+Homebrew packages (cmake, SDL2, pkg-config, FFmpeg development libraries; the C++20 compiler comes from the
+Xcode command line tools):
+
+```bash
+brew install cmake pkgconf sdl2 ffmpeg
+```
+
+### Racing assets
+
+The racing scene needs 13 racing files plus 7 shared wav files. Upstream's `download`/`verify` form applies,
+with `matrix-game` renamed to `matrix-game-mlx` and `--resources` pointing at the upstream checkout's
+`resources` directory, where the game looks (`resources/racing`):
+
+```bash
+matrix-game-mlx download --manifest releases/game-assets.json --repo-id Skywork/Matrix-Game-4.0 \
+  --repo-type model --revision 4419accdb7bb7881234c5914de8cd915266e0325 --scene racing \
+  --resources ../Matrix-Game-4/resources
+matrix-game-mlx verify --manifest releases/game-assets.json --scene racing \
+  --resources ../Matrix-Game-4/resources
+```
+
+If you keep the flags in a shell variable, use an array under zsh (`opts=(--manifest ...)` then
+`"${opts[@]}"`): an unquoted string variable is not word-split there.
+
+### Build
+
+Download the assets above first: `build_racing.sh` runs ctest under `set -e`, and 4 of its asset tests fail
+without `resources/racing/assets`. Verified on macOS with `sdl2` (sdl2-compat 2.32) and `ffmpeg` 9.0.2. Build from
+`Matrix-Game-4/`:
+
+```bash
+bash scripts/build_racing.sh -DRACING_ASSET_ROOT="$PWD/resources/racing"
+```
+
+The binary is `game/racing/bin/CitySampleBBoxGame`; the tests look for it in the `Matrix-Game-4` checkout next to
+`Matrix-Game-4-mlx` (`racing_game.game_binary()`), so in a git worktree build inside that worktree's
+`Matrix-Game-4`. The build succeeded on the first try and the 9 ctest targets pass. No upstream patch was needed
+(see "Upstream patches" below).
+
+### Play
+
+From `Matrix-Game-4/`:
+
+```bash
+game/racing/bin/CitySampleBBoxGame --data-dir resources/racing --hud              # free drive
+game/racing/bin/CitySampleBBoxGame --data-dir resources/racing --race --hud       # time trial (default route)
+game/racing/bin/CitySampleBBoxGame --data-dir resources/racing --pursuit --hud    # single-player pursuit
+```
+
+`--race --route downtown|avenue|skyway` picks the time-trial route.
+
+W/S accelerate/reverse, A/D steer, Space applies the handbrake. P pauses a race, Enter resumes, and R
+requests recovery in a time trial (pursuit recovery is disabled).
+
+### Recording a take
+
+Add `--fps 48 --physics-hz 480 --offline-record captures` (a directory of your choice) to any play command
+and press F9 to start and stop recording; each recording becomes `captures/take-NNN`. The take holds the
+clean reference video, an alpha UI track, audio, input events and per-frame telemetry. Do not feed the UI
+track to the model.
+
+For a reproducible take, the test suite replays an input script (`tests/data/racing/take_input_script.json`,
+a JSON array of `{frame, key, down}` with SDL scancode names) in a hidden window. From `Matrix-Game-4/`:
+
+```bash
+game/racing/bin/CitySampleBBoxGame --data-dir resources/racing --hidden --race --route downtown \
+  --fps 48 --physics-hz 480 --offline-record captures --offline-auto-record \
+  --offline-input-script ../Matrix-Game-4-mlx/tests/data/racing/take_input_script.json --duration 48
+```
+
+Recording starts by itself at game frame 144 (after the 3 s countdown) and the scripted F9 at frame 864
+stops it at exactly 720 frames (15 s at 48 FPS). `--duration` is a wall-clock safety net (the tests use
+3 + 15 + 30 s).
+
+Check a take without rendering (upstream's finalizer validates its own racing schema; do not use the shooter
+48 FPS / 2x validator):
+
+```bash
+python game/racing/tools/finalize-offline-demo.py captures/take-001 --check-only
+```
+
+### Render
+
+Racing takes must be rendered with `--scene racing` (a racing take's `session.json` carries no scene key, so only shooter takes can omit it):
+
+```bash
+matrix-game-mlx render --scene racing --take ../Matrix-Game-4/captures/take-001 --resources ../Matrix-Game-4/resources --preset realtime --output output/racing-take
+matrix-game-mlx render --scene racing --take ../Matrix-Game-4/captures/take-001 --resources ../Matrix-Game-4/resources --preset quality --output output/racing-take-quality
+```
+
+Renders need the converted pack's `dit_racing.safetensors` (the Hub pack has it; a partial local cache may not).
+Measured on an M2 Pro 32 GB with a 720-frame (15 s) take:
+
+| Mode | Seconds per chunk | Peak memory | Total |
+| --- | --- | --- | --- |
+| realtime | 3.9 s | 15.0 GB | ~12 min |
+| quality | 34.6 s | 24.4 GB | ~104 min |
+| realtime, dynamic captions | 4.6 s | 26.3 GB | not timed |
+| quality, dynamic captions | not run | needs more than 32 GB | not run |
+
+Dynamic captions use `--prompt-mode dynamic --captions FILE` (see "Dynamic captions (racing)" above). The
+JSONL has one record per chunk, `{"frame_start", "frame_end", "prompt"}` with `frame_end` inclusive and
+zero-based: frame 0 alone, then consecutive groups of four, the last range possibly shorter. For a
+720-frame take that is frame 0, 179 groups of four, then a final group of three (181 records). A complete example (181 records, one
+per chunk of the 720-frame scripted take) is `tests/data/racing/take_captions.jsonl`:
+
+```bash
+matrix-game-mlx render --scene racing --take ../Matrix-Game-4/captures/take-001 --resources ../Matrix-Game-4/resources --preset realtime --prompt-mode dynamic \
+  --captions captions.jsonl --output output/racing-take-dynamic
+```
+
+A plain RGB video does not supply engine captions. Real engine-derived captions need the engine, so they
+are part of the future `serve` work.
+
+### Finalize and compose
+
+Pack the rendered video with the take's audio and telemetry (upstream tool, from `Matrix-Game-4/`):
+
+```bash
+python game/racing/tools/finalize-offline-demo.py captures/take-001 \
+  --rendered ../Matrix-Game-4-mlx/output/racing-take/rendered.mp4
+```
+
+`game/racing/tools/compose-demo.py` provides optional HUD relayout and input visualization (`--help` for
+options). Both tools, and the video handling of the finalizer, need `ffmpeg` on the PATH.
+
+### Not ported
+
+Online racing (`serve`, MediaMTX, browser) and engine captions at runtime are deferred to the `serve` work.
+
+### Upstream patches
+
+None. The upstream game code builds and runs on macOS as is. One upstream test fails with ffmpeg 9.0.2:
+`game/racing/tools/test_demo_composition.py::test_ffmpeg_preserves_overlay_frame_indices` decodes 199 frames
+where it expects 200 (an rgba to rgb24 rounding difference in that ffmpeg; the frame indices themselves are
+correct). It is not patched.
+
 ## Weights
 
 The weight pack is produced by the [mlx-forge](https://github.com/dgrauet/mlx-forge) conversion of
@@ -282,7 +429,7 @@ MATRIX_GAME_4_MLX_WEIGHTS_DIR=... python -m tests.parity.gen_fixtures --scene ca
 | `--taehv-only` | Realtime only: regenerate only the TAEHV fixtures (~20 s) |
 | `--blocks-only` | Regenerate only the per-block fixture (chunk 0 call 0; chunk 1 call 0 for racing) and its floors |
 
-They are written to `$MG4_FIXTURES_DIR/<scene>_quality/` or `<scene>_realtime/` (`egypt_quality`, `castle_quality`, `racing_quality`, `egypt_realtime`, `castle_realtime`, `racing_realtime`;
+They are written to `$MG4_FIXTURES_DIR/<scene>_quality/` or `<scene>_realtime/` (`egypt_quality`, `castle_quality`, `racing_quality`, `egypt_realtime`, `castle_realtime`, `racing_realtime`, `racing_take_realtime`, `racing_take_quality`;
 default `~/.cache/matrix-game-4-mlx/fixtures`): about 1.5 GB per scene without `--long` (ancient-egypt 1.7 GB)
 and about 6 GB with `--long` (ancient-egypt 5.7 GiB, racing 5.2 GiB) (the chunk-22 per-call fixture alone is 3.8 GB). A full castle set takes about 1 h to
 generate, a racing set with `--long` about 1 h 15. For racing the torch DiT runs on the CPU (no sink-priming
@@ -302,6 +449,7 @@ Variant fixtures (the CLI's new options) are generated with `--variant NAME`, an
 | --- | --- |
 | `python -m tests.parity.gen_fixtures --captions-only` | umT5 caption embeddings vs upstream torch (`test_real_weights_captions.py`) |
 | `--variant racing_switch_realtime` / `racing_switch_quality` | Dynamic prompt switch (prompt A to prompt B) (`test_real_weights_variants.py`) |
+| `--variant racing_take_realtime` / `racing_take_quality` | The first 9 frames of a real recorded racing take (scene sink image, fixed prompt); needs the take (`MG4_RACING_TAKE`) (`test_real_weights_variants.py`) |
 | `--variant castle_nosink_realtime` / `racing_nosink_realtime` | `--no-sink-image` |
 | `--variant castle_taehv_2step` | TAEHV with a custom 2-step schedule |
 | `--variant egypt_wan_custom_first` | Wan VAE with custom `--first-steps` |
@@ -318,9 +466,33 @@ cd Matrix-Game-4-mlx
 python -m pytest tests -v
 ```
 
-The fast suite (no weights, no fixtures) is `python -m pytest -m "not needs_weights and not needs_fixtures"`.
+The fast suite (no weights, no fixtures) is `python -m pytest -m "not needs_weights and not needs_fixtures"`;
+it also runs the racing game (see "Racing tests"). Add `and not needs_racing_game` to skip the game.
 `tests/test_cli_smoke.py` (`needs_weights`) renders a 9-frame 864x480 racing clip in realtime dynamic mode through the CLI
 and checks `peak_memory_gb < 30`.
+
+### Racing tests
+
+Tests marked `needs_racing_game` run the built upstream game (`Matrix-Game-4/game/racing/bin/CitySampleBBoxGame`)
+and are skipped, with the download and build commands, when the binary or the assets are missing. They read
+two environment variables: `MG4_RESOURCES` (default `Matrix-Game-4/resources`, where the game looks in
+`racing/`) and `MG4_RACING_TAKE` (default `$MG4_RESOURCES/racing/captures/take-001`), the recorded take used by
+the render tests and the `racing_take_*` fixtures. The fast suite with the game enabled runs 5 headless smoke
+runs and 3 scripted recordings of about 48 s each; add `and not needs_racing_game` to the `-m` expression to
+leave them out.
+
+The render tests and `gen_fixtures --variant racing_take_*` need that take to exist first (they skip or fail
+with a pointer to this section). Record the canonical take into the default location with
+(`record_scripted_take`; from `Matrix-Game-4/`, with `MG4_RESOURCES` set or defaulting to `resources`):
+
+```bash
+game/racing/bin/CitySampleBBoxGame --data-dir "${MG4_RESOURCES:-resources}/racing" --hidden --race --route downtown \
+  --fps 48 --physics-hz 480 --offline-record "${MG4_RESOURCES:-resources}/racing/captures" --offline-auto-record \
+  --offline-input-script ../Matrix-Game-4-mlx/tests/data/racing/take_input_script.json --duration 48
+```
+
+On an empty `captures` directory this creates `take-001`. If you set `MG4_RACING_TAKE` to another take
+directory, record there instead.
 
 The real-weight parity suite runs once per scene whose fixtures exist (a missing or partial set is skipped with
 its `gen_fixtures` command) and loads one DiT at a time. Install the `parity` extra for the upstream oracle. Tests marked `needs_fixtures` read the torch reference

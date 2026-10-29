@@ -30,15 +30,18 @@ Variants (`--variant NAME`, VARIANT_SPECS: prompt switch, no sink, free codec / 
 draws, prompt_embeds and, for switch variants, prompt_b_embeds from upstream umT5 bf16 CPU, the torch sink_latent
 when the variant has a sink), chunks.npz, floor_chunk_{i}.npz (native bf16 CPU SDPA DiT floor, plus the Wan control)
 and meta.json (variant, vae_backend, steps, first_steps, sink, switch_chunk, prompt_b, floor with control_rel_l2).
-Switch variants call the upstream CastleStream.set_prompt(prompt B) before switch_chunk. `--variant-floor-only`
+The racing_take_* variants take their pixels from the scripted racing take (take_frames: first 9 frames of
+reference.mkv, preprocessed as offline.py does; sink = the scene sink image) and record take_session and
+take_reference_sha256 in meta.json. Switch variants call the upstream CastleStream.set_prompt(prompt B) before switch_chunk. `--variant-floor-only`
 regenerates the floor only. `--captions-only` writes `$MG4_FIXTURES_DIR/captions/` (embeds.npz: upstream umT5 bf16
 reference and fp32 / fp64-accumulate variants of the three scene prompts and prompt B; meta.json: floor per caption).
-`--print-variant-commands` prints the captions command, then the six variant commands (one at a time, ~10-25 min
+`--print-variant-commands` prints the captions command, then the variant commands (one at a time, ~10-25 min
 each).
 """
 import argparse
 import contextlib
 import gc
+import hashlib
 import json
 import subprocess
 import time
@@ -163,6 +166,27 @@ def pan_frames(spec: SceneSpec, n: int) -> np.ndarray:
         left = x if x <= span else 2 * span - x
         frames.append(arr[top:top + 480, left:left + 864])
     return (np.stack(frames).transpose(0, 3, 1, 2).astype(np.float32) * (2.0 / 255.0) - 1.0).astype(np.float32)
+
+
+def take_frames(take: Path, n: int) -> np.ndarray:
+    """First `n` frames of `take/reference.mkv`, read and preprocessed as the port's offline.py does for `--take`
+    (imageio_ffmpeg rgb24 -> crop_and_resize(480, 864) -> frames_to_tensor). float32 [n, 3, 480, 864] in [-1, 1].
+    The offline mode is video-to-video (stream.push on pixels only): the take's actions are not model inputs and the
+    sink is the scene sink image, as for every other variant."""
+    import imageio_ffmpeg
+    from PIL import Image
+    from matrix_game_mlx.inference.preprocessing import crop_and_resize, frames_to_tensor
+    reader = imageio_ffmpeg.read_frames(str(Path(take) / "reference.mkv"), pix_fmt="rgb24")
+    try:
+        width, height = next(reader)["size"]
+        raw = [r for _, r in zip(range(n), reader)]
+    finally:
+        reader.close()
+    if len(raw) < n:
+        raise ValueError(f"{take}: only {len(raw)} frames, need {n}")
+    frames = [crop_and_resize(Image.fromarray(np.frombuffer(r, np.uint8).reshape(height, width, 3)), 480, 864)
+              for r in raw]
+    return to_np(frames_to_tensor(frames)).astype(np.float32)
 
 
 def chunk_slices(n_chunks: int):
@@ -1060,6 +1084,7 @@ class VariantSpec:
     first_steps: tuple
     sink: bool
     switch_chunk: Optional[int]
+    take: bool = False      # pixels from the scripted racing take (take_frames) instead of the synthetic pan
 
     @property
     def scene_spec(self) -> SceneSpec:
@@ -1088,6 +1113,8 @@ VARIANT_SPECS = {v.name: v for v in (
     VariantSpec("racing_nosink_realtime", "racing", "taehv", (1000,), (1000,), False, None),
     VariantSpec("castle_taehv_2step", "castle", "taehv", (1000, 500), (1000, 500), True, None),
     VariantSpec("egypt_wan_custom_first", "ancient-egypt", "wan", (1000,), (1000, 750, 500, 250), True, None),
+    VariantSpec("racing_take_realtime", "racing", "taehv", (1000,), (1000,), True, None, take=True),
+    VariantSpec("racing_take_quality", "racing", "wan", (1000, 500), (1000, 500), True, None, take=True),
 )}
 
 
@@ -1406,7 +1433,17 @@ def variant_main(args, v: VariantSpec) -> None:
     log("prompt embeddings (torch T5)")
     embeds = torch_prompt_embeds([SCENES[v.scene]["prompt"]] + ([v.prompt_b] if v.prompt_b else []))
     prompt, prompt_b = embeds[0], (embeds[1] if v.prompt_b else None)
-    pixels = pan_frames(spec, 1 + 4 * (VARIANT_CHUNKS - 1))
+    n_frames = 1 + 4 * (VARIANT_CHUNKS - 1)
+    if v.take:
+        from tests import racing_game
+        take = racing_game.default_take()
+        if not (take / "session.json").is_file():
+            raise FileNotFoundError(racing_game.take_hint(take))
+        meta["take_session"] = json.loads((take / "session.json").read_text())
+        meta["take_reference_sha256"] = hashlib.sha256((take / "reference.mkv").read_bytes()).hexdigest()
+        pixels = take_frames(take, n_frames)
+    else:
+        pixels = pan_frames(spec, n_frames)
     noises, renoises = variant_noises(v)
     variant_reference(args, v, out, meta, prompt, prompt_b, pixels, noises, renoises)
     meta["total_seconds"] = time.perf_counter() - t_start

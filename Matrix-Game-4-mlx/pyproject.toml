@@ -19,4 +19,5 @@ include = ["matrix_game_mlx*"]
 matrix_game_mlx = ["configs/*.json"]
 
 [tool.pytest.ini_options]
-markers = ["needs_weights: requires the converted MLX pack", "needs_fixtures: requires torch reference fixtures"]
+markers = ["needs_weights: requires the converted MLX pack", "needs_fixtures: requires torch reference fixtures",
+           "needs_racing_game: requires the built upstream racing game and its assets"]
