@@ -1,7 +1,9 @@
 """Cheap checks of the fixture generator's helpers (no weights, no model build)."""
 import importlib.util
+import json
 import sys
 
+import numpy as np
 import pytest
 import torch
 
@@ -137,16 +139,22 @@ def test_realtime_preset_spec():
     assert n_denoising_calls(SCENE_SPECS["castle"], 0, realtime.steps) == 1
 
 
-def test_realtime_steps_match_pack_config():
-    """The generator's realtime steps are the pack's inference.json realtime_steps (what ModelComponents uses)."""
+def test_realtime_steps_match_cli_resolution():
+    """The generator's realtime preset (steps, codec) equals what the CLI's preset resolution gives for every scene;
+    when the pack's inference.json carries realtime_steps / quality_steps, they must equal the resolved defaults."""
     from tests.conftest import weights_dir
     from tests.parity.gen_fixtures import PRESET_SPECS
     if weights_dir() is None:
         pytest.skip("MATRIX_GAME_4_MLX_WEIGHTS_DIR not set")
     from matrix_game_mlx.inference.loader import ModelComponents
+    from matrix_game_mlx.scenes import model_args
     for scene in ("ancient-egypt", "castle", "racing"):
-        comps = ModelComponents(scene, "realtime", pack=weights_dir())
-        assert (comps.steps, comps.vae_backend) == (PRESET_SPECS["realtime"].steps, "taehv")
+        comps = ModelComponents(model_args(scene, "realtime"), pack=weights_dir())
+        assert (comps.args.steps, comps.args.vae_backend) == (PRESET_SPECS["realtime"].steps, "taehv")
+        inference = json.loads((weights_dir() / comps.entry["inference"]).read_text())
+        for key, preset in (("realtime_steps", "realtime"), ("quality_steps", "quality")):
+            if key in inference:
+                assert tuple(inference[key]) == model_args(scene, preset).steps, key
 
 
 def test_generation_command():
@@ -202,3 +210,207 @@ def test_device_bridge_moves_latents_to_the_codec():
     bridge.encode_stream(torch.ones(1, dtype=torch.bfloat16))
     assert codec.seen == [("dec", torch.device("cpu"), torch.float32), ("enc", torch.device("cpu"), torch.bfloat16)]
     assert codec.cleared == 1
+
+
+VARIANTS = {
+    "racing_switch_realtime": ("racing", "taehv", (1000,), (1000,), True, 2),
+    "racing_switch_quality": ("racing", "wan", (1000, 500), (1000, 500), True, 2),
+    "castle_nosink_realtime": ("castle", "taehv", (1000,), (1000,), False, None),
+    "racing_nosink_realtime": ("racing", "taehv", (1000,), (1000,), False, None),
+    "castle_taehv_2step": ("castle", "taehv", (1000, 500), (1000, 500), True, None),
+    "egypt_wan_custom_first": ("ancient-egypt", "wan", (1000,), (1000, 750, 500, 250), True, None),
+}
+
+
+def test_variant_specs():
+    """Exactly the six task variants, with their codec / steps / first steps / sink / prompt-switch chunk."""
+    from tests.parity.gen_fixtures import VARIANT_SPECS
+    assert set(VARIANT_SPECS) == set(VARIANTS)
+    for name, (scene, backend, steps, first, sink, switch) in VARIANTS.items():
+        v = VARIANT_SPECS[name]
+        assert (v.name, v.scene, v.vae_backend, v.steps, v.first_steps, v.sink, v.switch_chunk) == \
+            (name, scene, backend, steps, first, sink, switch)
+
+
+def test_prompt_b_text():
+    from tests.parity.gen_fixtures import PROMPT_B
+    assert PROMPT_B == ("a racing game on a rainy city street at night, neon reflections on wet asphalt, "
+                        "realistic AAA game rendering")
+
+
+def test_variant_generation_commands():
+    from tests.parity.gen_fixtures import VARIANT_SPECS, generation_command, parse_args
+    for name in VARIANT_SPECS:
+        assert generation_command(variant=name) == f"python -m tests.parity.gen_fixtures --variant {name}"
+        assert parse_args(generation_command(variant=name).split()[3:]).variant == name
+    assert generation_command(captions=True) == "python -m tests.parity.gen_fixtures --captions-only"
+    assert generation_command("castle") == "python -m tests.parity.gen_fixtures --scene castle"   # unchanged
+
+
+def test_print_variant_commands(capsys):
+    """Captions first, then the six variants in registry order (the controller's background queue)."""
+    from tests.parity.gen_fixtures import VARIANT_SPECS, main
+    main(["--print-variant-commands"])
+    lines = capsys.readouterr().out.splitlines()
+    assert lines == ["python -m tests.parity.gen_fixtures --captions-only"] + \
+        [f"python -m tests.parity.gen_fixtures --variant {name}" for name in VARIANT_SPECS]
+
+
+def test_variant_cli_validation():
+    from tests.parity.gen_fixtures import parse_args
+    args = parse_args(["--variant", "castle_taehv_2step", "--variant-floor-only"])
+    assert (args.variant, args.variant_floor_only) == ("castle_taehv_2step", True)
+    assert parse_args(["--captions-only"]).captions_only
+    for argv in (["--variant-floor-only"], ["--variant", "nope"], ["--variant", "castle_taehv_2step", "--long"],
+                 ["--variant", "castle_taehv_2step", "--floor-only"], ["--captions-only", "--variant",
+                                                                        "castle_taehv_2step"]):
+        with pytest.raises(SystemExit):
+            parse_args(argv)
+
+
+def test_variant_out_dir():
+    from tests.conftest import fixtures_dir
+    from tests.parity.gen_fixtures import VARIANT_SPECS, captions_dir, variant_dir
+    for name in VARIANT_SPECS:
+        assert variant_dir(name) == fixtures_dir() / name
+    assert captions_dir() == fixtures_dir() / "captions"
+
+
+def test_variant_denoising_schedule():
+    """Upstream CastleStream.push step choice: first_frame uses first_steps on chunk 0 (none with a sink: the sink is
+    the chunk), kv_only on positions < 2 (position = chunk + 1 with a sink)."""
+    from tests.parity.gen_fixtures import (VARIANT_SPECS, variant_generator_calls, variant_n_renoise,
+                                           variant_steps)
+    egypt = VARIANT_SPECS["egypt_wan_custom_first"]
+    assert [variant_steps(egypt, i) for i in range(3)] == [(1000, 750, 500, 250), (1000,), (1000,)]
+    assert variant_generator_calls(egypt, 0) == 4 + 1                       # 4 denoising calls + cache update
+    assert [variant_n_renoise(egypt, i) for i in range(3)] == [3, 0, 0]
+    racing = VARIANT_SPECS["racing_switch_quality"]
+    assert [len(variant_steps(racing, i)) for i in range(3)] == [0, 2, 2]
+    assert [variant_generator_calls(racing, i) for i in range(3)] == [1, 3, 3]
+    assert [variant_n_renoise(racing, i) for i in range(3)] == [0, 1, 1]
+    assert [len(variant_steps(VARIANT_SPECS["racing_nosink_realtime"], i)) for i in range(3)] == [1, 1, 1]
+    assert [len(variant_steps(VARIANT_SPECS["castle_nosink_realtime"], i)) for i in range(3)] == [1, 1, 1]
+    assert [variant_n_renoise(VARIANT_SPECS["castle_taehv_2step"], i) for i in range(3)] == [1, 1, 1]
+
+
+def test_variant_first_and_gated_chunks():
+    from tests.parity.gen_fixtures import VARIANT_SPECS, gated_chunks
+    assert gated_chunks(VARIANT_SPECS["racing_switch_realtime"]) == (1, 2)    # chunk 0 is the sink itself
+    assert gated_chunks(VARIANT_SPECS["racing_switch_quality"]) == (1, 2)
+    assert gated_chunks(VARIANT_SPECS["racing_nosink_realtime"]) == (0,)      # no sink: chunk 0 is denoised
+    assert gated_chunks(VARIANT_SPECS["castle_nosink_realtime"]) == (0,)
+    assert gated_chunks(VARIANT_SPECS["egypt_wan_custom_first"]) == (0,)
+
+
+def test_variant_model_argv():
+    """The MLX model arguments of a variant: every field explicit, so the preset default never decides."""
+    from tests.parity.gen_fixtures import VARIANT_SPECS
+    assert VARIANT_SPECS["castle_nosink_realtime"].model_argv() == \
+        ["--vae-backend", "taehv", "--steps", "1000", "--first-steps", "1000", "--no-sink-image"]
+    assert VARIANT_SPECS["egypt_wan_custom_first"].model_argv() == \
+        ["--vae-backend", "wan", "--steps", "1000", "--first-steps", "1000,750,500,250"]
+    assert VARIANT_SPECS["egypt_wan_custom_first"].preset == "quality"
+    assert VARIANT_SPECS["racing_switch_realtime"].preset == "realtime"
+
+
+def test_variant_model_args_resolve_to_spec():
+    """Resolved through matrix_game_mlx.scenes.model_args exactly as the gates do."""
+    from tests.conftest import weights_dir
+    from tests.parity.gen_fixtures import VARIANT_SPECS
+    if weights_dir() is None:
+        pytest.skip("MATRIX_GAME_4_MLX_WEIGHTS_DIR not set")
+    from matrix_game_mlx.scenes import model_args
+    for v in VARIANT_SPECS.values():
+        a = model_args(v.scene, v.preset, v.model_argv())
+        assert (a.vae_backend, a.steps, a.first_steps, a.sink_image is not None) == \
+            (v.vae_backend, v.steps, v.first_steps, v.sink), v.name
+
+
+def test_variant_noise_draws_are_deterministic():
+    """Initial noise per chunk and exactly variant_n_renoise renoise draws per chunk, reproducible."""
+    from tests.parity.gen_fixtures import LATENT_SHAPE, VARIANT_SPECS, variant_n_renoise, variant_noises
+    v = VARIANT_SPECS["egypt_wan_custom_first"]
+    noises, renoises = variant_noises(v, 3)
+    again = variant_noises(v, 3)
+    assert len(noises) == 3 and all(n.shape == LATENT_SHAPE and n.dtype == np.float32 for n in noises)
+    assert [len(r) for r in renoises] == [variant_n_renoise(v, i) for i in range(3)]
+    assert all(np.array_equal(a, b) for a, b in zip(noises, again[0]))
+    assert np.array_equal(renoises[0][2], again[1][0][2])
+
+
+def test_caption_texts():
+    from matrix_game_mlx.scenes import SCENES
+    from tests.parity.gen_fixtures import PROMPT_B, caption_texts
+    texts = caption_texts()
+    assert texts == {"ancient-egypt": SCENES["ancient-egypt"]["prompt"], "castle": SCENES["castle"]["prompt"],
+                     "racing": SCENES["racing"]["prompt"], "prompt_b": PROMPT_B}
+
+
+def test_variant_inputs_round_trip(tmp_path):
+    """inputs.npz as variant_reference writes it reads back through load_variant_inputs (sink / prompt B optional)."""
+    from tests.parity.gen_fixtures import (LATENT_SHAPE, VARIANT_SPECS, load_variant_inputs, variant_inputs,
+                                           variant_noises)
+    pixels = np.zeros((9, 3, 4, 4), np.float32) + np.arange(9, dtype=np.float32)[:, None, None, None]
+    for name, has_sink, has_b in (("racing_switch_quality", True, True), ("castle_nosink_realtime", False, False),
+                                  ("egypt_wan_custom_first", True, False)):
+        v = VARIANT_SPECS[name]
+        noises, renoises = variant_noises(v)
+        prompt, prompt_b = np.ones((1, 512, 8), np.float32), (np.full((1, 512, 8), 2, np.float32) if has_b else None)
+        sink = np.full(LATENT_SHAPE, 3, np.float32) if has_sink else None
+        np.savez(tmp_path / f"{name}.npz", **variant_inputs(prompt, prompt_b, sink, pixels, noises, renoises))
+        got = load_variant_inputs(v, np.load(tmp_path / f"{name}.npz"))
+        assert np.array_equal(got[0], pixels)
+        assert all(np.array_equal(a, b) for a, b in zip(got[1], noises))
+        assert [len(r) for r in got[2]] == [len(r) for r in renoises]
+        assert all(np.array_equal(a, b) for ra, rb in zip(got[2], renoises) for a, b in zip(ra, rb))
+        assert (got[3] is None) == (not has_sink) and (got[4] is None) == (not has_b)
+
+
+class _FakeStream:
+    """Mimics upstream CastleStream.push's generator / renoise calls (variant_steps per chunk + one clean pass)."""
+
+    def __init__(self, v, consume_renoise=True):
+        from tests.parity.gen_fixtures import LATENT_SHAPE, variant_steps
+        self.v, self.index, self.events, self.device = v, 0, [], torch.device("cpu")
+        self.steps, self.shape, self.consume = variant_steps, LATENT_SHAPE, consume_renoise
+        self.gen = lambda **kw: (None, torch.zeros(self.shape))
+
+    def set_prompt(self, embeddings):
+        self.events.append(("set_prompt", self.index, embeddings.dtype))
+
+    def push(self, pixels, *, frame_start, initial_noise=None):
+        steps = self.steps(self.v, self.index)
+        for k, _ in enumerate(steps):
+            self.gen(noisy_image_or_video=initial_noise, timestep=torch.zeros(1, 1))
+            if k + 1 < len(steps) and self.consume:
+                self.events.append(("renoise", self.index, float(torch.randn(1, *self.shape[2:]).mean())))
+        self.gen(noisy_image_or_video=initial_noise, timestep=torch.zeros(1, 1), drop_control=True)
+        self.events.append(("push", self.index, frame_start, tuple(pixels.shape)))
+        self.index += 1
+        return "chunk"
+
+
+def test_run_variant_switches_prompt_and_serves_renoise():
+    from tests.parity.gen_fixtures import VARIANT_SPECS, run_variant, variant_noises
+    pixels = np.zeros((9, 3, 2, 2), np.float32)
+    v = VARIANT_SPECS["racing_switch_quality"]
+    noises, renoises = variant_noises(v)
+    stream, seen = _FakeStream(v), []
+    run_variant(torch, v, stream, pixels, noises, renoises, np.zeros((1, 512, 8), np.float32),
+                lambda i, chunk, preds, s: seen.append((i, len(preds))))
+    assert seen == [(0, 0), (1, 2), (2, 2)]
+    assert [e[:2] for e in stream.events] == [("push", 0), ("renoise", 1), ("push", 1), ("set_prompt", 2),
+                                              ("renoise", 2), ("push", 2)]
+    assert stream.events[3][2] == torch.bfloat16
+    assert [e[2:] for e in stream.events if e[0] == "push"] == [(0, (1, 3, 2, 2)), (1, (4, 3, 2, 2)), (5, (4, 3, 2, 2))]
+    # The served draw is the prepared one (renoise chunk 1 = renoises[1][0])
+    assert stream.events[1][2] == pytest.approx(float(renoises[1][0].mean()), rel=1e-5)
+    egypt = VARIANT_SPECS["egypt_wan_custom_first"]
+    stream = _FakeStream(egypt)
+    run_variant(torch, egypt, stream, pixels, *variant_noises(egypt), None, lambda *a: None)
+    assert [e[:2] for e in stream.events].count(("renoise", 0)) == 3
+    assert not any(e[0] == "set_prompt" for e in stream.events)
+    with pytest.raises(RuntimeError, match="not consumed"):
+        run_variant(torch, egypt, _FakeStream(egypt, consume_renoise=False), pixels, *variant_noises(egypt), None,
+                    lambda *a: None)

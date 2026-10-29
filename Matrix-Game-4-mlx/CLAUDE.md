@@ -76,8 +76,9 @@ max(2e-2, 1.5 x the torch floor of the chunk), since with one step torch against
 matrix_game_mlx/
   scenes.py                      # scene profiles (prompts, sink policy), model-loading parts only
   configs/                       # ancient-egypt.json, castle.json, racing.json (scene name and prompt)
+  cli.py                         # `matrix-game-mlx` console script: render, download, verify (serve not ported)
   inference/
-    offline.py                   # CLI: --input clip | --take recording -> rendered.mp4 + render.json
+    offline.py                   # `render`: --input clip | --take recording -> rendered.mp4 + render.json; dynamic captions
     loader.py                    # ModelComponents: pack dir, pinned shared MG3 files (sha256), T5 -> DiT -> VAE
     loading.py                   # strict DiT build from the mlx-forge pack
     stream.py                    # CastleStream: sink priming, chunk push (1-2 denoising calls per preset + cache update)
@@ -98,7 +99,11 @@ tests/
   test_*.py                      # module parity vs upstream torch (no weights needed unless marked)
   parity/gen_fixtures.py         # torch fixture generator (python -m tests.parity.gen_fixtures)
   parity/test_real_weights.py    # per-call, per-block and end-to-end real-weight parity
+  parity/test_real_weights_variants.py  # prompt switch, no sink, TAEHV 2-step, Wan custom first-steps vs torch
+  parity/test_real_weights_captions.py  # caption embeddings vs torch
   parity/test_gen_fixtures.py    # generator helper checks
+  test_cli_smoke.py              # needs_weights: realtime dynamic render through the CLI (peak < 30 GB)
+  data/racing_captions.jsonl     # hand-made 9-frame captions (3 records)
 ```
 
 ## Tech Stack
@@ -107,6 +112,8 @@ Python 3.11+, MLX >= 0.31.0, NumPy, Pillow, imageio-ffmpeg, HuggingFace `tokeniz
 `huggingface_hub`/`safetensors`. Parity extra: torch, diffusers, einops.
 
 ## Testing
+
+Fast suite: `python -m pytest -m "not needs_weights and not needs_fixtures"`. Variant fixtures: `python -m tests.parity.gen_fixtures --variant NAME` / `--captions-only` (`--print-variant-commands` lists them). CLI: `matrix-game-mlx render|download|verify`; quality + dynamic captions needs more than 32 GB (T5 resident).
 
 Run from this directory: `/opt/homebrew/bin/python3.14 -m pytest tests -v` (the MLX/torch stack is
 installed for Homebrew Python 3.14)
@@ -118,7 +125,7 @@ installed for Homebrew Python 3.14)
 
 ## What NOT to Port
 
-- The server and the game/interactive layers
+- `serve` (the server, browser demo) and the game/interactive layers
 - `rtx5090*` files
 - Ring / fused / cudagraph runtimes (realtime uses the `native` DiT runtime) and the CUDA VAE graph
 - Training branches (teacher forcing, ctx slots, kv_mem, kv_capture, flex_attention masks,

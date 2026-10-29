@@ -115,6 +115,7 @@ def loaded():
 @pytest.fixture
 def comps(scene, loaded):
     from matrix_game_mlx.inference.loader import ModelComponents
+    from matrix_game_mlx.scenes import model_args
     _require(scene)
     if loaded.get("scene") != scene:
         loaded.clear()
@@ -126,8 +127,8 @@ def comps(scene, loaded):
         mx.clear_cache()
         meta = _meta(scene)
         inputs = np.load(_dir(scene) / "inputs.npz")
-        comps = ModelComponents(scene, "quality")
-        assert (comps.sink_mode, comps.sink_rope_mode) == (meta["sink_mode"], meta["sink_rope_mode"])
+        comps = ModelComponents(model_args(scene, "quality"))
+        assert (comps.args.sink_mode, comps.args.sink_rope_mode) == (meta["sink_mode"], meta["sink_rope_mode"])
         comps.load()
         comps.prompt = mx.array(inputs["prompt_embeds"]).astype(mx.bfloat16)     # same embeddings as the torch run
         comps.sink_latent = mx.array(inputs["sink_latent"]).astype(mx.bfloat16)
@@ -186,10 +187,10 @@ def test_sink_encoding_production_path(scene, comps):
     (rel L2 < 2e-2)."""
     from matrix_game_mlx.inference.stream import encode_sink_image
     torch_sink = np.load(_dir(scene) / "inputs.npz")["sink_latent"]
-    assert comps.sink_image == comps.pack / comps.cfg["scenes"][scene]["sink_image"]
+    assert comps.args.sink_image == comps.pack / comps.cfg["scenes"][scene]["sink_image"]
     # Independent of the pack config: the image torch encoded is <checkpoint dir>/sink.png (gen_fixtures SceneSpec)
-    assert comps.sink_image == comps.pack / SCENE_SPECS[scene].src_dir / "sink.png"
-    err = rel_l2(encode_sink_image(comps.vae, comps.sink_image, "wan", first_frame=comps.sink_mode == "first_frame"),
+    assert comps.args.sink_image == comps.pack / SCENE_SPECS[scene].src_dir / "sink.png"
+    err = rel_l2(encode_sink_image(comps.vae, comps.args.sink_image, "wan", first_frame=comps.args.sink_mode == "first_frame"),
                  torch_sink)
     print(f"{scene} sink rel L2 {err:.3e}")
     assert err < 2e-2, err
@@ -219,7 +220,7 @@ def test_block_parity(scene, comps, block_case, i):
     model = stream.gen.model
     y = model.blocks[i](_to_mx(blocks[f"x{i}"]), _to_mx(blocks["e0"]), mx.array([405]), [[1, 15, 27]], model.freqs,
                         _to_mx(blocks["context"]), None, None, kv_cache=stream.kv[i], crossattn_cache=xc[i],
-                        current_start=int(fx[f"c{j}_start"]), cache_start=0, sink_rope_mode=comps.sink_rope_mode)
+                        current_start=int(fx[f"c{j}_start"]), cache_start=0, sink_rope_mode=comps.args.sink_rope_mode)
     err = rel_l2(y, from_bits(blocks[f"x{i + 1}"]))
     print(f"{scene} block {i}: rel L2 {err:.3e} gate {gates[i]:.3e} ratio {err / gates[i]:.2f}")
     assert err <= gates[i], (err, gates[i])
@@ -237,7 +238,7 @@ def test_call_parity(scene, comps, name, j):
                          conditional_dict={"prompt_embeds": comps.prompt, "control_latent": _to_mx(fx["control"])},
                          timestep=mx.array(fx[f"c{j}_t"]), kv_cache=stream.kv, crossattn_cache=stream.xc,
                          current_start=int(fx[f"c{j}_start"]), drop_control=bool(fx[f"c{j}_drop"]),
-                         sink_rope_mode=comps.sink_rope_mode)
+                         sink_rope_mode=comps.args.sink_rope_mode)
     m = {"pred": rel_l2(pred, from_bits(fx[f"c{j}_pred"]))}
     for layer in KV_LAYERS:
         for kind in ("k", "v"):
@@ -316,7 +317,7 @@ def _run_stream(scene, comps):
 def test_stream_end_to_end(scene, comps):
     """Chunk 0 (and racing chunk 1) gated with the spec thresholds; other chunks reported (see module docstring)."""
     d, chunks = _dir(scene), _run_stream(scene, comps)
-    first_frame = comps.sink_mode == "first_frame"
+    first_frame = comps.args.sink_mode == "first_frame"
     gated = {0, 1} if first_frame else {0}
     for i, c in enumerate(chunks):
         ref = np.load(d / f"chunk_{i}.npz")

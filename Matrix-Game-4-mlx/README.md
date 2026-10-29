@@ -18,24 +18,82 @@ ancient-egypt, castle and racing scenes.
 ```bash
 cd Matrix-Game-4-mlx
 pip install -e .
-python -m matrix_game_mlx.inference.offline --scene ancient-egypt --input lowpoly.mp4 --output output/egypt
+matrix-game-mlx render --scene ancient-egypt --input lowpoly.mp4 --output output/egypt
 ```
+
+`matrix-game-mlx` is the port of upstream's `matrix-game` CLI. Subcommands: `render`, `download`, `verify`;
+`serve` (the online browser demo) is not ported and exits with "not ported yet".
 
 To render a game take recorded with the upstream game (`bash scripts/play.sh --scene ancient-egypt` in
 `../Matrix-Game-4/`, F9 to start and stop), pass the take directory; the scene comes from its `session.json`:
 
 ```bash
-python -m matrix_game_mlx.inference.offline --take /path/to/take-1 --output output/take-1
+matrix-game-mlx render --take /path/to/take-1 --output output/take-1
 ```
 
 The output directory gets `rendered.mp4` (same frame count and FPS as the input; the last incomplete
 four-frame block is padded internally, then trimmed) and `render.json` (configuration, frames, seconds,
-`seconds_per_chunk`, `peak_memory_gb`). Other flags: `--seed` (default 0), `--sink-image` (overrides the
-scene's sink image), `--preset {quality,realtime}` (default `quality`, as upstream's offline.py). Realtime example:
+`seconds_per_chunk`, `peak_memory_gb`, `prompt_mode`). Realtime example:
 
 ```bash
-python -m matrix_game_mlx.inference.offline --scene castle --preset realtime --input lowpoly.mp4 --output output/castle-realtime
+matrix-game-mlx render --scene castle --preset realtime --input lowpoly.mp4 --output output/castle-realtime
 ```
+
+### `render` flags
+
+The offline default preset is `quality`, as upstream's offline renderer. Weights come only from the MLX pack
+(see Weights), so upstream's weight-path flags and CUDA-only options are rejected with an error.
+
+| Flag | Status |
+| --- | --- |
+| `--scene {ancient-egypt,castle,racing}` | Supported |
+| `--preset {realtime,quality,baseline}` | Supported (default `quality`) |
+| `--preset {rtx5090,rtx5090-sage}` | Rejected: CUDA-only presets |
+| `--vae-backend {wan,taehv}` | Supported (default from the preset: `taehv` for realtime, `wan` otherwise) |
+| `--dit-runtime native` | Supported (the only runtime) |
+| `--dit-runtime` other values (`kernels`, `cudagraph`, `ring`, `ring-graph`, `ring-fused`, `rtx5090`, `rtx5090-sage`) | Rejected: CUDA-only; the MLX port runs `native` only |
+| `--steps`, `--first-steps` | Supported (comma-separated timesteps, strictly decreasing from 1000) |
+| `--vae-graph` | Rejected: CUDA graphs, not available on MLX |
+| `--no-vae-graph` | Accepted, no effect (VAE graphs are never used on MLX) |
+| `--prompt-mode {fixed,dynamic}`, `--prompt`, `--prompt-interval-chunks` | Supported; dynamic is racing only (see below) |
+| `--captions FILE` | Supported, dynamic mode only (required there) |
+| `--t5-runtime {native,graph}` | Accepted; `graph` behaves as `native` (no CUDA graphs) |
+| `--sink-image PATH`, `--no-sink-image` | Supported (mutually exclusive) |
+| `--resources DIR` | Accepted; `render` does not read weights or the sink image from it (those come from the MLX pack). It sets the game-asset root and is the default `download --resources` target |
+| `--asset-root DIR` | Accepted: overrides the game-asset root derived from `--resources`; `render` does not read it |
+| `--input CLIP` / `--take DIR`, `--output DIR`, `--seed N` | Supported |
+| `--model-dir`, `--checkpoint`, `--taehv-path` | Rejected: weights come only from the MLX pack (`MATRIX_GAME_4_MLX_WEIGHTS_DIR` selects a local pack) |
+
+### Dynamic captions (racing)
+
+`--prompt-mode dynamic --captions FILE` switches the text prompt during the render. The file is JSONL with one
+record per decoded chunk: `{"frame_start": int, "frame_end": int, "prompt": str}`. Chunk 0 is one frame, then
+every chunk is four frames, so a 9-frame clip has three records (`0..0`, `1..4`, `5..8`). The ranges must match
+the clip's chunks. A complete example is `tests/data/racing_captions.jsonl`:
+
+```bash
+matrix-game-mlx render --scene racing --preset realtime --prompt-mode dynamic \
+  --captions tests/data/racing_captions.jsonl --input clip.mp4 --output output/racing-dynamic
+```
+
+`--prompt-interval-chunks N` (1 to 1024) only re-reads the caption every N chunks. Dynamic mode keeps the umT5
+encoder resident (~11 GB) instead of freeing it after encoding the fixed prompt. The realtime preset fits a 32 GB
+machine (measured peak 26.3 GB on a 9-frame 864x480 clip, M2 Pro 32 GB); the quality preset with dynamic captions
+needs more than 32 GB.
+
+### Game assets: `download` and `verify`
+
+`releases/game-assets.json` is a byte copy of upstream's asset manifest. Scene resources (not weights) are fetched
+and checked with:
+
+```bash
+matrix-game-mlx download --manifest releases/game-assets.json --repo-id Skywork/Matrix-Game-4.0 \
+  --repo-type model --revision 4419accdb7bb7881234c5914de8cd915266e0325 --scene ancient-egypt --resources resources
+matrix-game-mlx verify --manifest releases/game-assets.json --scene ancient-egypt --resources resources
+```
+
+Unlike upstream, there is no `models.json` step: the model weights come from the MLX pack (see Weights).
+Archives are never extracted.
 
 ## Weights
 
@@ -237,6 +295,17 @@ bf16 linear, conv and SDPA calls on the CPU compute in fp32 and round the output
 kernel semantics). Every other op, including the float64 islands, runs unchanged, and `meta.json` records the
 emulation and the device of each part.
 
+Variant fixtures (the CLI's new options) are generated with `--variant NAME`, and the caption embeddings with
+`--captions-only`; `--print-variant-commands` lists every command:
+
+| Command | Validates (`tests/parity/`) |
+| --- | --- |
+| `python -m tests.parity.gen_fixtures --captions-only` | umT5 caption embeddings vs upstream torch (`test_real_weights_captions.py`) |
+| `--variant racing_switch_realtime` / `racing_switch_quality` | Dynamic prompt switch (prompt A to prompt B) (`test_real_weights_variants.py`) |
+| `--variant castle_nosink_realtime` / `racing_nosink_realtime` | `--no-sink-image` |
+| `--variant castle_taehv_2step` | TAEHV with a custom 2-step schedule |
+| `--variant egypt_wan_custom_first` | Wan VAE with custom `--first-steps` |
+
 A realtime fixture set takes about 10 min per scene and is about 200 MB; `--taehv-only` (~20 s) and `--floor-only` are
 partial modes.
 
@@ -248,6 +317,10 @@ Run with a Python that has the MLX/torch stack (the development machine uses Hom
 cd Matrix-Game-4-mlx
 python -m pytest tests -v
 ```
+
+The fast suite (no weights, no fixtures) is `python -m pytest -m "not needs_weights and not needs_fixtures"`.
+`tests/test_cli_smoke.py` (`needs_weights`) renders a 9-frame 864x480 racing clip in realtime dynamic mode through the CLI
+and checks `peak_memory_gb < 30`.
 
 The real-weight parity suite runs once per scene whose fixtures exist (a missing or partial set is skipped with
 its `gen_fixtures` command) and loads one DiT at a time. Install the `parity` extra for the upstream oracle. Tests marked `needs_fixtures` read the torch reference

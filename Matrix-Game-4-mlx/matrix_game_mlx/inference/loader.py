@@ -8,6 +8,7 @@ from typing import Dict
 from huggingface_hub import hf_hub_download, snapshot_download
 
 PACK_REPO_ID = "dgrauet/matrix-game-4.0-mlx"
+WEIGHTS_ENV = "MATRIX_GAME_4_MLX_WEIGHTS_DIR"
 PACK_REVISION = "327ce1f7ae729224ba37b0326fbf0eb4f79e0503"
 
 
@@ -16,11 +17,17 @@ def pack_dir(components=None) -> Path:
 
     From the Hub, the small files (json configs, sink images) are always fetched, plus the `components` safetensors
     (e.g. ("dit_castle", "taehv")); default is every component. Downloads are cached by huggingface_hub."""
-    local = os.environ.get("MATRIX_GAME_4_MLX_WEIGHTS_DIR")
+    local = os.environ.get(WEIGHTS_ENV)
     if local:
         return Path(local)
     weights = ["*.safetensors"] if components is None else [f"{c}.safetensors" for c in components]
     return Path(snapshot_download(PACK_REPO_ID, revision=PACK_REVISION, allow_patterns=["*.json", "*.png", *weights]))
+
+
+def scene_sink_image(scene: str) -> Path:
+    """Pack sink image path for `scene`, read from the pack's config.json (no weights are downloaded)."""
+    pack = pack_dir(())
+    return pack / json.loads((pack / "config.json").read_text())["scenes"][scene]["sink_image"]
 
 
 def sha256_file(path: Path) -> str:
@@ -58,24 +65,21 @@ def resolve_shared_files(pack: Path, components=None) -> Dict[str, Path]:
 
 
 class ModelComponents:
-    """Load T5 (encode + free), DiT and codec for one scene: Wan VAE (quality) or TAEHV (realtime)."""
+    """Model ownership for one resolved CLI/API `args` (see matrix_game_mlx.scenes.resolve_model_arguments).
 
-    def __init__(self, scene: str, preset: str = "quality", sink_image=None, pack: Path = None):
-        from matrix_game_mlx.scenes import SCENES, scene_sink_policy
-        if preset not in ("quality", "realtime"):
-            raise ValueError(f"Unknown preset {preset!r}; expected quality or realtime")
-        self.scene, self.preset = scene, preset
+    Loads the DiT, the codec (Wan VAE or TAEHV, chosen by `args.vae_backend`) and the prompt embeddings. Fixed prompts
+    are encoded once and T5 is freed; dynamic prompts keep a resident CaptionEncoder."""
+
+    def __init__(self, args, pack: Path = None):
+        self.args = args
         self.pack = Path(pack) if pack else pack_dir(())
         self.cfg = json.loads((self.pack / "config.json").read_text())
-        entry = self.cfg["scenes"][scene]
-        self.component = entry["component"]
-        self.inference = json.loads((self.pack / entry["inference"]).read_text())
-        self.sink_image = Path(sink_image) if sink_image else self.pack / entry["sink_image"]
-        self.prompt_text = SCENES[scene]["prompt"]
-        self.sink_mode, self.sink_rope_mode = scene_sink_policy(scene)
-        self.vae_backend = "taehv" if preset == "realtime" else "wan"
-        self.steps = tuple(self.inference[f"{preset}_steps"])
-        self.gen = self.vae = self.prompt = self.sink_latent = None
+        self.entry = self.cfg["scenes"][args.scene]
+        self.component = self.entry["component"]
+        self.gen = self.vae = self.prompt = None
+        self.sink_latent = self.sink_sha256 = None
+        self.attention_backend = "mlx-sdpa"
+        self.caption_encoder = None
         self._fetch_weights = pack is None
 
     def load(self):
@@ -83,34 +87,55 @@ class ModelComponents:
         import mlx.core as mx
         from matrix_game_mlx.inference.loading import build_dit
         from matrix_game_mlx.inference.stream import encode_sink_image
+        from matrix_game_mlx.inference.text import CaptionEncoder
         from matrix_game_mlx.inference.wrappers import WanTextEncoder
+        args = self.args
+        taehv = args.vae_backend == "taehv"
         if self._fetch_weights:
-            self.pack = pack_dir((self.component, "taehv") if self.vae_backend == "taehv" else (self.component,))
-        shared = resolve_shared_files(self.pack, ("t5_encoder", "vae") if self.vae_backend == "wan" else ("t5_encoder",))
+            self.pack = pack_dir((self.component, "taehv") if taehv else (self.component,))
+        shared = resolve_shared_files(self.pack, ("t5_encoder",) if taehv else ("t5_encoder", "vae"))
+        inference = json.loads((self.pack / self.entry["inference"]).read_text())
         text = WanTextEncoder(str(shared["t5_encoder.safetensors"]), str(shared["google/umt5-xxl"]))
-        self.prompt = text([self.prompt_text])["prompt_embeds"].astype(mx.bfloat16)
-        mx.eval(self.prompt)
+        if args.prompt_mode == "dynamic":
+            self.caption_encoder = CaptionEncoder(text, graph=args.t5_runtime == "graph")
+            self.prompt = self.caption_encoder(args.prompt)
+        else:
+            self.prompt = text([args.prompt])["prompt_embeds"].astype(mx.bfloat16)
+            mx.eval(self.prompt)
         del text
         gc.collect()
         mx.clear_cache()
-        self.gen = build_dit(self.pack, self.component, timestep_shift=self.inference["scheduler_shift"])
-        if self.vae_backend == "wan":
-            from matrix_game_mlx.inference.wrappers import WanVAE22Wrapper
-            self.vae = WanVAE22Wrapper(str(shared["vae.safetensors"]), dtype=mx.bfloat16)
-        else:
+        self.gen = build_dit(self.pack, self.component, timestep_shift=inference["scheduler_shift"])
+        if taehv:
             from matrix_game_mlx.inference.taehv import TAEHV
             self.vae = TAEHV.from_pack(self.pack / "taehv.safetensors", dtype=mx.bfloat16)
-        self.sink_latent = encode_sink_image(self.vae, self.sink_image, self.vae_backend,
-                                             first_frame=self.sink_mode == "first_frame").astype(mx.bfloat16)
-        mx.eval(self.sink_latent)
+        else:
+            from matrix_game_mlx.inference.wrappers import WanVAE22Wrapper
+            self.vae = WanVAE22Wrapper(str(shared["vae.safetensors"]), dtype=mx.bfloat16)
+        if args.sink_image is not None:
+            self.sink_latent = encode_sink_image(self.vae, args.sink_image, args.vae_backend,
+                                                 first_frame=args.sink_mode == "first_frame").astype(mx.bfloat16)
+            mx.eval(self.sink_latent)
+            self.sink_sha256 = sha256_file(args.sink_image)
 
-    def stream(self, seed: int = 0):
+    def stream(self, **kwargs):
         from matrix_game_mlx.inference.stream import CastleStream
-        return CastleStream(self.gen, self.vae, self.prompt, seed=seed, vae_backend=self.vae_backend,
-                            steps=self.steps, first_steps=self.steps, sink_latent=self.sink_latent, sink_mode=self.sink_mode,
-                            sink_rope_mode=self.sink_rope_mode)
+        return CastleStream(self.gen, self.vae, self.prompt, vae_backend=self.args.vae_backend,
+                            steps=self.args.steps, first_steps=self.args.first_steps,
+                            sink_latent=self.sink_latent, sink_mode=self.args.sink_mode,
+                            sink_rope_mode=self.args.sink_rope_mode, **kwargs)
 
-    def config(self) -> dict:
-        return dict(scene=self.scene, component=self.component, preset=self.preset, vae_backend=self.vae_backend,
-                    steps=list(self.steps), first_steps=list(self.steps), sink_mode=self.sink_mode, sink_rope_mode=self.sink_rope_mode,
-                    sink_image=self.sink_image.name, prompt=self.prompt_text, dit_runtime="mlx-native")
+    def config(self):
+        from matrix_game_mlx.scenes import SCENES
+        a = self.args
+        return dict(scene=a.scene, scene_name=SCENES[a.scene]["name"], checkpoint=f"{self.component}.safetensors",
+                    ckpt_keys=["generator_ema"], vae_backend=a.vae_backend, steps=list(a.steps),
+                    first_steps=list(a.first_steps), sink_rope_mode=a.sink_rope_mode, sink_mode=a.sink_mode,
+                    sink_encoder=a.vae_backend, sink_source="image" if a.sink_image is not None else "generated_first_frame",
+                    sink_image=a.sink_image.name if a.sink_image is not None else None, sink_sha256=self.sink_sha256,
+                    prompt=a.prompt, hq_first_frame=a.sink_mode == "first_frame" and a.sink_image is not None,
+                    prompt_mode=a.prompt_mode, prompt_interval_chunks=a.prompt_interval_chunks,
+                    t5_runtime=a.t5_runtime, dit_parallel="single", dit_runtime=a.dit_runtime,
+                    attention_backend=self.attention_backend, vae_graph=False, early_publish=False,
+                    profile_chunks=False, reference_pipeline="stream", experimental_runtime=False,
+                    preset=a.preset, component=self.component)

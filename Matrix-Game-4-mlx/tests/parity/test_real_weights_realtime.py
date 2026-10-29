@@ -81,14 +81,15 @@ def taehv(scene, taehv_cache):
 def test_taehv_sink_latent(scene, taehv):
     """The pack's sink image through the MLX TAEHV vs torch's encode_sink_image (gen_fixtures inputs.npz)."""
     from matrix_game_mlx.inference.loader import ModelComponents
+    from matrix_game_mlx.scenes import model_args
     from matrix_game_mlx.inference.stream import encode_sink_image
     meta = _require(scene, "taehv_floors")
-    comps = ModelComponents(scene, PRESET)                                # config only, nothing loaded
+    comps = ModelComponents(model_args(scene, PRESET))                     # config only, nothing loaded
     # The image torch encoded is <checkpoint dir>/sink.png (gen_fixtures SceneSpec); the pack's copy must be the same
-    assert comps.sink_image == comps.pack / SCENE_SPECS[scene].src_dir / "sink.png"
-    assert comps.sink_image.read_bytes() == SCENE_SPECS[scene].sink_image.read_bytes()
+    assert comps.args.sink_image == comps.pack / SCENE_SPECS[scene].src_dir / "sink.png"
+    assert comps.args.sink_image.read_bytes() == SCENE_SPECS[scene].sink_image.read_bytes()
     torch_sink = np.load(_dir(scene) / "inputs.npz")["sink_latent"]
-    sink = encode_sink_image(taehv, comps.sink_image, "taehv", first_frame=comps.sink_mode == "first_frame")
+    sink = encode_sink_image(taehv, comps.args.sink_image, "taehv", first_frame=comps.args.sink_mode == "first_frame")
     floor = meta["taehv_floors"]["sink"]["max"]
     tol = ceil_1sig(1.5 * floor)
     err = rel_l2(sink, torch_sink)
@@ -132,6 +133,7 @@ def loaded():
 @pytest.fixture
 def comps(scene, loaded):
     from matrix_game_mlx.inference.loader import ModelComponents
+    from matrix_game_mlx.scenes import model_args
     meta = _require(scene, "taehv_floors", "floor")
     if loaded.get("scene") != scene:
         loaded.clear()
@@ -141,9 +143,9 @@ def comps(scene, loaded):
         gc.collect()
         mx.clear_cache()
         inputs = np.load(_dir(scene) / "inputs.npz")
-        comps = ModelComponents(scene, PRESET)
-        assert (comps.sink_mode, comps.sink_rope_mode) == (meta["sink_mode"], meta["sink_rope_mode"])
-        assert (comps.vae_backend, comps.steps) == ("taehv", tuple(meta["steps"]))
+        comps = ModelComponents(model_args(scene, PRESET))
+        assert (comps.args.sink_mode, comps.args.sink_rope_mode) == (meta["sink_mode"], meta["sink_rope_mode"])
+        assert (comps.args.vae_backend, comps.args.steps) == ("taehv", tuple(meta["steps"]))
         comps.load()
         comps.prompt = mx.array(inputs["prompt_embeds"]).astype(mx.bfloat16)     # same embeddings as the torch run
         comps.sink_latent = mx.array(inputs["sink_latent"]).astype(mx.bfloat16)  # torch's TAEHV sink
@@ -171,7 +173,7 @@ def test_stream_end_to_end_realtime(scene, comps):
     try:
         recorder = _StepRecorder(stream.gen)
         stream.gen = recorder
-        first_frame = comps.sink_mode == "first_frame"
+        first_frame = comps.args.sink_mode == "first_frame"
         gated = {0, 1} if first_frame else {0}
         failures, frame = [], 0
         for i in range(meta["chunks"]):
