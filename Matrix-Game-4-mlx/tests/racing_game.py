@@ -7,7 +7,7 @@ from typing import Optional
 REPO = Path(__file__).resolve().parents[2]
 UPSTREAM = REPO / "Matrix-Game-4"
 RESOURCES_ENV = "MG4_RESOURCES"
-BUILD_COMMAND = 'cd Matrix-Game-4 && bash scripts/build_racing.sh -DRACING_ASSET_ROOT="$MG4_RESOURCES/racing"'
+README_SECTION = "the \"Racing tests\" section of Matrix-Game-4-mlx/README.md"
 
 
 def resources_dir() -> Path:
@@ -22,15 +22,32 @@ def game_binary() -> Path:
     return UPSTREAM / "game/racing/bin/CitySampleBBoxGame"
 
 
+def download_command() -> str:
+    """The assets download command (README "Racing assets"), targeting the resources directory in use."""
+    return ("cd Matrix-Game-4-mlx && matrix-game-mlx download --manifest releases/game-assets.json "
+            "--repo-id Skywork/Matrix-Game-4.0 --repo-type model "
+            "--revision 4419accdb7bb7881234c5914de8cd915266e0325 --scene racing "
+            f"--resources {resources_dir()}")
+
+
+def build_command() -> str:
+    """The game build command (README "Dependencies and build"); needs the assets first (ctest uses them)."""
+    return f'cd Matrix-Game-4 && bash scripts/build_racing.sh -DRACING_ASSET_ROOT="{racing_data_dir()}"'
+
+
+def take_hint(take: Path) -> str:
+    """What to do when the recorded take is missing: the record command lives in the README."""
+    return f"no recorded take at {take}: record one with the command in {README_SECTION}, or set {TAKE_ENV}"
+
+
 def racing_game_missing() -> Optional[str]:
     """None when the game binary and its assets are present, else what to run to get them."""
     todo = []
     if not (racing_data_dir() / "assets/bbox-assets.bin").is_file():
-        todo.append("matrix-game-mlx download --scene racing --manifest releases/game-assets.json "
-                    "--resources $MG4_RESOURCES ...")
+        todo.append(download_command())
     if not game_binary().is_file():
-        todo.append(BUILD_COMMAND)
-    return "racing game not ready, run: " + " ; ".join(todo) if todo else None
+        todo.append(build_command())
+    return "racing game not ready, run (in this order): " + " ; ".join(todo) if todo else None
 
 
 def run_game(args: list, timeout: float) -> subprocess.CompletedProcess:

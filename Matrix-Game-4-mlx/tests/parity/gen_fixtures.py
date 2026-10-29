@@ -1437,6 +1437,8 @@ def variant_main(args, v: VariantSpec) -> None:
     if v.take:
         from tests import racing_game
         take = racing_game.default_take()
+        if not (take / "session.json").is_file():
+            raise FileNotFoundError(racing_game.take_hint(take))
         meta["take_session"] = json.loads((take / "session.json").read_text())
         meta["take_reference_sha256"] = hashlib.sha256((take / "reference.mkv").read_bytes()).hexdigest()
         pixels = take_frames(take, n_frames)

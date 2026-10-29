@@ -109,7 +109,7 @@ tests/
   test_racing_take_render.py     # realtime and dynamic-caption renders of the take finalize; captions file matches the take (needs weights)
   data/racing_captions.jsonl     # hand-made 9-frame captions (3 records)
   data/racing/take_input_script.json  # scripted racing take inputs ({frame, key, down}; 720 frames at 48 FPS)
-  data/racing/take_captions.jsonl     # 9-frame offline captions for a racing take
+  data/racing/take_captions.jsonl     # offline captions for the racing take (181 records covering the 720 frames)
 ```
 
 ## Tech Stack
