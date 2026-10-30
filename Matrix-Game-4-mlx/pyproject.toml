@@ -23,4 +23,5 @@ matrix_game_mlx = ["configs/*.json"]
 markers = ["needs_weights: requires the converted MLX pack", "needs_fixtures: requires torch reference fixtures",
            "needs_racing_game: requires the built upstream racing game and its assets",
            "needs_castle_game: requires the built shooter CastleReferenceServer",
-           "needs_racing_server: requires the built CitySampleReferenceServer and the racing assets"]
+           "needs_racing_server: requires the built CitySampleReferenceServer and the racing assets",
+           "needs_media: requires mediamtx and a GI-enabled Python (brew install mediamtx gstreamer pygobject3)"]
