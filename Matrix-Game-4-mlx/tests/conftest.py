@@ -77,3 +77,7 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(pytest.mark.skip(reason="no torch fixtures in MG4_FIXTURES_DIR"))
         if "needs_racing_game" in item.keywords and racing_game.racing_game_missing():
             item.add_marker(pytest.mark.skip(reason=racing_game.racing_game_missing()))
+        if "needs_castle_game" in item.keywords and racing_game.castle_game_missing():
+            item.add_marker(pytest.mark.skip(reason=racing_game.castle_game_missing()))
+        if "needs_racing_server" in item.keywords and racing_game.racing_server_missing():
+            item.add_marker(pytest.mark.skip(reason=racing_game.racing_server_missing()))

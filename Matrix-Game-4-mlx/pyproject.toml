@@ -21,4 +21,6 @@ matrix_game_mlx = ["configs/*.json"]
 
 [tool.pytest.ini_options]
 markers = ["needs_weights: requires the converted MLX pack", "needs_fixtures: requires torch reference fixtures",
-           "needs_racing_game: requires the built upstream racing game and its assets"]
+           "needs_racing_game: requires the built upstream racing game and its assets",
+           "needs_castle_game: requires the built shooter CastleReferenceServer",
+           "needs_racing_server: requires the built CitySampleReferenceServer and the racing assets"]
