@@ -55,9 +55,10 @@ class MediaEnvironmentTests(unittest.TestCase):
     def test_sidecar_import_stays_light(self):
         import subprocess
         import sys
+        from pathlib import Path
         code = ("import sys, matrix_game_mlx.server.transport.output as o; "
                 "sys.exit(any(m in sys.modules for m in ('mlx', 'torch', 'aiohttp')))")
-        self.assertEqual(subprocess.run([sys.executable, "-c", code]).returncode, 0)
+        self.assertEqual(subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[1]).returncode, 0)
 
 
 if __name__ == "__main__":
