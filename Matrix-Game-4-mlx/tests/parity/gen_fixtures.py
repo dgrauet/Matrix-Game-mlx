@@ -32,7 +32,13 @@ when the variant has a sink), chunks.npz, floor_chunk_{i}.npz (native bf16 CPU S
 and meta.json (variant, vae_backend, steps, first_steps, sink, switch_chunk, prompt_b, floor with control_rel_l2).
 The racing_take_* variants take their pixels from the scripted racing take (take_frames: first 9 frames of
 reference.mkv, preprocessed as offline.py does; sink = the scene sink image) and record take_session and
-take_reference_sha256 in meta.json. Switch variants call the upstream CastleStream.set_prompt(prompt B) before switch_chunk. `--variant-floor-only`
+take_reference_sha256 in meta.json. Switch variants call the upstream CastleStream.set_prompt(prompt B) before switch_chunk.
+The *_online_* variants (VariantSpec.capture) take their pixels from a real serve-mode capture (capture_online.py:
+the first 9 RGB frames the online producer fed frames_to_tensor, capture_frames) and record capture_name and
+capture_frames_sha256 in meta.json; racing_online_dynamic also replays the engine captions as upstream
+Session.produce does in dynamic mode (capture_prompts, interval 1, from the racing profile prompt), embeds each
+distinct caption with upstream umT5 (chunk_prompt_embeds_{i} in inputs.npz, meta capture_prompts) and calls
+CastleStream.set_prompt before each chunk where the prompt switches. `--variant-floor-only`
 regenerates the floor only. `--captions-only` writes `$MG4_FIXTURES_DIR/captions/` (embeds.npz: upstream umT5 bf16
 reference and fp32 / fp64-accumulate variants of the three scene prompts and prompt B; meta.json: floor per caption).
 `--print-variant-commands` prints the captions command, then the variant commands (one at a time, ~10-25 min
@@ -187,6 +193,54 @@ def take_frames(take: Path, n: int) -> np.ndarray:
     frames = [crop_and_resize(Image.fromarray(np.frombuffer(r, np.uint8).reshape(height, width, 3)), 480, 864)
               for r in raw]
     return to_np(frames_to_tensor(frames)).astype(np.float32)
+
+
+def capture_dir(name: str) -> Path:
+    """Default location of an online capture (capture_online.py): $MG4_RESOURCES/online-captures/<name>/."""
+    from tests.racing_game import resources_dir
+    return resources_dir() / "online-captures" / name
+
+
+def file_sha256(path: Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def capture_frames(capture: Path, n: int) -> np.ndarray:
+    """The first `n` frames of an online capture (frames.npy: the uint8 [N, 480, 864, 3] RGB images the online
+    producer fed frames_to_tensor) through frames_to_tensor, as Session.produce pushes them. float32
+    [n, 3, 480, 864] in [-1, 1]. Raises ValueError when frames.npy does not match capture.json frames_sha256."""
+    from PIL import Image
+    from matrix_game_mlx.inference.preprocessing import frames_to_tensor
+    capture = Path(capture)
+    expected = json.loads((capture / "capture.json").read_text())["frames_sha256"]
+    if file_sha256(capture / "frames.npy") != expected:
+        raise ValueError(f"{capture}/frames.npy does not match capture.json frames_sha256: recapture it")
+    frames = np.load(capture / "frames.npy")
+    if frames.dtype != np.uint8 or frames.ndim != 4 or frames.shape[1:] != (480, 864, 3) or len(frames) < n:
+        raise ValueError(f"{capture}: frames {frames.dtype} {frames.shape}, need at least {n} uint8 480x864 RGB")
+    return to_np(frames_to_tensor([Image.fromarray(f) for f in frames[:n]])).astype(np.float32)
+
+
+def capture_prompts(capture: Path, chunks: int, interval: int, initial: str) -> list:
+    """Per chunk, the prompt to set_prompt before pushing it (None: unchanged), replaying upstream Session.produce in
+    dynamic mode on the capture's states.jsonl: on chunks with chunk % interval == 0 take states[-1]["chunk_prompt"]
+    and switch when it differs from the current prompt, which starts at `initial` (the scene profile prompt)."""
+    rows = [json.loads(line) for line in (Path(capture) / "states.jsonl").read_text().splitlines() if line]
+    if len(rows) < chunks:
+        raise ValueError(f"{capture}: {len(rows)} captured chunks, need {chunks}")
+    current, out = initial, []
+    for chunk, row in enumerate(rows[:chunks]):
+        candidate = None
+        if chunk % interval == 0:
+            candidate = row["states"][-1].get("chunk_prompt")
+            if not candidate:
+                raise ValueError(f"{capture}: chunk {chunk} has no frame-aligned engine caption")
+        if candidate is None or candidate == current:
+            out.append(None)
+        else:
+            out.append(candidate)
+            current = candidate
+    return out
 
 
 def chunk_slices(n_chunks: int):
@@ -1085,6 +1139,7 @@ class VariantSpec:
     sink: bool
     switch_chunk: Optional[int]
     take: bool = False      # pixels from the scripted racing take (take_frames) instead of the synthetic pan
+    capture: Optional[str] = None   # pixels (and racing captions) from a real online capture (capture_dir(capture))
 
     @property
     def scene_spec(self) -> SceneSpec:
@@ -1098,6 +1153,11 @@ class VariantSpec:
     @property
     def prompt_b(self) -> Optional[str]:
         return PROMPT_B if self.switch_chunk is not None else None
+
+    @property
+    def dynamic_prompts(self) -> bool:
+        """The prompt follows the capture's engine captions (upstream dynamic captions exist for racing only)."""
+        return self.capture is not None and self.scene == "racing"
 
     def model_argv(self) -> list:
         """matrix_game_mlx.scenes.model_args argv reproducing this variant (codec, steps, first steps, sink)."""
@@ -1115,7 +1175,15 @@ VARIANT_SPECS = {v.name: v for v in (
     VariantSpec("egypt_wan_custom_first", "ancient-egypt", "wan", (1000,), (1000, 750, 500, 250), True, None),
     VariantSpec("racing_take_realtime", "racing", "taehv", (1000,), (1000,), True, None, take=True),
     VariantSpec("racing_take_quality", "racing", "wan", (1000, 500), (1000, 500), True, None, take=True),
+    VariantSpec("racing_online_dynamic", "racing", "taehv", (1000,), (1000,), True, None, capture="racing-online"),
+    VariantSpec("castle_online_realtime", "castle", "taehv", (1000,), (1000,), True, None, capture="castle-online"),
 )}
+ONLINE_PROMPT_INTERVAL = 1           # upstream serve --prompt-interval-chunks default
+
+
+def capture_command(v: VariantSpec) -> str:
+    """The capture_online command that records a capture variant's capture into its default location."""
+    return f"python -m tests.parity.capture_online --scene {v.scene}"
 
 
 def variant_dir(name: str) -> Path:
@@ -1148,7 +1216,12 @@ def variant_generator_calls(v: VariantSpec, chunk: int) -> int:
 
 
 def gated_chunks(v: VariantSpec) -> tuple:
-    """Chunks the variant gate checks: the first denoised chunk, plus the prompt-switch chunk."""
+    """Chunks the variant gate checks: the first denoised chunk, plus the prompt-switch chunk; every denoised chunk of
+    a dynamic-prompt capture (its engine-caption switches can fall on any chunk). A fixed-prompt capture follows the
+    standing rule: later castle chunks diverge chaotically even torch vs torch (castle chunk 2 floor decoded PSNR
+    ~22-23 dB on both the pan and the online capture), so they are reported only."""
+    if v.dynamic_prompts:
+        return tuple(i for i in range(VARIANT_CHUNKS) if variant_steps(v, i))
     first = next(i for i in range(VARIANT_CHUNKS) if variant_steps(v, i))
     return tuple(sorted({first} | ({v.switch_chunk} if v.switch_chunk is not None else set())))
 
@@ -1267,14 +1340,25 @@ def variant_codec(torch, v: VariantSpec, device_pref: str, pixels_0: np.ndarray,
     return vae, vae
 
 
+def chunk_prompts(v: VariantSpec, prompt_b, n_chunks: int) -> list:
+    """Per chunk, the embeddings CastleStream.set_prompt receives before the push (None: unchanged). `prompt_b` is a
+    switch variant's prompt B embeddings (set before switch_chunk), or a capture variant's per-chunk list already
+    (load_variant_inputs: the capture_prompts replay)."""
+    if isinstance(prompt_b, list):
+        return prompt_b
+    return [prompt_b if i == v.switch_chunk else None for i in range(n_chunks)]
+
+
 def run_variant(torch, v: VariantSpec, stream, pixels, noises, renoises, prompt_b, on_chunk) -> list:
-    """Push the variant's chunks with the prepared initial noises and renoise draws; before chunk v.switch_chunk the
-    prompt switches to prompt_b through CastleStream.set_prompt (cross-attention caches re-initialized)."""
+    """Push the variant's chunks with the prepared initial noises and renoise draws; before each chunk with prompt
+    embeddings in chunk_prompts (switch_chunk, or a capture's engine-caption switches) the prompt switches through
+    CastleStream.set_prompt (cross-attention caches re-initialized)."""
     recorder = GenRecorder(stream.gen)
     stream.gen = recorder
+    prompts = chunk_prompts(v, prompt_b, len(noises))
     for i, (a, b) in enumerate(chunk_slices(len(noises))):
-        if i == v.switch_chunk:
-            stream.set_prompt(torch.from_numpy(prompt_b).to(stream.device, torch.bfloat16))
+        if prompts[i] is not None:
+            stream.set_prompt(torch.from_numpy(prompts[i]).to(stream.device, torch.bfloat16))
         t0 = time.perf_counter()
         recorder.preds.clear()
         with injected_renoise(torch, [torch.from_numpy(r) for r in renoises[i]]) as left:
@@ -1289,11 +1373,14 @@ def run_variant(torch, v: VariantSpec, stream, pixels, noises, renoises, prompt_
 
 
 def variant_inputs(prompt, prompt_b, sink, pixels, noises, renoises) -> dict:
-    """inputs.npz content of a variant (inverse of load_variant_inputs); prompt_b / sink None when absent."""
+    """inputs.npz content of a variant (inverse of load_variant_inputs); prompt_b / sink None when absent; a capture
+    variant's prompt_b is its per-chunk list (chunk_prompt_embeds_{i} where the prompt switches)."""
     inputs = dict(prompt_embeds=prompt)
     if sink is not None:
         inputs["sink_latent"] = sink
-    if prompt_b is not None:
+    if isinstance(prompt_b, list):
+        inputs.update({f"chunk_prompt_embeds_{i}": e for i, e in enumerate(prompt_b) if e is not None})
+    elif prompt_b is not None:
         inputs["prompt_b_embeds"] = prompt_b
     for i, (a, b) in enumerate(chunk_slices(len(noises))):
         inputs[f"pixels_{i}"], inputs[f"initial_noise_{i}"] = pixels[a:b], noises[i]
@@ -1302,13 +1389,17 @@ def variant_inputs(prompt, prompt_b, sink, pixels, noises, renoises) -> dict:
 
 
 def load_variant_inputs(v: VariantSpec, inputs) -> tuple:
-    """(pixels [9, 3, H, W], initial noises, renoise lists, sink or None, prompt_b or None) from inputs.npz."""
+    """(pixels [9, 3, H, W], initial noises, renoise lists, sink or None, prompt_b or None) from inputs.npz; for a
+    capture variant the last item is the per-chunk list of set_prompt embeddings (None: unchanged)."""
     n = VARIANT_CHUNKS
     pixels = np.concatenate([inputs[f"pixels_{i}"] for i in range(n)])
     noises = [inputs[f"initial_noise_{i}"] for i in range(n)]
     renoises = [[inputs[f"renoise_{i}_{k}"] for k in range(variant_n_renoise(v, i))] for i in range(n)]
     sink = inputs["sink_latent"] if v.sink else None
     prompt_b = inputs["prompt_b_embeds"] if v.switch_chunk is not None else None
+    if v.capture is not None:
+        prompt_b = [inputs[f"chunk_prompt_embeds_{i}"] if f"chunk_prompt_embeds_{i}" in inputs.files else None
+                    for i in range(n)]
     return pixels, noises, renoises, sink, prompt_b
 
 
@@ -1430,10 +1521,26 @@ def variant_main(args, v: VariantSpec) -> None:
                 prompt_embeds_source="upstream umT5 bf16 CPU (cpu_bf16_emulation), pack shared t5_encoder weights")
     if v.vae_backend == "taehv":
         meta["taehv_checkpoint"] = str(TAEHV_CHECKPOINT)
-    log("prompt embeddings (torch T5)")
-    embeds = torch_prompt_embeds([SCENES[v.scene]["prompt"]] + ([v.prompt_b] if v.prompt_b else []))
-    prompt, prompt_b = embeds[0], (embeds[1] if v.prompt_b else None)
     n_frames = 1 + 4 * (VARIANT_CHUNKS - 1)
+    captions = []
+    if v.capture is not None:
+        capture = capture_dir(v.capture)
+        if not (capture / "capture.json").is_file():
+            raise FileNotFoundError(f"no online capture at {capture}: record it with {capture_command(v)}")
+        meta.update(capture_name=v.capture, capture=json.loads((capture / "capture.json").read_text()))
+        meta["capture_frames_sha256"] = meta["capture"]["frames_sha256"]
+        pixels = capture_frames(capture, n_frames)            # frames_sha256 checked before T5 runs
+        if v.dynamic_prompts:
+            meta["prompt_interval_chunks"] = ONLINE_PROMPT_INTERVAL
+            meta["capture_prompts"] = capture_prompts(capture, VARIANT_CHUNKS, ONLINE_PROMPT_INTERVAL,
+                                                      SCENES[v.scene]["prompt"])
+            captions = list(dict.fromkeys(p for p in meta["capture_prompts"] if p is not None))
+    log(f"prompt embeddings (torch T5, {1 + len(captions)} distinct engine/profile prompts)")
+    embeds = torch_prompt_embeds([SCENES[v.scene]["prompt"]] + ([v.prompt_b] if v.prompt_b else []) + captions)
+    prompt, prompt_b = embeds[0], (embeds[1] if v.prompt_b else None)
+    if v.dynamic_prompts:                         # per chunk, the embeddings set_prompt receives (None: unchanged)
+        by_text = dict(zip(captions, embeds[1:]))
+        prompt_b = [None if p is None else by_text[p] for p in meta["capture_prompts"]]
     if v.take:
         from tests import racing_game
         take = racing_game.default_take()
@@ -1442,7 +1549,7 @@ def variant_main(args, v: VariantSpec) -> None:
         meta["take_session"] = json.loads((take / "session.json").read_text())
         meta["take_reference_sha256"] = hashlib.sha256((take / "reference.mkv").read_bytes()).hexdigest()
         pixels = take_frames(take, n_frames)
-    else:
+    elif v.capture is None:
         pixels = pan_frames(spec, n_frames)
     noises, renoises = variant_noises(v)
     variant_reference(args, v, out, meta, prompt, prompt_b, pixels, noises, renoises)

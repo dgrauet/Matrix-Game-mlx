@@ -1,0 +1,23 @@
+[
+ {
+  "sequence": 1,
+  "forward": 1.0,
+  "right": 0.0,
+  "look_x": 0.0,
+  "look_y": 0.0
+ },
+ {
+  "sequence": 2,
+  "forward": 1.0,
+  "right": 0.0,
+  "look_x": 60.0,
+  "look_y": 0.0
+ },
+ {
+  "sequence": 3,
+  "forward": 1.0,
+  "right": 0.5,
+  "look_x": 60.0,
+  "look_y": 0.0
+ }
+]

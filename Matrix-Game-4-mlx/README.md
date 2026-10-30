@@ -429,7 +429,7 @@ MATRIX_GAME_4_MLX_WEIGHTS_DIR=... python -m tests.parity.gen_fixtures --scene ca
 | `--taehv-only` | Realtime only: regenerate only the TAEHV fixtures (~20 s) |
 | `--blocks-only` | Regenerate only the per-block fixture (chunk 0 call 0; chunk 1 call 0 for racing) and its floors |
 
-They are written to `$MG4_FIXTURES_DIR/<scene>_quality/` or `<scene>_realtime/` (`egypt_quality`, `castle_quality`, `racing_quality`, `egypt_realtime`, `castle_realtime`, `racing_realtime`, `racing_take_realtime`, `racing_take_quality`;
+They are written to `$MG4_FIXTURES_DIR/<scene>_quality/` or `<scene>_realtime/` (`egypt_quality`, `castle_quality`, `racing_quality`, `egypt_realtime`, `castle_realtime`, `racing_realtime`, `racing_take_realtime`, `racing_take_quality`, `racing_online_dynamic`, `castle_online_realtime`;
 default `~/.cache/matrix-game-4-mlx/fixtures`): about 1.5 GB per scene without `--long` (ancient-egypt 1.7 GB)
 and about 6 GB with `--long` (ancient-egypt 5.7 GiB, racing 5.2 GiB) (the chunk-22 per-call fixture alone is 3.8 GB). A full castle set takes about 1 h to
 generate, a racing set with `--long` about 1 h 15. For racing the torch DiT runs on the CPU (no sink-priming
@@ -450,6 +450,7 @@ Variant fixtures (the CLI's new options) are generated with `--variant NAME`, an
 | `python -m tests.parity.gen_fixtures --captions-only` | umT5 caption embeddings vs upstream torch (`test_real_weights_captions.py`) |
 | `--variant racing_switch_realtime` / `racing_switch_quality` | Dynamic prompt switch (prompt A to prompt B) (`test_real_weights_variants.py`) |
 | `--variant racing_take_realtime` / `racing_take_quality` | The first 9 frames of a real recorded racing take (scene sink image, fixed prompt); needs the take (`MG4_RACING_TAKE`) (`test_real_weights_variants.py`) |
+| `--variant racing_online_dynamic` / `castle_online_realtime` | The first 9 frames of a real `serve` session capture (`python -m tests.parity.capture_online --scene racing\|castle`, into `$MG4_RESOURCES/online-captures/<scene>-online/`); racing replays the engine captions with the upstream dynamic-prompt rule (`set_prompt` on every caption change) (`test_real_weights_variants.py`) |
 | `--variant castle_nosink_realtime` / `racing_nosink_realtime` | `--no-sink-image` |
 | `--variant castle_taehv_2step` | TAEHV with a custom 2-step schedule |
 | `--variant egypt_wan_custom_first` | Wan VAE with custom `--first-steps` |

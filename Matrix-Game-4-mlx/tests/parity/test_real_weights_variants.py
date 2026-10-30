@@ -6,12 +6,16 @@ or partial set is skipped with its gen_fixtures command. The MLX stream is built
 the variant (matrix_game_mlx.scenes.model_args with the variant's explicit --vae-backend / --steps / --first-steps /
 --no-sink-image) and fed torch's prompt embeddings, sink latent (variants with a sink), initial noises and renoise
 draws; switch variants call CastleStream.set_prompt(torch's prompt B embeddings) before switch_chunk, as the torch
-run did on the upstream stream.
+run did on the upstream stream. Online-capture variants (racing_online_dynamic, castle_online_realtime) push the
+pixels of a real serve-mode capture (tests/parity/capture_online.py); their fixture's capture_frames_sha256 must
+match the capture on disk, and racing_online_dynamic calls set_prompt(torch's embeddings of the engine caption)
+before every chunk where the replayed upstream Session.produce rule switches (gen_fixtures.chunk_prompts).
 
 Gated chunks (gen_fixtures.gated_chunks): the first denoised chunk (chunk 0, or chunk 1 for racing with a sink, whose
-chunk 0 is the sink latent itself: no denoising, pred bitwise the sink), plus switch_chunk for switch variants. Per
-gated chunk, by the standing floor method (floor measured per configuration, gen_fixtures.variant_floor):
-control and layer 0 / 29 K cache rel L2 < max(2e-2, ceil_1sig(1.5 x floor)) (control floor: meta.json
+chunk 0 is the sink latent itself: no denoising, pred bitwise the sink), plus switch_chunk for switch variants; every
+denoised chunk for racing_online_dynamic (an engine-caption switch can fall on any chunk; at least one must fall
+between two gated chunks). Per gated chunk, by the standing floor method (floor measured per configuration,
+gen_fixtures.variant_floor): control and layer 0 / 29 K cache rel L2 < max(2e-2, ceil_1sig(1.5 x floor)) (control floor: meta.json
 floor.control_rel_l2; K floor: floor_chunk_i.npz vs the fixture), pred rel L2 < max(2e-2, 1.5 x floor), decoded PSNR
 > 35 dB. The 2e-2 lower bound is the realtime suite's flat spec threshold (a floor-derived gate never goes below it). The other
 chunks are reported (-s). Every chunk's denoising-call count must match torch's and gen_fixtures.variant_steps.
@@ -27,8 +31,9 @@ import pytest
 import mlx.core as mx
 
 from tests.conftest import psnr, rel_l2, to_np
-from tests.parity.gen_fixtures import (VARIANT_SPECS, gated_chunks, generation_command, load_variant_inputs,
-                                       variant_dir, variant_steps)
+from tests.parity.gen_fixtures import (ONLINE_PROMPT_INTERVAL, VARIANT_SPECS, capture_command, capture_dir,
+                                       capture_prompts, chunk_prompts, gated_chunks, generation_command,
+                                       load_variant_inputs, variant_dir, variant_steps)
 from tests.parity.test_real_weights import ceil_1sig
 
 pytestmark = [pytest.mark.needs_fixtures, pytest.mark.needs_weights]
@@ -59,6 +64,17 @@ def _require(name: str) -> dict:
     if v.take:
         assert meta.get("take_reference_sha256"), \
             f"{name}: fixture lacks take_reference_sha256 (not generated from a take): regenerate it"
+    if v.capture is not None:
+        capture = capture_dir(v.capture)
+        if not (capture / "capture.json").is_file():
+            pytest.skip(f"no online capture at {capture}: record it with {capture_command(v)}")
+        on_disk = json.loads((capture / "capture.json").read_text())["frames_sha256"]
+        assert meta.get("capture_name") == v.capture and meta.get("capture_frames_sha256") == on_disk, \
+            f"{name}: fixture capture {meta.get('capture_frames_sha256')} != {capture} {on_disk}: regenerate it"
+        if v.dynamic_prompts:
+            from matrix_game_mlx.scenes import SCENES
+            assert meta["capture_prompts"] == capture_prompts(capture, meta["chunks"], ONLINE_PROMPT_INTERVAL,
+                                                              SCENES[v.scene]["prompt"])
     return meta
 
 
@@ -127,16 +143,21 @@ def test_variant_end_to_end(variant, comps):
     v, d, meta = VARIANT_SPECS[variant], variant_dir(variant), _meta(variant)
     inputs, ref = np.load(d / "inputs.npz"), np.load(d / "chunks.npz")
     _, noises, renoises, _, prompt_b = load_variant_inputs(v, inputs)
+    prompts = chunk_prompts(v, prompt_b, meta["chunks"])
     first_frame = comps.args.sink_mode == "first_frame"
     gated = gated_chunks(v)
+    if v.dynamic_prompts:
+        assert [p is not None for p in prompts] == [p is not None for p in meta["capture_prompts"]]
+        assert any(prompts[k] is not None for k in gated if k - 1 in gated), \
+            f"{variant}: no engine-caption switch between two gated chunks {gated}: recapture"
     stream = comps.stream(seed=0)
     try:
         recorder = _StepRecorder(stream.gen)
         stream.gen = recorder
         failures, frame = [], 0
         for i in range(meta["chunks"]):
-            if i == v.switch_chunk:
-                stream.set_prompt(mx.array(prompt_b).astype(mx.bfloat16))
+            if prompts[i] is not None:
+                stream.set_prompt(mx.array(prompts[i]).astype(mx.bfloat16))
             px = mx.array(inputs[f"pixels_{i}"])
             recorder.n = 0
             c = stream.push(px, frame_start=frame, initial_noise=mx.array(noises[i]),
