@@ -17,7 +17,7 @@ serve = ["aiohttp>=3.10,<4"]
 include = ["matrix_game_mlx*"]
 
 [tool.setuptools.package-data]
-matrix_game_mlx = ["configs/*.json"]
+matrix_game_mlx = ["configs/*.json", "web/*"]
 
 [tool.pytest.ini_options]
 markers = ["needs_weights: requires the converted MLX pack", "needs_fixtures: requires torch reference fixtures",
