@@ -11,6 +11,7 @@ matrix-game-mlx = "matrix_game_mlx.cli:main"
 
 [project.optional-dependencies]
 parity = ["torch", "diffusers", "einops"]
+serve = ["aiohttp>=3.10,<4"]
 
 [tool.setuptools.packages.find]
 include = ["matrix_game_mlx*"]

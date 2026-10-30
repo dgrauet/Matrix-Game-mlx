@@ -136,6 +136,8 @@ class ModelComponents:
                     prompt=a.prompt, hq_first_frame=a.sink_mode == "first_frame" and a.sink_image is not None,
                     prompt_mode=a.prompt_mode, prompt_interval_chunks=a.prompt_interval_chunks,
                     t5_runtime=a.t5_runtime, dit_parallel="single", dit_runtime=a.dit_runtime,
-                    attention_backend=self.attention_backend, vae_graph=False, early_publish=False,
-                    profile_chunks=False, reference_pipeline="stream", experimental_runtime=False,
+                    attention_backend=self.attention_backend, vae_graph=False,
+                    early_publish=getattr(a, "early_publish", False),
+                    profile_chunks=getattr(a, "profile_chunks", False),
+                    reference_pipeline=getattr(a, "reference_pipeline", "stream"), experimental_runtime=False,
                     preset=a.preset, component=self.component)

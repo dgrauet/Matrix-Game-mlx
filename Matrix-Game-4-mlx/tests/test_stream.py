@@ -103,6 +103,76 @@ def test_taehv_stream_three_pushes():
     assert vae._streaming_encoder is None and vae._streaming_decoder is None and vae._streaming_encode_frames == 0
 
 
+def _run_pushes(stream, counts=(1, 4, 4), **push_kw):
+    rng = np.random.default_rng(0)
+    frame, chunks = 0, []
+    for count in counts:
+        pixels = mx.array(rng.uniform(-1, 1, (count, 3, 480, 864)).astype(np.float32))
+        chunks.append(stream.push(pixels, frame_start=frame, **push_kw))
+        frame += count
+    return chunks
+
+
+def _taehv_stream(gen=None, **kw):
+    from matrix_game_mlx.inference.stream import CastleStream
+    return CastleStream(gen or _FakeGenerator(), _taehv(), mx.zeros((1, 2, 4)), vae_backend="taehv", steps=(1000,),
+                        first_steps=(1000,), **kw)
+
+
+def test_on_rgb_matches_plain_push():
+    from matrix_game_mlx.inference.preprocessing import tensor_to_uint8
+    plain_stream, early_stream = _taehv_stream(seed=3), _taehv_stream(seed=3)
+    plain = _run_pushes(plain_stream)
+    got = []
+    rng = np.random.default_rng(0)
+    frame = 0
+    for index, count in enumerate((1, 4, 4)):
+        pixels = mx.array(rng.uniform(-1, 1, (count, 3, 480, 864)).astype(np.float32))
+        early = early_stream.push(pixels, frame_start=frame, on_rgb=got.append)
+        frame += count
+        assert early.pixels is None and early.rgb is got[-1]
+        assert got[-1].dtype == np.uint8 and got[-1].shape == (count, 480, 864, 3)
+        assert np.array_equal(got[-1], tensor_to_uint8(plain[index].pixels))
+        assert mx.array_equal(early.latent, plain[index].latent) and mx.array_equal(early.control, plain[index].control)
+    assert len(got) == 3 and plain[0].rgb is None
+
+
+def test_on_rgb_runs_before_clean_kv():
+    gen = _FakeGenerator()
+    stream = _taehv_stream(gen)
+    events = []
+    real_call = gen.__call__.__func__
+
+    class Recording(type(gen)):
+        def __call__(self, **kw):
+            events.append("clean" if kw.get("drop_control") else "denoise")
+            return real_call(self, **kw)
+
+    gen.__class__ = Recording
+    pixels = mx.array(np.random.default_rng(0).uniform(-1, 1, (1, 3, 480, 864)).astype(np.float32))
+    stream.push(pixels, frame_start=0, on_rgb=lambda rgb: events.append("callback"))
+    assert events == ["denoise", "callback", "clean"]
+
+
+def test_profile_timing_keys():
+    plain = _run_pushes(_taehv_stream(profile=True), (1,))[0]
+    assert tuple(plain.timings_ms) == ("encode", "denoise", "clean_kv", "decode")
+    early = _run_pushes(_taehv_stream(profile=True), (1,), on_rgb=lambda rgb: None)[0]
+    assert tuple(early.timings_ms) == ("encode", "denoise", "decode", "pack_copy", "clean_kv")
+    assert all(v >= 0 for c in (plain, early) for v in c.timings_ms.values())
+    assert _run_pushes(_taehv_stream(), (1,))[0].timings_ms == {}
+
+
+def test_push_from_worker_thread():
+    from concurrent.futures import ThreadPoolExecutor
+    reference = _run_pushes(_taehv_stream(seed=5))
+    stream = _taehv_stream(seed=5)
+    with ThreadPoolExecutor(1) as pool:
+        threaded = pool.submit(_run_pushes, stream).result()
+    for a, b in zip(reference, threaded):
+        assert mx.array_equal(a.pixels, b.pixels) and mx.array_equal(a.latent, b.latent)
+
+
 def test_encode_sink_image_taehv_clears_state(tmp_path):
     from PIL import Image
     from matrix_game_mlx.inference.stream import encode_sink_image

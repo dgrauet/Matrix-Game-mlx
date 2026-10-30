@@ -1,7 +1,10 @@
 """Scene-configured chunk1 sessions with Wan or TAEHV streaming codecs (MLX port of matrix_game/inference/stream.py)."""
 from dataclasses import dataclass, field
+import time
+from typing import Optional
 
 import mlx.core as mx
+import numpy as np
 
 LATENT_SHAPE = (1, 1, 48, 30, 54)
 FRAME_SIZE = (480, 864)
@@ -37,11 +40,12 @@ class Chunk:
     index: int
     frame_start: int
     frame_end: int
-    pixels: mx.array
+    pixels: Optional[mx.array]
     latent: mx.array
     control: mx.array
     denoising_steps: int
     timings_ms: dict = field(default_factory=dict)
+    rgb: Optional[np.ndarray] = None            # uint8 [T, H, W, 3]; set (and pixels None) only with on_rgb
 
 
 class CastleStream:
@@ -49,7 +53,7 @@ class CastleStream:
 
     def __init__(self, generator, vae, prompt_embeds, *, seed=0, max_latents=8192, vae_backend="wan",
                  steps=(1000, 500), first_steps=(1000, 750, 500, 250), sink_latent=None, sink_mode="kv_only",
-                 sink_rope_mode="fixed"):
+                 sink_rope_mode="fixed", profile=False):
         from matrix_game_mlx.inference.rollout import set_attention_window, warp_steps
         from matrix_game_mlx.inference.wrappers import frame_seq_length_of, init_crossattn_cache, init_kv_cache
 
@@ -57,6 +61,7 @@ class CastleStream:
         if sink_mode not in ("kv_only", "first_frame") or sink_rope_mode not in ("absolute", "fixed"):
             raise ValueError("Invalid sink policy")
         self.sink_mode, self.sink_rope_mode = sink_mode, sink_rope_mode
+        self.profile = profile
         self.first_frame_latent = sink_latent if sink_mode == "first_frame" else None
         if vae_backend not in ("wan", "taehv"):
             raise ValueError("Expected wan or taehv VAE backend")
@@ -136,9 +141,14 @@ class CastleStream:
         for cross in self.xc:
             cross["is_init"] = False
 
-    def push(self, pixels, *, frame_start, initial_noise=None, renoise=None) -> Chunk:
+    def push(self, pixels, *, frame_start, initial_noise=None, renoise=None, on_rgb=None) -> Chunk:
+        """With on_rgb, publish owned uint8 THWC frames after decode and before the clean-KV pass.
+
+        The call still returns only after clean KV, so the next chunk is unchanged by early publication.
+        """
         count = self._validate(pixels, frame_start=frame_start, initial_noise=initial_noise)
         try:
+            marks = [time.perf_counter()]
             if self.vae_backend == "wan":
                 x = pixels.transpose(0, 2, 3, 1)[None]                               # [1, T, H, W, 3]
                 control = self.vae.encode_stream(x, self.encoder_features)           # [1, 1, 48, h, w]
@@ -147,6 +157,7 @@ class CastleStream:
                 x = pixels.transpose(1, 0, 2, 3)[None].astype(self.vae.dtype)        # [1, 3, T, H, W]
                 control = self.vae.encode_stream(x).transpose(0, 2, 1, 3, 4)
             mx.eval(control)
+            marks.append(time.perf_counter())
             if tuple(control.shape) != self.shape:
                 raise RuntimeError("VAE encoder output cadence changed")
             position = self.index + self.sink_offset
@@ -178,9 +189,16 @@ class CastleStream:
                     x = x.reshape(1, 1, *x.shape[1:]).astype(self.dtype)
             if not bool(mx.all(mx.isfinite(pred))):
                 raise RuntimeError("Non-finite generated latent")
-            self.gen(noisy_image_or_video=pred, conditional_dict=cond, timestep=mx.zeros((1, 1)), drop_control=True,
-                     **common)
-            self._eval_caches()
+            marks.append(time.perf_counter())
+
+            def clean():
+                self.gen(noisy_image_or_video=pred, conditional_dict=cond, timestep=mx.zeros((1, 1)),
+                         drop_control=True, **common)
+                self._eval_caches()
+
+            if on_rgb is None:
+                clean()
+                marks.append(time.perf_counter())
             if self.vae_backend == "wan":
                 decoded = self.decoder.push(pred)
             else:
@@ -188,7 +206,23 @@ class CastleStream:
             mx.eval(decoded)
             if tuple(decoded.shape) != (count, 3, *FRAME_SIZE):
                 raise RuntimeError("VAE decoder output cadence changed")
-            result = Chunk(self.index, self.frame, self.frame + count - 1, decoded, pred, control, len(steps))
+            marks.append(time.perf_counter())
+            rgb = None
+            if on_rgb is not None:
+                from matrix_game_mlx.inference.preprocessing import tensor_to_uint8
+                rgb = tensor_to_uint8(decoded)                  # fresh owned NumPy array
+                marks.append(time.perf_counter())
+                try:
+                    on_rgb(rgb)
+                finally:
+                    clean()
+                    marks.append(time.perf_counter())
+                decoded = None
+            names = ("encode", "denoise", "clean_kv", "decode") if on_rgb is None else (
+                "encode", "denoise", "decode", "pack_copy", "clean_kv")
+            timings = {name: (b - a) * 1000 for name, a, b in zip(names, marks, marks[1:])} if self.profile else {}
+            result = Chunk(self.index, self.frame, self.frame + count - 1, decoded, pred, control, len(steps),
+                           timings, rgb)
             self.index += 1
             self.frame += count
             return result
