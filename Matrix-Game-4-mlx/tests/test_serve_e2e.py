@@ -125,6 +125,7 @@ def test_reference_only(scene, tmp_path):
 
 
 @pytest.mark.parametrize("scene", [pytest.param("castle", marks=SHOOTER + MODEL),
+                                   pytest.param("ancient-egypt", marks=SHOOTER + MODEL),
                                    pytest.param("racing", marks=RACING + MODEL)])
 def test_model_realtime(scene, tmp_path, log_line):
     controls = racing_controls if scene == "racing" else shooter_controls
