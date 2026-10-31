@@ -113,9 +113,10 @@ def loaded():
 
 
 @pytest.fixture
-def comps(scene, loaded):
+def comps(scene, loaded, request):
     from matrix_game_mlx.inference.loader import ModelComponents
     from matrix_game_mlx.scenes import model_args
+    from tests.conftest import select_runtime
     _require(scene)
     if loaded.get("scene") != scene:
         loaded.clear()
@@ -127,7 +128,7 @@ def comps(scene, loaded):
         mx.clear_cache()
         meta = _meta(scene)
         inputs = np.load(_dir(scene) / "inputs.npz")
-        comps = ModelComponents(model_args(scene, "quality"))
+        comps = ModelComponents(select_runtime(model_args(scene, "quality"), request.config))
         assert (comps.args.sink_mode, comps.args.sink_rope_mode) == (meta["sink_mode"], meta["sink_rope_mode"])
         comps.load()
         comps.prompt = mx.array(inputs["prompt_embeds"]).astype(mx.bfloat16)     # same embeddings as the torch run
@@ -136,8 +137,27 @@ def comps(scene, loaded):
     return loaded["comps"]
 
 
-def _inject_state(kv, fx) -> None:
-    """Fill MLX KV caches with torch's state at the chunk boundary (all layers)."""
+def is_ring(gen) -> bool:
+    """True when the ring-fused runtime is installed on the generator (its KV cache is in ring order)."""
+    return getattr(gen.model, "castle_runtime", None) is not None
+
+
+def _window(gen) -> int:
+    return gen.model.blocks[0].self_attn.local_attn_size
+
+
+def linear_cache(gen, cache: dict) -> dict:
+    """The layer cache in torch's linear order (the ring runtime's cache goes through `to_linear`)."""
+    if not is_ring(gen):
+        return cache
+    from matrix_game_mlx.inference.runtime import to_linear
+    window = _window(gen)
+    return to_linear(cache, cache["k"].shape[1] // window, window)
+
+
+def _inject_state(kv, fx, gen=None) -> None:
+    """Fill MLX KV caches with torch's state at the chunk boundary (all layers); with the ring runtime (`gen`) the
+    linear state goes through `from_linear` into ring order."""
     for i, c in enumerate(kv):
         n = int(fx[f"state_lei{i}"])
         c["k"], c["v"] = mx.zeros_like(c["k"]), mx.zeros_like(c["v"])
@@ -145,6 +165,10 @@ def _inject_state(kv, fx) -> None:
             c["k"][:, :n], c["v"][:, :n] = _to_mx(fx[f"state_k{i}"]), _to_mx(fx[f"state_v{i}"])
         c["k_sink_raw"] = _to_mx(fx[f"state_ksr{i}"])
         c["global_end_index"], c["local_end_index"] = int(fx[f"state_gei{i}"]), n
+        if gen is not None and is_ring(gen):
+            from matrix_game_mlx.inference.runtime import from_linear
+            window = _window(gen)
+            c.update(from_linear(c, c["k"].shape[1] // window, window))
 
 
 # Thresholds of the egypt calls as fixed in milestone 1 (max variant per entry: "sdpa" native bf16 SDPA, "bf16"
@@ -207,6 +231,28 @@ def block_case(scene, comps, loaded):
     return loaded["block_case"]
 
 
+def _ring_block(model, i, cache, cross, x, e0, context, start, sink_rope_mode):
+    """Block i through the ring runtime's `run_blocks` with a single Plan (what CastleRuntime.run does per layer)."""
+    from matrix_game_mlx.inference.rope_kernel import build_causal_rope_rotations
+    from matrix_game_mlx.inference.runtime import Plan, plan_cache, run_blocks
+    block, (h, w) = model.blocks[i], (15, 27)
+    window, tokens = _window_of(model), h * w
+    position = start // tokens
+    fixed = position > window and sink_rope_mode == "fixed"
+    rotations = build_causal_rope_rotations(model.freqs, 1, h, w, position)
+    sink_rotations = build_causal_rope_rotations(model.freqs, 1, h, w, position - window) if fixed else None
+    s, end = plan_cache(cache, start, tokens, window, True)
+    a = block.cross_attn
+    cross["k"] = a.norm_k(a.k(context)).reshape(1, -1, a.num_heads, a.head_dim)
+    cross["v"] = a.v(context).reshape(1, -1, a.num_heads, a.head_dim)
+    cross["is_init"] = True
+    return run_blocks([Plan(block, cache, cross, s, end)], x, e0, rotations, sink_rotations)
+
+
+def _window_of(model) -> int:
+    return model.blocks[0].self_attn.local_attn_size
+
+
 @needs_weights
 @pytest.mark.parametrize("i", range(30))
 @pytest.mark.parametrize("scene", SCENES)
@@ -215,12 +261,17 @@ def test_block_parity(scene, comps, block_case, i):
     from matrix_game_mlx.inference.wrappers import init_crossattn_cache
     fx, j, blocks, gates = block_case
     stream = comps.stream(seed=0)
-    _inject_state(stream.kv, fx)
+    _inject_state(stream.kv, fx, stream.gen)
     xc = init_crossattn_cache(stream.gen, 1, mx.bfloat16)                     # cross-attn K/V from torch's context
     model = stream.gen.model
-    y = model.blocks[i](_to_mx(blocks[f"x{i}"]), _to_mx(blocks["e0"]), mx.array([405]), [[1, 15, 27]], model.freqs,
-                        _to_mx(blocks["context"]), None, None, kv_cache=stream.kv[i], crossattn_cache=xc[i],
-                        current_start=int(fx[f"c{j}_start"]), cache_start=0, sink_rope_mode=comps.args.sink_rope_mode)
+    x, e0, context = _to_mx(blocks[f"x{i}"]), _to_mx(blocks["e0"]), _to_mx(blocks["context"])
+    start = int(fx[f"c{j}_start"])
+    if is_ring(stream.gen):
+        y = _ring_block(model, i, stream.kv[i], xc[i], x, e0, context, start, comps.args.sink_rope_mode)
+    else:
+        y = model.blocks[i](x, e0, mx.array([405]), [[1, 15, 27]], model.freqs, context, None, None,
+                            kv_cache=stream.kv[i], crossattn_cache=xc[i], current_start=start, cache_start=0,
+                            sink_rope_mode=comps.args.sink_rope_mode)
     err = rel_l2(y, from_bits(blocks[f"x{i + 1}"]))
     print(f"{scene} block {i}: rel L2 {err:.3e} gate {gates[i]:.3e} ratio {err / gates[i]:.2f}")
     assert err <= gates[i], (err, gates[i])
@@ -233,17 +284,18 @@ def test_call_parity(scene, comps, name, j):
     fx = np.load(path)                       # listed in meta.json call_floors: a missing file is a broken fixture set
     tol = call_tol(_meta(scene)["call_floors"]["calls"][name][j], t_zero=not fx[f"c{j}_t"].any())
     stream = comps.stream(seed=0)
-    _inject_state(stream.kv, fx)                                               # torch's state at the chunk boundary
+    _inject_state(stream.kv, fx, stream.gen)                                   # torch's state at the chunk boundary
     _, pred = stream.gen(noisy_image_or_video=_to_mx(fx[f"c{j}_x"]),
                          conditional_dict={"prompt_embeds": comps.prompt, "control_latent": _to_mx(fx["control"])},
                          timestep=mx.array(fx[f"c{j}_t"]), kv_cache=stream.kv, crossattn_cache=stream.xc,
                          current_start=int(fx[f"c{j}_start"]), drop_control=bool(fx[f"c{j}_drop"]),
                          sink_rope_mode=comps.args.sink_rope_mode)
     m = {"pred": rel_l2(pred, from_bits(fx[f"c{j}_pred"]))}
+    lin = {layer: linear_cache(comps.gen, stream.kv[layer]) for layer in KV_LAYERS}   # torch's order
     for layer in KV_LAYERS:
         for kind in ("k", "v"):
             want = from_bits(fx[f"c{j}_{kind}{layer}"])
-            got = to_np(stream.kv[layer][kind][:, :stream.kv[layer]["local_end_index"]])
+            got = to_np(lin[layer][kind][:, :stream.kv[layer]["local_end_index"]])
             assert got.shape == want.shape, f"{kind}{layer}: cache end index differs from torch"
             np.testing.assert_array_equal(got[:, :-405], want[:, :-405], err_msg=f"{kind}{layer} history")
             m[f"{kind}{layer}"] = rel_l2(written_slot(got), written_slot(want))
@@ -307,8 +359,8 @@ def _run_stream(scene, comps):
         frame += px.shape[0]
         chunks.append(dict(control=to_np(c.control), n_denoising=len(recorder.preds),
                            pred_step0=recorder.preds[0] if recorder.preds else None, pred=to_np(c.latent),
-                           decoded=to_np(c.pixels), kv_k_layer0=to_np(stream.kv[0]["k"]),
-                           kv_k_layer29=to_np(stream.kv[29]["k"])))
+                           decoded=to_np(c.pixels), kv_k_layer0=to_np(linear_cache(comps.gen, stream.kv[0])["k"]),
+                           kv_k_layer29=to_np(linear_cache(comps.gen, stream.kv[29])["k"])))
     return chunks
 
 

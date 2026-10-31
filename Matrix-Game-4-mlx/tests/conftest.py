@@ -18,6 +18,19 @@ for p in (MLX_ROOT, UPSTREAM_ROOT):
         sys.path.insert(0, p)
 
 
+def pytest_addoption(parser):
+    parser.addoption("--dit-runtime", choices=("native", "ring-fused"), default=None,
+                     help="DiT runtime of the real-weight parity tests (default: the preset's default)")
+
+
+def select_runtime(args, config):
+    """Force the `--dit-runtime` pytest option on the model arguments (no option: the preset's default stays)."""
+    runtime = config.getoption("--dit-runtime")
+    if runtime is not None:
+        args.dit_runtime = runtime
+    return args
+
+
 def import_upstream(name: str):
     """Import an upstream module (package `matrix_game`) from Matrix-Game-4/."""
     return importlib.import_module(name)

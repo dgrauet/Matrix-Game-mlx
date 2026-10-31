@@ -30,9 +30,9 @@ import numpy as np
 import pytest
 import mlx.core as mx
 
-from tests.conftest import fixtures_dir, psnr, rel_l2, to_np
+from tests.conftest import fixtures_dir, psnr, select_runtime, rel_l2, to_np
 from tests.parity.gen_fixtures import PRESET_SPECS, SCENE_SPECS, generation_command
-from tests.parity.test_real_weights import ceil_1sig
+from tests.parity.test_real_weights import ceil_1sig, linear_cache
 
 pytestmark = [pytest.mark.needs_fixtures, pytest.mark.needs_weights]
 
@@ -131,7 +131,7 @@ def loaded():
 
 
 @pytest.fixture
-def comps(scene, loaded):
+def comps(scene, loaded, request):
     from matrix_game_mlx.inference.loader import ModelComponents
     from matrix_game_mlx.scenes import model_args
     meta = _require(scene, "taehv_floors", "floor")
@@ -143,7 +143,7 @@ def comps(scene, loaded):
         gc.collect()
         mx.clear_cache()
         inputs = np.load(_dir(scene) / "inputs.npz")
-        comps = ModelComponents(model_args(scene, PRESET))
+        comps = ModelComponents(select_runtime(model_args(scene, PRESET), request.config))
         assert (comps.args.sink_mode, comps.args.sink_rope_mode) == (meta["sink_mode"], meta["sink_rope_mode"])
         assert (comps.args.vae_backend, comps.args.steps) == ("taehv", tuple(meta["steps"]))
         comps.load()
@@ -181,8 +181,8 @@ def test_stream_end_to_end_realtime(scene, comps):
             recorder.n = 0
             c = stream.push(px, frame_start=frame, initial_noise=mx.array(inputs[f"initial_noise_{i}"]))
             frame += px.shape[0]
-            got = dict(control=to_np(c.control), pred=to_np(c.latent), kv_k_layer0=to_np(stream.kv[0]["k"]),
-                       kv_k_layer29=to_np(stream.kv[29]["k"]))
+            got = dict(control=to_np(c.control), pred=to_np(c.latent), kv_k_layer0=to_np(linear_cache(comps.gen, stream.kv[0])["k"]),
+                       kv_k_layer29=to_np(linear_cache(comps.gen, stream.kv[29])["k"]))
             assert recorder.n == int(ref[f"n_denoising_{i}"]), (i, recorder.n, int(ref[f"n_denoising_{i}"]))
             if first_frame and i == 0:
                 # No denoising call on either side: pred is the sink latent itself

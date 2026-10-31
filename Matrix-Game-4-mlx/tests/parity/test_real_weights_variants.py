@@ -30,11 +30,11 @@ import numpy as np
 import pytest
 import mlx.core as mx
 
-from tests.conftest import psnr, rel_l2, to_np
+from tests.conftest import psnr, rel_l2, select_runtime, to_np
 from tests.parity.gen_fixtures import (ONLINE_PROMPT_INTERVAL, VARIANT_SPECS, capture_command, capture_dir,
                                        capture_prompts, chunk_prompts, gated_chunks, generation_command,
                                        load_variant_inputs, variant_dir, variant_steps)
-from tests.parity.test_real_weights import ceil_1sig
+from tests.parity.test_real_weights import ceil_1sig, linear_cache
 
 pytestmark = [pytest.mark.needs_fixtures, pytest.mark.needs_weights]
 
@@ -89,7 +89,7 @@ def loaded():
 
 
 @pytest.fixture
-def comps(variant, loaded):
+def comps(variant, loaded, request):
     from matrix_game_mlx.inference.loader import ModelComponents
     from matrix_game_mlx.scenes import model_args
     meta = _require(variant)
@@ -102,7 +102,7 @@ def comps(variant, loaded):
         gc.collect()
         mx.clear_cache()
         inputs = np.load(variant_dir(variant) / "inputs.npz")
-        comps = ModelComponents(model_args(v.scene, v.preset, v.model_argv()))
+        comps = ModelComponents(select_runtime(model_args(v.scene, v.preset, v.model_argv()), request.config))
         a = comps.args
         assert (a.sink_mode, a.sink_rope_mode) == (meta["sink_mode"], meta["sink_rope_mode"])
         assert (a.vae_backend, a.steps, a.first_steps) == (v.vae_backend, v.steps, v.first_steps)
@@ -163,8 +163,8 @@ def test_variant_end_to_end(variant, comps):
             c = stream.push(px, frame_start=frame, initial_noise=mx.array(noises[i]),
                             renoise=[mx.array(r) for r in renoises[i]])
             frame += px.shape[0]
-            got = dict(control=to_np(c.control), pred=to_np(c.latent), kv_k_layer0=to_np(stream.kv[0]["k"]),
-                       kv_k_layer29=to_np(stream.kv[29]["k"]))
+            got = dict(control=to_np(c.control), pred=to_np(c.latent), kv_k_layer0=to_np(linear_cache(comps.gen, stream.kv[0])["k"]),
+                       kv_k_layer29=to_np(linear_cache(comps.gen, stream.kv[29])["k"]))
             assert recorder.n == int(ref[f"n_denoising_{i}"]) == len(variant_steps(v, i)), \
                 (i, recorder.n, int(ref[f"n_denoising_{i}"]), variant_steps(v, i))
             if first_frame and v.sink and i == 0:
