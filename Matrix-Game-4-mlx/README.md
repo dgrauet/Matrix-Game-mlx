@@ -363,7 +363,8 @@ browser. **Racing with dynamic captions does not fit sustainably on a 32 GB Mac.
 the footprint reaches 25.5 GB (24.5 GB in the end-to-end test, which stops after 9 frames), and the machine swaps:
 swap grew by 3.8 GB without a browser and 3.1 GB with one, later chunks took 31 to 35 s instead of 4 s,
 and with the browser the session was lost ("Browser disconnected": the page stopped answering the server's
-15 s watchdog). Use `--prompt-mode fixed` (the default) on 32 GB; dynamic captions need a Mac with more memory.
+15 s watchdog). These runs were at `--fps 24`; `--fps` changes neither the generation rate nor the memory, so the
+same holds at `--fps 4`. Use `--prompt-mode fixed` (the default) on 32 GB; dynamic captions need a Mac with more memory.
 (The swap file already held 4 to 5 GB from earlier work when these runs started, so a freshly booted Mac
 may do better; that was not tested.)
 
