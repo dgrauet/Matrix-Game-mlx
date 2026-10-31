@@ -414,7 +414,12 @@ Environment: `MG4_RESOURCES` (game assets, default `../Matrix-Game-4/resources`)
 `test_browser_upstream.py` run the real stack; `slow` marks the quality session (several minutes). The browser tests run upstream's
 `tests/browser/*.cjs` unmodified: Chromium uses Playwright's full Chromium (`CHROME_PATH`, set by the tests), because
 the default headless shell rejects pointer lock; WebKit runs with `DISPLAY_ONLY=1`, since Playwright's WebKit never grants
-it (Safari itself is not automated; do upstream's manual Safari check). If WebKit receives no video on a fresh machine, check System Settings, Privacy & Security, Local Network for the
+it (Safari itself is not automated; do upstream's manual Safari check). The exception is `test_browser_model`
+(`needs_weights`): it runs `test_browser.cjs` in full (reference, model, model dual view at 1728 wide) against a castle
+realtime session at `--fps 4` with `DISPLAY_ONLY=1`, from a temporary copy with two edits asserted against upstream's
+text, because the script's timings assume CUDA speed: 8 new game frames in 20 s instead of 40, and a wait for the HUD
+before the final inspection (the client hides it after 1.5 s without video). Keyboard, mouse and audio are therefore
+browser-tested in reference mode only, not under the model; check them by hand. If WebKit receives no video on a fresh machine, check System Settings, Privacy & Security, Local Network for the
 browser: after a new install WebKit got no WHEP video for about an hour, then worked without any change. Measure with
 `python3 -m tests.measure_serve --scene castle --fps 4 --chunks 32 [--browser] [--prompt-mode dynamic]`.
 
