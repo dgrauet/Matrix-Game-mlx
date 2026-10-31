@@ -1,10 +1,24 @@
 """Ring KV runtime for Apple silicon (MLX port of matrix_game/inference/runtime.py).
 
+`CastleRuntime` takes over the DiT block loop (hooked in `CausalWanModel._forward_inference`, as upstream): it plans
+every layer's KV cache as a ring (`plan_cache(..., ring=True)`), builds the RoPE rotations once per call and applies
+them with the GPU kernel (`rope_kernel.apply_causal_rope`, bitwise equal to the float64 CPU path), then runs
+`run_blocks`. Only the bounded, batch-1, chunk-1, bf16 inference path is supported; anything else is a ValueError
+(never a silent fallback to the native loop). The unfused `run_blocks` composes the native block pieces with the
+native rounding, so the only numeric difference from `native` is the attention key order (ring slots -> SDPA
+summation order).
+
 Planner part: `plan_cache` (upstream semantics on MLX caches whose end indices are Python ints, a documented
 deviation from upstream's 1-element tensors) plus `to_linear` / `from_linear`, which convert between the ring slot
 order and the native linear order (sink frame, then the rolling window oldest to newest) so the parity suite can
 compare against torch fixtures.
+
+Deviations from upstream: no CUDA graphs (`prime`, `graph`) and no varlen `cu_seqlens` in `Plan`; the only mode is
+`ring-fused`; caches are also required to be bfloat16; every layer is validated before any cache is planned (upstream
+plans layer by layer and can leave earlier layers planned when a later one fails).
 """
+from dataclasses import dataclass
+
 import mlx.core as mx
 
 
@@ -78,3 +92,132 @@ def to_linear(cache: dict, tokens: int, window: int) -> dict:
 def from_linear(cache: dict, tokens: int, window: int) -> dict:
     """Native linear cache -> new cache in ring order (inverse of `to_linear`)."""
     return _permute(cache, tokens, window, inverse=True)
+
+
+@dataclass
+class Plan:
+    block: object
+    cache: dict
+    cross: dict
+    start: int
+    end: int
+
+
+def _modulate(h, shift, scale, frames, tokens):
+    """Native `CausalWanAttentionBlock` mod(): per-frame adaLN shift/scale, same expression and rounding."""
+    return (h.reshape(h.shape[0], frames, tokens, -1) * (1 + scale) + shift).reshape(h.shape)
+
+
+def _gate(h, g, frames, tokens):
+    """Native `CausalWanAttentionBlock` gate()."""
+    return (h.reshape(h.shape[0], frames, tokens, -1) * g).reshape(h.shape)
+
+
+def run_blocks(plans, x, e, rotations, sink_rotations, fused=False):
+    """Run the DiT blocks over planned caches (upstream `run_blocks`; `fused` is Task 6's fused-kernel path).
+
+    Unfused: exactly the native `CausalWanAttentionBlock` arithmetic, with RoPE from the GPU kernel and attention
+    over the cache in ring order (`cache[:, :end]`, or the re-roped sink + `cache[:, tokens:end]` in fixed-sink
+    steady state).
+    """
+    from matrix_game_mlx.inference.rope_kernel import apply_causal_rope
+    from matrix_game_mlx.inference.wan.modules.attention import attention
+    if fused:
+        raise NotImplementedError("fused DiT kernels are not implemented yet")
+    frames, tokens = e.shape[1], x.shape[1] // e.shape[1]
+    for p in plans:
+        block, cache = p.block, p.cache
+        mod = mx.split(block.modulation[:, None] + e, 6, axis=2)
+        z = _modulate(block.norm1(x), mod[0], mod[1], frames, tokens)
+        attn = block.self_attn
+        b, s, n, d = z.shape[0], z.shape[1], attn.num_heads, attn.head_dim
+        q = attn.norm_q(attn.q(z)).reshape(b, s, n, d)
+        k = attn.norm_k(attn.k(z)).reshape(b, s, n, d)
+        v = attn.v(z).reshape(b, s, n, d)
+        q = apply_causal_rope(q, rotations).astype(v.dtype)
+        cache["k"][:, p.start:p.end] = apply_causal_rope(k, rotations).astype(v.dtype)
+        cache["v"][:, p.start:p.end] = v
+        if p.start == 0:
+            cache["k_sink_raw"] = k
+        if sink_rotations is None:
+            keys, values = cache["k"][:, :p.end], cache["v"][:, :p.end]
+        else:
+            sink = apply_causal_rope(cache["k_sink_raw"], sink_rotations).astype(v.dtype)
+            keys = mx.concatenate([sink, cache["k"][:, tokens:p.end]], axis=1)
+            values = mx.concatenate([cache["v"][:, :tokens], cache["v"][:, tokens:p.end]], axis=1)
+        y = attn.o(attention(q, keys, values).reshape(b, s, n * d))
+        x = x + _gate(y, mod[2], frames, tokens)
+        # Cross K/V were initialised by the planner, so the native module reads them from the cache.
+        x = x + block.cross_attn(block.norm3(x), None, None, crossattn_cache=p.cross)
+        y = block.ffn(_modulate(block.norm2(x), mod[3], mod[4], frames, tokens))
+        x = x + _gate(y, mod[5], frames, tokens)
+    return x
+
+
+class CastleRuntime:
+    """Ring KV + GPU RoPE DiT runtime. Upstream's CUDA modes (kernels, cudagraph, ring, ring-graph) do not exist."""
+
+    def __init__(self, mode):
+        if mode != "ring-fused":
+            raise ValueError("Unknown castle runtime")
+        self.mode = mode
+        self.ring = True
+        self.fused = False  # Task 6 enables the fused kernels
+
+    def clear(self):
+        """Drop per-session state (none yet: no graphs; kept for the upstream call sites)."""
+
+    def run(self, model, x, e, grid_sizes, context, kv, xc, current_start, *, sink_rope_mode, unsupported=False):
+        from matrix_game_mlx.inference.rope_kernel import build_causal_rope_rotations
+        from matrix_game_mlx.inference.wan.modules.causal_model import _check_rope_len
+        device = mx.default_device()
+        if (unsupported or sink_rope_mode not in (None, "absolute", "fixed") or x.dtype != mx.bfloat16
+                or device.type != mx.gpu):
+            raise ValueError(f"Unsupported runtime: extra={unsupported}, sink={sink_rope_mode}, "
+                             f"dtype={x.dtype}, device={device}")
+        if len(grid_sizes) != 1 or x.shape[0] != 1 or grid_sizes[0][0] != 1 or e.shape[:2] != (1, 1):
+            raise ValueError("Castle runtime requires batch1/chunk1")
+        _, h, w = (int(g) for g in grid_sizes[0])
+        tokens = h * w
+        position = current_start // tokens
+        if x.shape[1] != tokens or current_start % tokens or kv is None or xc is None:
+            raise ValueError("Expected frame-aligned unpadded input and explicit caches")
+        if len(kv) != len(model.blocks) or len(xc) != len(kv):
+            raise ValueError("Cache layer count mismatch")
+        window = model.blocks[0].self_attn.local_attn_size
+        for block, cache in zip(model.blocks, kv):
+            a = block.self_attn
+            if (a.local_attn_size != window or window < 2 or a.sink_size != 1
+                    or cache["k"].shape[1] != window * tokens
+                    or "k_sink_raw" not in cache or cache["k_sink_raw"].shape[1] != tokens
+                    or type(block.cross_attn).__name__ != "WanT2VCrossAttention"):
+                raise ValueError("Expected identical bounded windows, one sink, and T2V cross attention")
+            if any(cache[name].dtype != mx.bfloat16 for name in ("k", "v", "k_sink_raw")):
+                raise ValueError("Expected bfloat16 KV caches")
+        _check_rope_len(model.freqs, position + 1)  # native's message for an exhausted RoPE table
+        rotations = build_causal_rope_rotations(model.freqs, 1, h, w, position)
+        steady = position > window
+        fixed = steady and sink_rope_mode == "fixed"
+        sink_rotations = build_causal_rope_rotations(model.freqs, 1, h, w, position - window) if fixed else None
+        plans = []
+        for block, cache, cross in zip(model.blocks, kv, xc):
+            start, end = plan_cache(cache, current_start, tokens, window, self.ring)
+            if start < 0 or end > window * tokens or (fixed and end != window * tokens):
+                raise ValueError("Invalid bounded KV range")
+            if not cross["is_init"]:
+                a = block.cross_attn
+                cross["k"] = a.norm_k(a.k(context)).reshape(1, -1, a.num_heads, a.head_dim)
+                cross["v"] = a.v(context).reshape(1, -1, a.num_heads, a.head_dim)
+                cross["is_init"] = True
+            plans.append(Plan(block, cache, cross, start, end))
+        return run_blocks(plans, x, e, rotations, sink_rotations, self.fused)
+
+
+def install_runtime(generator, mode):
+    """Install the DiT runtime for `mode` on `generator.model` ("native" removes it)."""
+    if mode not in ("native", "ring-fused"):
+        raise ValueError("Unknown DiT runtime")
+    old = getattr(generator.model, "castle_runtime", None)
+    if old is not None:
+        old.clear()
+    generator.model.castle_runtime = None if mode == "native" else CastleRuntime(mode)

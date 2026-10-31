@@ -50,8 +50,8 @@ The offline default preset is `quality`, as upstream's offline renderer. Weights
 | `--preset {realtime,quality,baseline}` | Supported (default `quality`) |
 | `--preset {rtx5090,rtx5090-sage}` | Rejected: CUDA-only presets |
 | `--vae-backend {wan,taehv}` | Supported (default from the preset: `taehv` for realtime, `wan` otherwise) |
-| `--dit-runtime native` | Supported (the only runtime) |
-| `--dit-runtime` other values (`kernels`, `cudagraph`, `ring`, `ring-graph`, `ring-fused`, `rtx5090`, `rtx5090-sage`) | Rejected: CUDA-only; the MLX port runs `native` only |
+| `--dit-runtime {native,ring-fused}` | Supported on every preset; default from the preset as upstream (`ring-fused` for realtime, `native` otherwise). `ring-fused` is the Apple fast path (ring KV cache, GPU RoPE kernel); see Known deviations |
+| `--dit-runtime` other values (`kernels`, `cudagraph`, `ring`, `ring-graph`, `rtx5090`, `rtx5090-sage`) | Rejected: CUDA-only; the MLX port runs `native` or `ring-fused` |
 | `--steps`, `--first-steps` | Supported (comma-separated timesteps, strictly decreasing from 1000) |
 | `--vae-graph` | Rejected: CUDA graphs, not available on MLX |
 | `--no-vae-graph` | Accepted, no effect (VAE graphs are never used on MLX) |
@@ -394,7 +394,7 @@ Upstream's server modules are copied with `matrix_game.` renamed to `matrix_game
 - `Runtime.__init__` no longer resets `attention_backend` (the MLX loader sets `mlx-sdpa`).
 - No torch: the session report drops `profile_torch_threads`; the stream hands an owned `uint8` array to `on_rgb` (no `.numpy()`); profile keys are
   `gpu_<stage>_ms` instead of `cuda_<stage>_ms`.
-- CUDA-only model options keep the treatment `render` gives them (for example `--preset rtx5090` exits with "--preset rtx5090 is CUDA-only"); the realtime DiT runtime is `native`.
+- CUDA-only model options keep the treatment `render` gives them (for example `--preset rtx5090` exits with "--preset rtx5090 is CUDA-only"); the realtime DiT runtime is `ring-fused`, as upstream.
 - The web client is copied byte-for-byte, and `matrix_game_mlx/web/mediamtx-reader.LICENSE` ships in the wheel (`license-files`).
 - Game patches: none. Both `CastleReferenceServer` and `CitySampleReferenceServer` create their hidden SDL/OpenGL window from a
   subprocess on macOS unchanged.
@@ -566,8 +566,16 @@ so the gap is the DiT's alone, which is preset-independent and gated per call an
 - KV-cache end indices are Python ints instead of 1-element tensors.
 - `CastleStream.push` has a test-only `renoise` argument.
 - Only the inference path (`kv_cache is not None`) is ported; training branches raise `NotImplementedError`.
-- Realtime DiT runtime is upstream's `native`. Upstream's realtime default is the CUDA-only `ring-fused`, out of
-  scope (upstream logs that ring changes the reduction order and that native is the baseline).
+- `--dit-runtime ring-fused` (the realtime default, as upstream) is an MLX runtime, not upstream's CUDA one: the
+  same host ring-KV planner (`plan_cache`, `run_blocks`, `CastleRuntime`, `install_runtime`), RoPE applied by a GPU
+  kernel bitwise equal to the float64 CPU path, and no CUDA graphs (`prime`/`graph`), varlen `cu_seqlens` or fused
+  kernels yet. Its only numeric difference from `native` is the attention key order (ring slots change the SDPA
+  summation order; with the linear layout it is bitwise native). Measured on the tiny bf16 model over 60 chunks
+  (`tests/test_runtime.py`): max rel L2 vs native 2.4e-3 per call, 1.2e-3 on the written KV slot; most calls are
+  bitwise (the fp32 reorder rarely changes a bf16 output bit). Like upstream, the loader logs that ring changes the
+  reduction order and that native is the baseline. Port-only checks: KV caches must be bfloat16, and every layer is
+  validated before any cache is planned; an unsupported configuration is a `ValueError`, never a native fallback.
+  `CastleRuntime` accepts only `ring-fused`; `install_runtime` only `native` and `ring-fused`.
 - No CUDA VAE graph (`vae_graph`): it only captures the same TAEHV ops.
 - TAEHV convs accumulate in float32 and round once to bf16 (see Numerics).
 - `serve`: the macOS port changes listed under "Online play on macOS" (sidecar interpreter, Apple software renderer, startup deadline, `gpu_` timing keys, no torch).

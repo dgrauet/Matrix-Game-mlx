@@ -309,7 +309,11 @@ class CausalWanModel(nn.Module):
             ctx = mx.concatenate([ctx, mx.zeros((ctx.shape[0], self.text_len - ctx.shape[1], ctx.shape[2]), ctx.dtype)], 1)
         context = self.text_embedding_linear2(gelu_tanh(self.text_embedding_linear1(ctx.astype(dtype))))
 
-        for block_index, block in enumerate(self.blocks):
+        runtime = getattr(self, "castle_runtime", None)
+        if runtime is not None:
+            x = runtime.run(self, x, e0, grid_sizes, context, kv_cache, crossattn_cache, current_start,
+                            sink_rope_mode=sink_rope_mode, unsupported=cache_start not in (0, None))
+        for block_index, block in (() if runtime is not None else enumerate(self.blocks)):
             x = block(x, e0, seq_lens, grid_sizes, self.freqs, context, None, None,
                       kv_cache=kv_cache[block_index], crossattn_cache=crossattn_cache[block_index],
                       current_start=current_start, cache_start=cache_start, sink_rope_mode=sink_rope_mode)

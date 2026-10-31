@@ -1,5 +1,7 @@
 import hashlib
 import json
+import types
+
 import pytest
 
 from matrix_game_mlx.inference import loader
@@ -166,7 +168,7 @@ def test_dynamic_keeps_caption_encoder(tmp_path, monkeypatch, mode, scene):
             return embeds * 2
     monkeypatch.setattr(wrappers, "WanTextEncoder", FakeText)
     monkeypatch.setattr(text, "CaptionEncoder", FakeCaption)
-    monkeypatch.setattr(loading, "build_dit", lambda *a, **k: object())
+    monkeypatch.setattr(loading, "build_dit", lambda *a, **k: types.SimpleNamespace(model=types.SimpleNamespace()))
     monkeypatch.setattr(wrappers, "WanVAE22Wrapper", lambda *a, **k: object())
     monkeypatch.setattr(stream, "encode_sink_image", lambda *a, **k: mx.zeros((1, 48, 1, 4, 4)))
     shared = tmp_path / "t5"
@@ -182,6 +184,36 @@ def test_dynamic_keeps_caption_encoder(tmp_path, monkeypatch, mode, scene):
         assert mx.array_equal(m.prompt, embeds * 2)
     else:
         assert m.caption_encoder is None and mx.array_equal(m.prompt, embeds)
+
+
+@pytest.mark.parametrize("preset,argv,runtime", [("realtime", [], "ring-fused"), ("quality", [], "native"),
+                                                ("realtime", ["--dit-runtime", "native"], "native"),
+                                                ("quality", ["--dit-runtime", "ring-fused"], "ring-fused")])
+def test_load_installs_dit_runtime(tmp_path, monkeypatch, preset, argv, runtime):
+    """load() installs the resolved runtime on the DiT and config() (render.json, session report) reports it."""
+    import mlx.core as mx
+    from matrix_game_mlx.inference import loading, stream, taehv, wrappers
+    from matrix_game_mlx.inference.runtime import CastleRuntime
+    from matrix_game_mlx.scenes import model_args
+    pack = _scene_pack(tmp_path, monkeypatch)
+    embeds = mx.ones((1, 512, 4096), dtype=mx.bfloat16)
+    monkeypatch.setattr(wrappers, "WanTextEncoder", lambda *a: (lambda prompts: {"prompt_embeds": embeds}))
+    gen = types.SimpleNamespace(model=types.SimpleNamespace())
+    monkeypatch.setattr(loading, "build_dit", lambda *a, **k: gen)
+    monkeypatch.setattr(wrappers, "WanVAE22Wrapper", lambda *a, **k: object())
+    monkeypatch.setattr(taehv.TAEHV, "from_pack", staticmethod(lambda *a, **k: object()))
+    monkeypatch.setattr(stream, "encode_sink_image", lambda *a, **k: mx.zeros((1, 48, 1, 4, 4)))
+    shared = tmp_path / "t5"
+    shared.write_bytes(b"")
+    monkeypatch.setattr(loader, "resolve_shared_files", lambda p, c=None: {
+        "t5_encoder.safetensors": shared, "google/umt5-xxl": shared, "vae.safetensors": shared})
+    m = loader.ModelComponents(model_args("castle", preset, argv), pack=pack)
+    assert m.config()["dit_runtime"] == runtime
+    m.load()
+    installed = gen.model.castle_runtime
+    assert (installed is None) if runtime == "native" else (isinstance(installed, CastleRuntime) and installed.mode == runtime)
+    cfg = m.config()
+    assert cfg["dit_runtime"] == runtime and cfg["experimental_runtime"] is (runtime != "native")
 
 
 def test_pack_dir_from_env(tmp_path, monkeypatch):
