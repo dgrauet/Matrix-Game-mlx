@@ -568,8 +568,9 @@ so the gap is the DiT's alone, which is preset-independent and gated per call an
 - Only the inference path (`kv_cache is not None`) is ported; training branches raise `NotImplementedError`.
 - `--dit-runtime ring-fused` (the realtime default, as upstream) is an MLX runtime, not upstream's CUDA one: the
   same host ring-KV planner (`plan_cache`, `run_blocks`, `CastleRuntime`, `install_runtime`), RoPE applied by a GPU
-  kernel bitwise equal to the float64 CPU path, fused Metal block-glue kernels (`inference/kernels.py`, below), and
-  no CUDA graphs (`prime`/`graph`) or varlen `cu_seqlens`. Its only numeric difference from `native` is the
+  kernel bitwise equal to the float64 CPU path, fused Metal block-glue kernels (`inference/kernels.py`, below), the
+  steady-window graph compiled with `mx.compile` (below) instead of a CUDA graph, and no varlen `cu_seqlens`. Its
+  only numeric difference from `native` is the
   attention key order (ring slots change the SDPA summation order; with the linear layout it is bitwise native,
   fused or not). Measured on the tiny bf16 model over 60 chunks
   (`tests/test_runtime.py`): max rel L2 vs native 2.4e-3 per call, 1.2e-3 on the written KV slot; most calls are
@@ -587,6 +588,21 @@ so the gap is the DiT's alone, which is preset-independent and gated per call an
   bitwise fused vs unfused in `tests/test_runtime.py`). Port-only: the fused path requires bfloat16 modulation and
   norm weights, an affine `norm3` and RMS q/k norms (`ValueError` otherwise, checked before any cache is planned);
   `*_row` argument names (upstream `*_k`); no stride arguments (MLX makes kernel inputs row-contiguous).
+- `ring-fused` steady-window graph: upstream's `CastleRuntime.prime` / `graph` / `clear` names and its "one
+  steady-window graph per session" rule (positions, RoPE rotations and timestep modulation are inputs; no
+  per-position cache; `captures` / `replays` counters), on `mx.compile` instead of CUDA graph capture: the compiled
+  function is keyed on the model, shapes, sink mode and write spans (not buffer addresses), takes every KV / text
+  cache tensor as an input and returns the updated K/V, and reads the block weights as implicit inputs. Compilation
+  keeps the traced arithmetic (the fused kernels and SDPA are opaque to it): a 60-chunk rollout is bitwise compiled
+  vs eager (`tests/test_runtime.py`). `CastleStream` calls `prime` before gameplay and `clear` on `close()`, as
+  upstream; the warm-up (one DiT call plus the trace) is part of stream creation.
+- `ring-fused` memoizes the timestep-embedding MLP per timestep value (`CastleRuntime.time_embedding`, port
+  addition): the float64-accumulated MLP runs on the MLX CPU stream and every block waits for it, while a stream
+  only uses its few denoising timesteps and t=0. A hit returns the arrays computed for the same t (bitwise the same
+  values); an entry misses when any MLP weight array is replaced, and `clear()` empties it.
+- `CastleStream._validate` reads its value checks (pixels finite and in [-1, 1], initial noise finite) in one host
+  sync, and the finite check of the generated latent is read with the denoising step's own evaluation (same
+  checks and messages as upstream).
 - No CUDA VAE graph (`vae_graph`): it only captures the same TAEHV ops.
 - TAEHV convs accumulate in float32 and round once to bf16 (see Numerics).
 - `serve`: the macOS port changes listed under "Online play on macOS" (sidecar interpreter, Apple software renderer, startup deadline, `gpu_` timing keys, no torch).

@@ -3,23 +3,30 @@
 `CastleRuntime` takes over the DiT block loop (hooked in `CausalWanModel._forward_inference`, as upstream): it plans
 every layer's KV cache as a ring (`plan_cache(..., ring=True)`), builds the RoPE rotations once per call and applies
 them with the GPU kernel (`rope_kernel.apply_causal_rope`, bitwise equal to the float64 CPU path), then runs
-`run_blocks`. Only the bounded, batch-1, chunk-1, bf16 inference path is supported; anything else is a ValueError
-(never a silent fallback to the native loop). The unfused `run_blocks` composes the native block pieces with the
-native rounding, so the only numeric difference from `native` is the attention key order (ring slots -> SDPA
-summation order).
+`run_blocks` with the fused block-glue kernels (`kernels.py`, bitwise the native block pieces at the model widths).
+Once the KV window is full (steady state) the blocks run through one `mx.compile`d graph per session, the
+counterpart of upstream's CUDA graph replay (`prime` compiles it before gameplay, `clear` drops it); compilation keeps
+the traced arithmetic, so the only numeric difference from `native` is the attention key order (ring slots -> SDPA
+summation order). Only the bounded, batch-1, chunk-1, bf16 inference path is supported; anything else is a ValueError
+(never a silent fallback to the native loop).
 
 Planner part: `plan_cache` (upstream semantics on MLX caches whose end indices are Python ints, a documented
 deviation from upstream's 1-element tensors) plus `to_linear` / `from_linear`, which convert between the ring slot
 order and the native linear order (sink frame, then the rolling window oldest to newest) so the parity suite can
 compare against torch fixtures.
 
-Deviations from upstream: no CUDA graphs (`prime`, `graph`) and no varlen `cu_seqlens` in `Plan`; the only mode is
-`ring-fused`; caches are also required to be bfloat16; every layer is validated before any cache is planned (upstream
-plans layer by layer and can leave earlier layers planned when a later one fails).
+Deviations from upstream: `mx.compile` instead of CUDA graphs (a compiled function keyed on shapes and spans, not a
+graph bound to buffer addresses) and no varlen `cu_seqlens` in `Plan`; the only mode is `ring-fused`; caches are also
+required to be bfloat16; every layer is validated before any cache is planned (upstream plans layer by layer and can
+leave earlier layers planned when a later one fails); the timestep-embedding MLP is memoized per timestep value
+(`CastleRuntime.time_embedding`).
 """
 from dataclasses import dataclass
 
 import mlx.core as mx
+import numpy as np
+
+from matrix_game_mlx.inference.rope_kernel import RopeRotations
 
 
 def plan_cache(cache: dict, current_start: int, tokens: int, window: int, ring: bool = False) -> tuple:
@@ -189,7 +196,13 @@ def _fusable(block, e) -> bool:
 
 
 class CastleRuntime:
-    """Ring KV + GPU RoPE DiT runtime. Upstream's CUDA modes (kernels, cudagraph, ring, ring-graph) do not exist."""
+    """Ring KV + GPU RoPE + fused-kernel DiT runtime with one compiled steady-window graph (upstream: CUDA graph).
+
+    Upstream's CUDA modes (kernels, cudagraph, ring, ring-graph) do not exist. `captures` counts graph compilations
+    (traces) and `replays` the calls that ran the compiled graph, as upstream's counters.
+    """
+
+    TIME_MEMO_MAX = 8
 
     def __init__(self, mode):
         if mode != "ring-fused":
@@ -197,9 +210,59 @@ class CastleRuntime:
         self.mode = mode
         self.ring = True
         self.fused = True
+        self.compile = True
+        self.entry = None
+        self.captures = self.replays = 0
+        self.time_memo = {}
 
     def clear(self):
-        """Drop per-session state (none yet: no graphs; kept for the upstream call sites)."""
+        """Drop per-session state: the compiled steady-window graph and the timestep-embedding memo."""
+        self.entry = None
+        self.time_memo.clear()
+
+    def time_embedding(self, model, t, dtype):
+        """`model.time_embedding(t, dtype)` memoized per timestep value (port addition, see README).
+
+        The float64-accumulated timestep MLP runs on the CPU stream and every block waits for it; a stream only ever
+        uses its few denoising timesteps and t=0, so a hit returns the arrays computed for the same t (bitwise the
+        same values). Entries hold the MLP weight arrays they were computed with and miss when any is replaced.
+        """
+        layers = (model.time_embedding_linear1, model.time_embedding_linear2, model.time_projection_linear1)
+        weights = tuple(a for layer in layers for a in (layer.weight, layer.bias))
+        key = (tuple(t.shape), t.dtype, np.array(t).tobytes(), dtype)
+        hit = self.time_memo.get(key)
+        if hit is not None and all(a is b for a, b in zip(hit[0], weights)):
+            return hit[1]
+        value = model.time_embedding(t, dtype)
+        if len(self.time_memo) >= self.TIME_MEMO_MAX:
+            self.time_memo.clear()
+        self.time_memo[key] = (weights, value)
+        return value
+
+    def prime(self, generator, prompt, shape, kv, xc, fsl, sink_rope_mode="fixed"):
+        """Compile the steady-window graph before gameplay (upstream `prime`), then erase the warm-up KV.
+
+        Runs one clean (t=0) call at the first steady position on zero latents. The text K/V it initialises comes
+        from the real prompt and is kept, as upstream; every self-attention cache is reset to zeros.
+        """
+        if not self.compile:
+            return
+        window = generator.model.blocks[0].self_attn.local_attn_size
+        for cache in kv:
+            cache["global_end_index"] = (window + 1) * fsl
+            cache["local_end_index"] = window * fsl
+        try:
+            _, pred = generator(noisy_image_or_video=mx.zeros(shape, generator.model.patch_embedding.weight.dtype),
+                                conditional_dict={"prompt_embeds": prompt}, timestep=mx.zeros((1, 1)),
+                                drop_control=True, kv_cache=kv, crossattn_cache=xc, current_start=(window + 1) * fsl,
+                                sink_rope_mode=sink_rope_mode)
+            mx.eval(pred, *[c[k] for c in kv for k in ("k", "v")], *[c[k] for c in xc if c.get("is_init")
+                                                                     for k in ("k", "v")])
+        finally:
+            for cache in kv:
+                for name in ("k", "v", "k_sink_raw"):
+                    cache[name] = mx.zeros_like(cache[name])
+                cache["global_end_index"] = cache["local_end_index"] = 0
 
     def run(self, model, x, e, grid_sizes, context, kv, xc, current_start, *, sink_rope_mode, unsupported=False):
         from matrix_game_mlx.inference.rope_kernel import build_causal_rope_rotations
@@ -247,7 +310,49 @@ class CastleRuntime:
                 cross["v"] = a.v(context).reshape(1, -1, a.num_heads, a.head_dim)
                 cross["is_init"] = True
             plans.append(Plan(block, cache, cross, start, end))
-        return run_blocks(plans, x, e, rotations, sink_rotations, self.fused)
+        if not self.compile or not steady:
+            return run_blocks(plans, x, e, rotations, sink_rotations, self.fused)
+        return self.graph(model, plans, x, e, rotations, sink_rotations)
+
+    def graph(self, model, plans, x, e, rotations, sink_rotations):
+        """Run the blocks through the session's compiled steady-window graph (upstream: CUDA graph replay).
+
+        One entry per active session, no per-position cache: the input latent tokens, the timestep modulation `e`,
+        the RoPE rotation tables and every KV / text cache tensor are graph inputs, the block weights are implicit
+        inputs (`mx.compile(inputs=...)`), and in steady state every layer writes the tail slot, so the write
+        span is fixed. The planner's ring eviction ran before, outside the graph. A different key (model, shapes,
+        sink mode, spans) replaces the entry. mx.compile keeps the arithmetic of the traced ops (the fused kernels
+        and SDPA are opaque to it), so the graph is bitwise the eager `run_blocks` (tests/test_runtime.py).
+        """
+        fixed = sink_rotations is not None
+        key = (id(model), tuple(x.shape), x.dtype, tuple(e.shape), e.dtype, fixed, rotations.seq_len, rotations.pairs,
+               self.fused, tuple((id(p.block), p.start, p.end, tuple(p.cache["k"].shape), tuple(p.cross["k"].shape))
+                                 for p in plans))
+        if self.entry is None or self.entry[0] != key:
+            self.entry = None
+            blocks, spans, fused = [p.block for p in plans], [(p.start, p.end) for p in plans], self.fused
+            seq_len, pairs = rotations.seq_len, rotations.pairs
+
+            def step(x, e, tables, ks, vs, sinks, cross_ks, cross_vs):
+                self.captures += 1                             # Python runs only while tracing
+                traced = [Plan(block, {"k": k, "v": v, "k_sink_raw": sink}, {"k": ck, "v": cv, "is_init": True},
+                               start, end)
+                          for block, (start, end), k, v, sink, ck, cv in zip(blocks, spans, ks, vs, sinks, cross_ks,
+                                                                             cross_vs)]
+                rots = [RopeRotations(table, seq_len, pairs) for table in tables]
+                out = run_blocks(traced, x, e, rots[0], rots[1] if fixed else None, fused)
+                return out, [p.cache["k"] for p in traced], [p.cache["v"] for p in traced]
+
+            # The entry keeps the blocks alive, so their ids in the key cannot be reused while it exists.
+            self.entry = (key, mx.compile(step, inputs=[block.state for block in blocks]))
+        tables = [rotations.table] + ([sink_rotations.table] if fixed else [])
+        out, ks, vs = self.entry[1](x, e, tables, [p.cache["k"] for p in plans], [p.cache["v"] for p in plans],
+                                    [p.cache["k_sink_raw"] for p in plans], [p.cross["k"] for p in plans],
+                                    [p.cross["v"] for p in plans])
+        for p, k, v in zip(plans, ks, vs):
+            p.cache["k"], p.cache["v"] = k, v
+        self.replays += 1
+        return out
 
 
 def install_runtime(generator, mode):

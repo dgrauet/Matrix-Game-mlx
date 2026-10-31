@@ -87,11 +87,12 @@ def _inputs(rng, n):
     return [rng.standard_normal((1, 1, 2, 4, 12)).astype(np.float32) for _ in range(n)]
 
 
-def _teacher_forced(weights, mode, *, calls, switch_at=None):
+def _teacher_forced(weights, mode, *, calls, switch_at=None, compiled=True):
     """Run native and runtime per call from the same (native) cache state; assert per-call equivalence."""
     rng = np.random.default_rng(0)
     contexts = [rng.standard_normal((1, 8, 32)).astype(np.float32) for _ in range(2)]
     native, runtime = _model(weights), _model(weights, runtime=True)
+    runtime.castle_runtime.compile = compiled
     kv_n, xc_n = _caches()
     _, xc_r = _caches()
     worst = [0.0, 0.0]
@@ -127,6 +128,8 @@ def _teacher_forced(weights, mode, *, calls, switch_at=None):
             for name in ("k", "v"):
                 assert mx.array_equal(cr[name], cn[name]), f"{msg} layer {layer} cross {name}"
     assert runtime.castle_runtime.calls == len(calls) and getattr(native, "castle_runtime", None) is None
+    steady = sum(position > WINDOW for position, _ in calls)
+    assert runtime.castle_runtime.replays == (steady if compiled else 0)
     return worst
 
 
@@ -214,6 +217,8 @@ def test_runtime_fused_is_bitwise_unfused(weights, mode, monkeypatch):
     fused, unfused = _model(weights, runtime=True), _model(weights, runtime=True)
     assert fused.castle_runtime.fused
     unfused.castle_runtime.fused = False
+    for model in (fused, unfused):  # eager: the Python call counters below see every call (compiled: the trace only)
+        model.castle_runtime.compile = False
     (kv_f, xc_f), (kv_u, xc_u) = _caches(), _caches()
     calls = _schedule(CHUNKS, clean_first=True)
     for index, ((position, t), x) in enumerate(zip(calls, _inputs(rng, len(calls)))):
@@ -228,6 +233,114 @@ def test_runtime_fused_is_bitwise_unfused(weights, mode, monkeypatch):
                       "gelu_tanh": n}
 
 
+def _rollout(model, mode, calls, inputs, ctx, contexts_at=None):
+    """Free-running rollout on fresh caches; returns per-call outputs and the caches after every call."""
+    kv, xc = _caches()
+    outs, states = [], []
+    for index, ((position, t), x) in enumerate(zip(calls, inputs)):
+        if contexts_at is not None and index == contexts_at[0]:
+            ctx = contexts_at[1]
+            for cross in xc:                                   # as CastleStream.set_prompt
+                cross["is_init"] = False
+        outs.append(_call(model, x, t, ctx, kv, xc, position, mode))
+        # New array objects: eager slice assignment updates the cache's array objects in place.
+        states.append([{name: mx.array(c[name]) for name in ("k", "v", "k_sink_raw")} for c in kv])
+    return outs, states
+
+
+@pytest.mark.parametrize("mode", ["absolute", "fixed"])
+def test_compiled_matches_uncompiled(weights, mode):
+    """The compiled steady-window graph against the Task 6 eager path: the teacher-forced per-call assertions of
+    test_runtime_matches_native with compilation on, and a 60-chunk free-running rollout that is bitwise equal
+    (outputs and every cache tensor after every call) with compilation on and off."""
+    MEASURED[f"compiled_teacher_forced[{mode}]"] = _teacher_forced(weights, mode, calls=_schedule(CHUNKS))
+    rng = np.random.default_rng(6)
+    ctx = rng.standard_normal((1, 8, 32)).astype(np.float32)
+    calls = _schedule(CHUNKS, clean_first=True)
+    inputs = _inputs(rng, len(calls))
+    compiled, eager = _model(weights, runtime=True), _model(weights, runtime=True)
+    assert compiled.castle_runtime.compile
+    eager.castle_runtime.compile = False
+    (out_c, st_c), (out_e, st_e) = (_rollout(m, mode, calls, inputs, ctx) for m in (compiled, eager))
+    for index, (a, b, sa, sb) in enumerate(zip(out_c, out_e, st_c, st_e)):
+        assert mx.array_equal(a, b), f"call {index}"
+        for layer, (ca, cb) in enumerate(zip(sa, sb)):
+            for name in ("k", "v", "k_sink_raw"):
+                assert mx.array_equal(ca[name], cb[name]), f"call {index} layer {layer} {name}"
+    steady = sum(position > WINDOW for position, _ in calls)
+    assert steady > 0 and compiled.castle_runtime.replays == steady and eager.castle_runtime.replays == 0
+    print("max rel L2 (output, written slot):", MEASURED)
+
+
+def test_compile_cache_bounded(weights):
+    """One steady-window graph per session (upstream: one CUDA graph): positions, RoPE rotations, timestep
+    modulation and a new prompt are inputs, so 60 chunks (with a prompt switch) compile at most 3 entries; clear()
+    drops the compiled state and the next steady call compiles again."""
+    rng = np.random.default_rng(7)
+    contexts = [rng.standard_normal((1, 8, 32)).astype(np.float32) for _ in range(2)]
+    model = _model(weights, runtime=True)
+    runtime = model.castle_runtime
+    calls = _schedule(CHUNKS)
+    _rollout(model, "fixed", calls, _inputs(rng, len(calls)), contexts[0], contexts_at=(len(calls) // 2, contexts[1]))
+    steady = sum(position > WINDOW for position, _ in calls)
+    print(f"compiled entries after {CHUNKS} chunks: {runtime.captures}, replays {runtime.replays} / {steady}")
+    assert 1 <= runtime.captures <= 3 and runtime.replays == steady
+    assert runtime.entry is not None
+    runtime.clear()
+    assert runtime.entry is None and not runtime.time_memo
+    before = runtime.captures
+    _rollout(model, "fixed", _schedule(WINDOW + 2), _inputs(rng, 2 * (WINDOW + 2)), contexts[0])
+    assert runtime.captures == before + 1
+
+
+def test_time_embedding_memo_is_bitwise(weights):
+    """The runtime memoizes the float64-accumulated timestep MLP per timestep value: a hit returns exactly what the
+    native computation returns, a weight change invalidates it, and clear() empties it."""
+    model = _model(weights, runtime=True)
+    runtime = model.castle_runtime
+    for t in (937.5, 0.0, 937.5, 0.0, 937.5):
+        got = runtime.time_embedding(model, mx.full((1, 1), t), mx.bfloat16)
+        want = model.time_embedding(mx.full((1, 1), t), mx.bfloat16)
+        assert all(mx.array_equal(a, b) and a.dtype == b.dtype for a, b in zip(got, want)), t
+    assert len(runtime.time_memo) == 2
+    layer = model.time_projection_linear1
+    layer.weight = layer.weight * 2
+    got = runtime.time_embedding(model, mx.full((1, 1), 0.0), mx.bfloat16)
+    want = model.time_embedding(mx.full((1, 1), 0.0), mx.bfloat16)
+    assert all(mx.array_equal(a, b) for a, b in zip(got, want))
+    runtime.clear()
+    assert not runtime.time_memo
+
+
+def test_prime_compiles_and_leaves_clean_caches(weights):
+    """prime (upstream's warm-up before gameplay) runs one steady-window call, so the graph is compiled before the
+    first chunk, then erases every KV cache; a rollout from the primed caches is bitwise a rollout on fresh ones and
+    compiles nothing more."""
+    from matrix_game_mlx.inference.wrappers import WanDiffusionWrapper
+    rng = np.random.default_rng(8)
+    prompt = mx.array(rng.standard_normal((1, 8, 32)).astype(np.float32))
+    primed, fresh = _model(weights, runtime=True), _model(weights, runtime=True)
+    gen = WanDiffusionWrapper(primed)
+    kv, xc = _caches()
+    primed.castle_runtime.prime(gen, prompt, (1, 1, 4, 2, 4), kv, xc, FSL, "fixed")
+    assert primed.castle_runtime.captures == 1 and primed.castle_runtime.replays == 1
+    for c in kv:
+        assert (c["global_end_index"], c["local_end_index"]) == (0, 0)
+        assert all(not bool(mx.any(c[name])) for name in ("k", "v", "k_sink_raw"))
+    assert all(c["is_init"] for c in xc)                       # the real prompt's text K/V is reused, as upstream
+    calls = _schedule(CHUNKS // 4)
+    inputs = _inputs(rng, len(calls))
+    kv_f, xc_f = _caches()
+    for (position, t), x in zip(calls, inputs):
+        a = _call(primed, x, t, prompt, kv, xc, position, "fixed")
+        b = _call(fresh, x, t, prompt, kv_f, xc_f, position, "fixed")
+        assert mx.array_equal(a, b)
+        for ca, cb in zip(kv, kv_f):
+            for name in ("k", "v", "k_sink_raw"):
+                assert mx.array_equal(ca[name], cb[name])
+    assert primed.castle_runtime.captures == 1
+
+
 def test_runtime_second_stream_matches_fresh(weights):
     rng = np.random.default_rng(2)
     ctx = rng.standard_normal((1, 8, 32)).astype(np.float32)
@@ -237,6 +350,7 @@ def test_runtime_second_stream_matches_fresh(weights):
     kv, xc = _caches()
     for (position, t), x in zip(_schedule(6), first):
         _call(used, x, t, ctx, kv, xc, position, "fixed")
+    assert used.castle_runtime.captures == 1 and used.castle_runtime.replays > 0   # the compiled graph ran
     fresh = _model(weights, runtime=True)
     (kv_u, xc_u), (kv_f, xc_f) = _caches(), _caches()
     for (position, t), x in zip(calls, inputs):
@@ -246,6 +360,8 @@ def test_runtime_second_stream_matches_fresh(weights):
         for cu, cf in zip(kv_u, kv_f):
             for name in ("k", "v", "k_sink_raw"):
                 assert mx.array_equal(cu[name], cf[name])
+    # The second stream reused the first stream's compiled graph: compiled state holds no session data.
+    assert used.castle_runtime.captures == 1 and fresh.castle_runtime.captures == 1
 
 
 def test_install_runtime_modes(weights):

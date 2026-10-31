@@ -106,6 +106,9 @@ class CastleStream:
             self.decoder = IncrementalDecoder(vae)
         else:
             vae.clear_cache()
+        runtime = getattr(getattr(generator, "model", None), "castle_runtime", None)
+        if runtime is not None:
+            runtime.prime(generator, self.prompt, self.shape, self.kv, self.xc, self.fsl, sink_rope_mode)
         if self.sink_offset:
             self.gen(noisy_image_or_video=sink_latent.astype(self.dtype), conditional_dict={"prompt_embeds": self.prompt},
                      timestep=mx.zeros((1, 1)), drop_control=True, kv_cache=self.kv, crossattn_cache=self.xc,
@@ -129,10 +132,18 @@ class CastleStream:
             raise ValueError("Expected consecutive RGB frames: 1 initially, then 4 per chunk")
         if self.index >= self.max_latents:
             raise ValueError("Session reached its configured RoPE/frame budget")
-        if not mx.issubdtype(pixels.dtype, mx.floating) or not bool(mx.all(mx.isfinite(pixels))) or \
-                float(pixels.min()) < -1 or float(pixels.max()) > 1:
+        if not mx.issubdtype(pixels.dtype, mx.floating):
             raise ValueError("RGB input must be finite floating point in [-1,1]")
-        if initial_noise is not None and (tuple(initial_noise.shape) != self.shape or not bool(mx.all(mx.isfinite(initial_noise)))):
+        if initial_noise is not None and tuple(initial_noise.shape) != self.shape:
+            raise ValueError("Initial noise must be finite and match one latent frame")
+        # Every value check in one host sync (pixels finite and in range, noise finite).
+        reads = [mx.all(mx.isfinite(pixels)), pixels.min(), pixels.max()]
+        if initial_noise is not None:
+            reads.append(mx.all(mx.isfinite(initial_noise)))
+        mx.eval(reads)
+        if not bool(reads[0]) or float(reads[1]) < -1 or float(reads[2]) > 1:
+            raise ValueError("RGB input must be finite floating point in [-1,1]")
+        if initial_noise is not None and not bool(reads[3]):
             raise ValueError("Initial noise must be finite and match one latent frame")
         return count
 
@@ -181,17 +192,19 @@ class CastleStream:
             common = dict(kv_cache=self.kv, crossattn_cache=self.xc, current_start=position * self.fsl,
                           sink_rope_mode=self.sink_rope_mode)
             with scope("denoise"):
+                finite = None
                 for k, step in enumerate(steps):
                     t = mx.full((1, 1), float(step))
                     _, pred = self.gen(noisy_image_or_video=x, conditional_dict=cond, timestep=t, **common)
-                    self._eval_caches(pred)
+                    finite = mx.all(mx.isfinite(pred))             # read with the step's own sync
+                    self._eval_caches(pred, finite)
                     if k + 1 < len(steps):
                         flat = pred.reshape(-1, *pred.shape[2:]).astype(mx.float32)
                         noise = renoise[k].reshape(flat.shape) if renoise is not None else \
                             self._next_noise("renoise_key").reshape(flat.shape)
                         x = self.scheduler.add_noise(flat, noise.astype(mx.float32), mx.full((1,), float(steps[k + 1])))
                         x = x.reshape(1, 1, *x.shape[1:]).astype(self.dtype)
-                if not bool(mx.all(mx.isfinite(pred))):
+                if not bool(mx.all(mx.isfinite(pred)) if finite is None else finite):
                     raise RuntimeError("Non-finite generated latent")
             marks.append(time.perf_counter())
 
@@ -239,6 +252,9 @@ class CastleStream:
     def close(self):
         if self.closed:
             return
+        runtime = getattr(getattr(self.gen, "model", None), "castle_runtime", None)
+        if runtime is not None:
+            runtime.clear()
         self.kv.clear()
         self.xc.clear()
         self.encoder_features.clear()

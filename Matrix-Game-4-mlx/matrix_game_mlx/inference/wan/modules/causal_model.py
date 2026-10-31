@@ -285,6 +285,13 @@ class CausalWanModel(nn.Module):
                                        current_start=current_start, cache_start=cache_start,
                                        sink_rope_mode=sink_rope_mode)
 
+    def time_embedding(self, t, dtype):
+        """(e, e0): the timestep MLP (float64 accumulation on the CPU stream) and its 6-way modulation projection."""
+        e = linear_f64_acc(self.time_embedding_linear2, silu(linear_f64_acc(
+            self.time_embedding_linear1, sinusoidal_embedding_1d(self.freq_dim, t.reshape(-1)).astype(dtype))))
+        e0 = linear_f64_acc(self.time_projection_linear1, silu(e)).reshape(*t.shape, 6, self.dim)
+        return e, e0
+
     def _forward_inference(self, x, t, context, seq_len, kv_cache=None, crossattn_cache=None, current_start=0,
                            cache_start=0, sink_rope_mode=None):
         pt, ph, pw = self.patch_size
@@ -300,16 +307,14 @@ class CausalWanModel(nn.Module):
         assert max(u.shape[1] for u in tokens) <= seq_len
         x = mx.concatenate(tokens, axis=0)
 
-        e = linear_f64_acc(self.time_embedding_linear2, silu(linear_f64_acc(
-            self.time_embedding_linear1, sinusoidal_embedding_1d(self.freq_dim, t.reshape(-1)).astype(x.dtype))))
-        e0 = linear_f64_acc(self.time_projection_linear1, silu(e)).reshape(*t.shape, 6, self.dim)
+        runtime = getattr(self, "castle_runtime", None)
+        e, e0 = self.time_embedding(t, x.dtype) if runtime is None else runtime.time_embedding(self, t, x.dtype)
 
         ctx = context if isinstance(context, mx.array) else mx.stack(list(context))
         if ctx.shape[1] < self.text_len:
             ctx = mx.concatenate([ctx, mx.zeros((ctx.shape[0], self.text_len - ctx.shape[1], ctx.shape[2]), ctx.dtype)], 1)
         context = self.text_embedding_linear2(gelu_tanh(self.text_embedding_linear1(ctx.astype(dtype))))
 
-        runtime = getattr(self, "castle_runtime", None)
         if runtime is not None:
             x = runtime.run(self, x, e0, grid_sizes, context, kv_cache, crossattn_cache, current_start,
                             sink_rope_mode=sink_rope_mode, unsupported=cache_start not in (0, None))
