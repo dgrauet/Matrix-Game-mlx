@@ -22,6 +22,36 @@ def game_binary() -> Path:
     return UPSTREAM / "game/racing/bin/CitySampleBBoxGame"
 
 
+def castle_game_binary() -> Path:
+    return UPSTREAM / "game/bin/CastleReferenceServer"
+
+
+def racing_server_binary() -> Path:
+    return UPSTREAM / "game/racing/bin/CitySampleReferenceServer"
+
+
+def castle_build_command() -> str:
+    """The shooter build command (README "Build"); its ctest needs no assets."""
+    return "cd Matrix-Game-4 && bash scripts/build_game.sh"
+
+
+def castle_game_missing() -> Optional[str]:
+    """None when the shooter reference server is built, else the command that builds it."""
+    if castle_game_binary().is_file():
+        return None
+    return f"shooter reference server not built, run: {castle_build_command()}"
+
+
+def racing_server_missing() -> Optional[str]:
+    """None when the racing reference server and the racing assets are present, else what to run."""
+    todo = []
+    if not (racing_data_dir() / "assets/bbox-assets.bin").is_file():
+        todo.append(download_command())
+    if not racing_server_binary().is_file():
+        todo.append(build_command())
+    return "racing reference server not ready, run (in this order): " + " ; ".join(todo) if todo else None
+
+
 def download_command() -> str:
     """The assets download command (README "Racing assets"), targeting the resources directory in use."""
     return ("cd Matrix-Game-4-mlx && matrix-game-mlx download --manifest releases/game-assets.json "

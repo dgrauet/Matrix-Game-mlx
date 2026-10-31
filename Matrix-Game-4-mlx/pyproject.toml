@@ -3,6 +3,7 @@ name = "matrix-game-4-mlx"
 version = "0.1.0"
 description = "MLX inference port of Matrix-Game 4.0 (offline rendering)"
 requires-python = ">=3.11"
+license-files = ["matrix_game_mlx/web/mediamtx-reader.LICENSE"]
 dependencies = ["mlx>=0.31.0", "numpy", "Pillow", "imageio-ffmpeg", "huggingface_hub",
                 "safetensors", "tokenizers", "transformers", "ftfy", "regex"]
 
@@ -11,13 +12,19 @@ matrix-game-mlx = "matrix_game_mlx.cli:main"
 
 [project.optional-dependencies]
 parity = ["torch", "diffusers", "einops"]
+serve = ["aiohttp>=3.10,<4"]
 
 [tool.setuptools.packages.find]
 include = ["matrix_game_mlx*"]
 
 [tool.setuptools.package-data]
-matrix_game_mlx = ["configs/*.json"]
+matrix_game_mlx = ["configs/*.json", "web/*"]
 
 [tool.pytest.ini_options]
 markers = ["needs_weights: requires the converted MLX pack", "needs_fixtures: requires torch reference fixtures",
-           "needs_racing_game: requires the built upstream racing game and its assets"]
+           "needs_racing_game: requires the built upstream racing game and its assets",
+           "needs_castle_game: requires the built shooter CastleReferenceServer",
+           "needs_racing_server: requires the built CitySampleReferenceServer and the racing assets",
+           "needs_media: requires mediamtx and a GI-enabled Python (brew install mediamtx gstreamer pygobject3)",
+           "needs_playwright: requires Node Playwright with Chromium and WebKit (PLAYWRIGHT_MODULE)",
+           "slow: takes several minutes (quality-preset online session)"]

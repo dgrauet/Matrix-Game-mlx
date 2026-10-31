@@ -10,7 +10,7 @@ def main(argv=None):
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     rest = args.arguments
     if args.command == "serve":
-        raise SystemExit("matrix-game-mlx serve: not ported yet")
+        from .server.app import main as run
     elif args.command == "render":
         from .inference.offline import main as run
     else:

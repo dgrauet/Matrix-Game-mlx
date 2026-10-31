@@ -8,7 +8,8 @@ from matrix_game_mlx.cli import main
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize("name,flag", [("render", "--take"), ("download", "--manifest"), ("verify", "--manifest")])
+@pytest.mark.parametrize("name,flag", [("serve", "--reference-only"), ("render", "--take"), ("download", "--manifest"),
+                                       ("verify", "--manifest")])
 def test_subcommand_help(name, flag, capsys):
     with pytest.raises(SystemExit) as stopped:
         main([name, "--help"])
@@ -16,11 +17,11 @@ def test_subcommand_help(name, flag, capsys):
     assert flag in capsys.readouterr().out
 
 
-def test_serve_not_ported():
-    with pytest.raises(SystemExit) as stopped:
-        main(["serve"])
-    assert stopped.value.code not in (0, None)
-    assert "not ported yet" in str(stopped.value.code)
+def test_serve_dispatches_to_server_app(monkeypatch):
+    received = []
+    monkeypatch.setattr("matrix_game_mlx.server.app.main", received.append)
+    main(["serve", "--scene", "castle", "--fps", "24"])
+    assert received == [["--scene", "castle", "--fps", "24"]]
 
 
 def test_console_script_declared():

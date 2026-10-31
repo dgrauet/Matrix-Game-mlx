@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -221,6 +222,8 @@ VARIANTS = {
     "egypt_wan_custom_first": ("ancient-egypt", "wan", (1000,), (1000, 750, 500, 250), True, None),
     "racing_take_realtime": ("racing", "taehv", (1000,), (1000,), True, None),
     "racing_take_quality": ("racing", "wan", (1000, 500), (1000, 500), True, None),
+    "racing_online_dynamic": ("racing", "taehv", (1000,), (1000,), True, None),
+    "castle_online_realtime": ("castle", "taehv", (1000,), (1000,), True, None),
 }
 
 
@@ -433,3 +436,146 @@ def test_take_frames_shape_and_range():
     assert frames.shape == (9, 3, 480, 864) and frames.dtype == np.float32
     assert frames.min() >= -1.0 and frames.max() <= 1.0
     assert not np.array_equal(frames[0], frames[8])     # the car is moving
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Online captures (tests/parity/capture_online.py): real serve-mode game frames and engine captions.
+
+def _write_states(capture, captions):
+    """A synthetic states.jsonl in the capture_online layout: one row per chunk, the engine caption on the chunk's
+    last state (as RacingGame sets it) and at the row's top level."""
+    capture.mkdir(parents=True, exist_ok=True)
+    rows, start = [], 0
+    for i, caption in enumerate(captions):
+        count = 1 if i == 0 else 4
+        states = [dict(frame=f) for f in range(start, start + count)]
+        states[-1]["chunk_prompt"] = caption
+        rows.append(json.dumps(dict(frame_start=start, states=states, chunk_prompt=caption)))
+        start += count
+    (capture / "states.jsonl").write_text("\n".join(rows) + "\n")
+
+
+def test_capture_prompts_replays_the_session_rule(tmp_path):
+    """Session.produce (dynamic): on chunks with chunk % interval == 0 take states[-1]["chunk_prompt"] and switch when
+    it differs from the current prompt, which starts at the scene profile prompt; None when unchanged."""
+    from tests.parity.gen_fixtures import capture_prompts
+    for captions, interval, expected in ((["A", "A", "B"], 1, ["A", None, "B"]),
+                                         (["A", "C", "B"], 2, ["A", None, "B"]),     # chunk 1 is not sampled
+                                         (["P", "P", "P"], 1, [None, None, None])):
+        capture = tmp_path / "".join(captions) / str(interval)
+        _write_states(capture, captions)
+        assert capture_prompts(capture, 3, interval, "P") == expected, (captions, interval)
+    _write_states(tmp_path / "short", ["A", "B"])
+    with pytest.raises(ValueError, match="chunks"):
+        capture_prompts(tmp_path / "short", 3, 1, "P")
+    _write_states(tmp_path / "empty", ["A", ""])
+    with pytest.raises(ValueError, match="caption"):
+        capture_prompts(tmp_path / "empty", 2, 1, "P")
+
+
+def _write_capture(capture, frames):
+    from tests.parity.gen_fixtures import file_sha256
+    capture.mkdir(parents=True, exist_ok=True)
+    np.save(capture / "frames.npy", frames)
+    (capture / "capture.json").write_text(json.dumps(dict(frames_sha256=file_sha256(capture / "frames.npy"))))
+
+
+def test_capture_frames_returns_the_model_pixels_of_the_first_frames(tmp_path):
+    """The first n captured RGB frames through frames_to_tensor (what Session.produce pushes), checked against the
+    capture's recorded frames_sha256."""
+    from PIL import Image
+    from matrix_game_mlx.inference.preprocessing import frames_to_tensor
+    from tests.conftest import to_np
+    from tests.parity.gen_fixtures import capture_frames
+    frames = np.random.default_rng(0).integers(0, 256, (5, 480, 864, 3), dtype=np.uint8)
+    _write_capture(tmp_path / "ok", frames)
+    got = capture_frames(tmp_path / "ok", 3)
+    assert got.shape == (3, 3, 480, 864) and got.dtype == np.float32
+    assert np.array_equal(got, to_np(frames_to_tensor([Image.fromarray(f) for f in frames[:3]])))
+    with pytest.raises(ValueError, match="frames"):
+        capture_frames(tmp_path / "ok", 6)
+    _write_capture(tmp_path / "bad", frames)
+    np.save(tmp_path / "bad" / "frames.npy", frames[::-1])                 # frames changed after the capture
+    with pytest.raises(ValueError, match="frames_sha256"):
+        capture_frames(tmp_path / "bad", 3)
+
+
+def test_capture_dir_default_location():
+    from tests.parity.gen_fixtures import capture_dir
+    from tests.racing_game import resources_dir
+    assert capture_dir("racing-online") == resources_dir() / "online-captures" / "racing-online"
+
+
+def test_capture_variants():
+    """The two online-capture variants, registered with their capture names; every other variant has none."""
+    from tests.parity.gen_fixtures import VARIANT_SPECS, gated_chunks, generation_command
+    assert {n: v.capture for n, v in VARIANT_SPECS.items() if v.capture} == {
+        "racing_online_dynamic": "racing-online", "castle_online_realtime": "castle-online"}
+    assert not any(VARIANT_SPECS[n].take for n in ("racing_online_dynamic", "castle_online_realtime"))
+    assert generation_command(variant="racing_online_dynamic") == \
+        "python -m tests.parity.gen_fixtures --variant racing_online_dynamic"
+    # Every denoised chunk of the dynamic-prompt capture is gated (racing chunk 0 is the sink latent itself); the
+    # fixed-prompt castle capture keeps the standing first-denoised-chunk rule
+    assert gated_chunks(VARIANT_SPECS["racing_online_dynamic"]) == (1, 2)
+    assert gated_chunks(VARIANT_SPECS["castle_online_realtime"]) == (0,)
+    assert VARIANT_SPECS["racing_online_dynamic"].dynamic_prompts
+    assert not VARIANT_SPECS["castle_online_realtime"].dynamic_prompts
+    assert not VARIANT_SPECS["racing_switch_realtime"].dynamic_prompts
+
+
+def test_chunk_prompts_per_chunk():
+    """Per chunk, the embeddings set_prompt receives before the push: switch variants at switch_chunk, capture
+    variants where capture_prompts switches."""
+    from tests.parity.gen_fixtures import VARIANT_SPECS, chunk_prompts
+    b = np.ones((1, 512, 8), np.float32)
+    assert [e is b for e in chunk_prompts(VARIANT_SPECS["racing_switch_realtime"], b, 3)] == [False, False, True]
+    assert chunk_prompts(VARIANT_SPECS["racing_switch_realtime"], b, 3)[:2] == [None, None]
+    assert chunk_prompts(VARIANT_SPECS["castle_taehv_2step"], None, 3) == [None, None, None]
+    per_chunk = [b, None, 2 * b]
+    assert chunk_prompts(VARIANT_SPECS["racing_online_dynamic"], per_chunk, 3) is per_chunk
+
+
+def test_capture_variant_inputs_round_trip(tmp_path):
+    """Per-chunk prompt embeddings of a dynamic capture variant survive inputs.npz; a castle capture has none."""
+    from tests.parity.gen_fixtures import (LATENT_SHAPE, VARIANT_SPECS, load_variant_inputs, variant_inputs,
+                                           variant_noises)
+    pixels = np.zeros((9, 3, 4, 4), np.float32)
+    sink = np.zeros(LATENT_SHAPE, np.float32)
+    for name, per_chunk in (("racing_online_dynamic", [np.full((1, 512, 8), 2, np.float32), None,
+                                                       np.full((1, 512, 8), 3, np.float32)]),
+                            ("castle_online_realtime", [None, None, None])):
+        v = VARIANT_SPECS[name]
+        noises, renoises = variant_noises(v)
+        np.savez(tmp_path / f"{name}.npz", **variant_inputs(np.ones((1, 512, 8), np.float32), per_chunk, sink,
+                                                            pixels, noises, renoises))
+        got = load_variant_inputs(v, np.load(tmp_path / f"{name}.npz"))[4]
+        assert [g is None for g in got] == [p is None for p in per_chunk]
+        assert all(np.array_equal(g, p) for g, p in zip(got, per_chunk) if p is not None)
+
+
+def test_run_variant_replays_capture_prompts():
+    from tests.parity.gen_fixtures import VARIANT_SPECS, run_variant, variant_noises
+    v = VARIANT_SPECS["racing_online_dynamic"]
+    stream = _FakeStream(v)
+    per_chunk = [np.zeros((1, 512, 8), np.float32), None, np.ones((1, 512, 8), np.float32)]
+    run_variant(torch, v, stream, np.zeros((9, 3, 2, 2), np.float32), *variant_noises(v), per_chunk, lambda *a: None)
+    assert [e[:2] for e in stream.events if e[0] == "set_prompt"] == [("set_prompt", 0), ("set_prompt", 2)]
+
+
+def test_gated_caption_change():
+    """The capture check: an engine-caption change between two consecutive gated chunks after chunk 0."""
+    from tests.parity.capture_online import gated_caption_change
+    assert gated_caption_change(["P", "A", "B"], (1, 2)) == 2
+    assert gated_caption_change(["P", "A", "A"], (1, 2)) is None          # only the chunk-0 replacement (not gated)
+    assert gated_caption_change(["P", "A", "A", "B"], (1, 2)) is None     # chunk 3 is not gated
+    assert gated_caption_change(["A", "B", "B"], (0, 1, 2)) == 1
+
+
+def test_capture_online_cli():
+    from tests.parity.capture_online import parse_args
+    from tests.parity.gen_fixtures import capture_dir
+    args = parse_args(["--scene", "racing"])
+    assert (args.scene, args.out) == ("racing", capture_dir("racing-online"))
+    assert parse_args(["--scene", "castle", "--out", "/x"]).out == Path("/x")
+    with pytest.raises(SystemExit):
+        parse_args(["--scene", "ancient-egypt"])

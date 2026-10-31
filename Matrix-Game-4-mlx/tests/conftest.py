@@ -8,7 +8,8 @@ from typing import Optional
 import numpy as np
 import pytest
 
-from tests import racing_game
+from tests import media, racing_game
+from tests.serve_process import playwright_missing
 
 MLX_ROOT = str(Path(__file__).resolve().parents[1])
 UPSTREAM_ROOT = str(Path(__file__).resolve().parents[2] / "Matrix-Game-4")
@@ -77,3 +78,11 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(pytest.mark.skip(reason="no torch fixtures in MG4_FIXTURES_DIR"))
         if "needs_racing_game" in item.keywords and racing_game.racing_game_missing():
             item.add_marker(pytest.mark.skip(reason=racing_game.racing_game_missing()))
+        if "needs_castle_game" in item.keywords and racing_game.castle_game_missing():
+            item.add_marker(pytest.mark.skip(reason=racing_game.castle_game_missing()))
+        if "needs_racing_server" in item.keywords and racing_game.racing_server_missing():
+            item.add_marker(pytest.mark.skip(reason=racing_game.racing_server_missing()))
+        if "needs_media" in item.keywords and media.media_missing():
+            item.add_marker(pytest.mark.skip(reason=media.media_missing()))
+        if "needs_playwright" in item.keywords and playwright_missing():
+            item.add_marker(pytest.mark.skip(reason=playwright_missing()))

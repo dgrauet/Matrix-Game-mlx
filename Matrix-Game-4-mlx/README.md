@@ -1,7 +1,7 @@
 # Matrix-Game-4-mlx
 
 MLX inference port of [Matrix-Game 4.0](https://github.com/SkyworkAI/Matrix-Game) for Apple Silicon.
-It targets offline rendering: a causal video-to-video renderer that turns a clip into a stylized one
+It targets offline rendering and an online browser demo (`serve`): a causal video-to-video renderer that turns a clip into a stylized one
 using the quality preset (Wan VAE) or the realtime preset (TAEHV codec, one denoising step), for the
 ancient-egypt, castle and racing scenes.
 
@@ -21,8 +21,8 @@ pip install -e .
 matrix-game-mlx render --scene ancient-egypt --input lowpoly.mp4 --output output/egypt
 ```
 
-`matrix-game-mlx` is the port of upstream's `matrix-game` CLI. Subcommands: `render`, `download`, `verify`;
-`serve` (the online browser demo) is not ported and exits with "not ported yet".
+`matrix-game-mlx` is the port of upstream's `matrix-game` CLI. Subcommands: `render`, `download`, `verify`, `serve`
+(the online browser demo, see "Online play on macOS").
 
 To render a game take recorded with the upstream game (`bash scripts/play.sh --scene ancient-egypt` in
 `../Matrix-Game-4/`, F9 to start and stop), pass the take directory; the scene comes from its `session.json`:
@@ -100,7 +100,7 @@ Archives are never extracted.
 The upstream racing game (`../Matrix-Game-4/game/racing`, a native C++20/SDL2/OpenGL program) builds and runs
 on macOS unchanged. You play or script a drive, the game records a take (clean reference video, alpha UI,
 audio, inputs, telemetry), and `matrix-game-mlx render --take` turns the take into a stylized video. Online
-play is not ported (see "Not ported" below). Game, finalize and compose commands run in `Matrix-Game-4/`
+play is described under "Online play on macOS". Game, finalize and compose commands run in `Matrix-Game-4/`
 (the upstream checkout), `matrix-game-mlx` commands in `Matrix-Game-4-mlx/`.
 
 ### Dependencies
@@ -217,7 +217,7 @@ matrix-game-mlx render --scene racing --take ../Matrix-Game-4/captures/take-001 
 ```
 
 A plain RGB video does not supply engine captions. Real engine-derived captions need the engine, so they
-are part of the future `serve` work.
+come from `serve --prompt-mode dynamic` (see "Online play on macOS").
 
 ### Finalize and compose
 
@@ -231,9 +231,9 @@ python game/racing/tools/finalize-offline-demo.py captures/take-001 \
 `game/racing/tools/compose-demo.py` provides optional HUD relayout and input visualization (`--help` for
 options). Both tools, and the video handling of the finalizer, need `ffmpeg` on the PATH.
 
-### Not ported
+### Online racing
 
-Online racing (`serve`, MediaMTX, browser) and engine captions at runtime are deferred to the `serve` work.
+`matrix-game-mlx serve --scene racing` (MediaMTX, browser, engine captions at runtime) is described under "Online play on macOS".
 
 ### Upstream patches
 
@@ -241,6 +241,194 @@ None. The upstream game code builds and runs on macOS as is. One upstream test f
 `game/racing/tools/test_demo_composition.py::test_ffmpeg_preserves_overlay_frame_indices` decodes 199 frames
 where it expects 200 (an rgba to rgb24 rounding difference in that ffmpeg; the frame indices themselves are
 correct). It is not patched.
+
+## Online play on macOS
+
+`matrix-game-mlx serve` is the port of upstream's online demo (`../Matrix-Game-4/docs/online.md`, and "Online" in
+`docs/racing.md`): the native game renders the scene, the MLX model restyles each chunk, GStreamer encodes it and
+MediaMTX serves it to the browser over WHEP, with upstream's web client (`matrix_game_mlx/web/`, byte-identical).
+Same options, validations, routes and messages as upstream's `serve`, except the CUDA-only options (see "Known
+deviations"). **It is not real time on a laptop**: the realtime preset generates about 1.1 frames per second and the
+quality preset about 0.15 (table below), so a session is a slow-motion game. Commands run from `Matrix-Game-4-mlx/`
+unless noted; `matrix-game-mlx serve` and `python3 -m matrix_game_mlx.cli serve` are the same entry point.
+
+### Setup
+
+```bash
+brew install cmake pkgconf sdl2 ffmpeg mediamtx gstreamer pygobject3        # build tools, media stack
+pip install 'aiohttp>=3.10,<4'                                              # or: pip install -e '.[serve]'
+```
+
+The GStreamer sidecar needs a Python with `gi`, NumPy and the GStreamer 1.0 typelibs; `serve` picks the first of
+the current interpreter, `/opt/homebrew/bin/python3`, `python3` on the `PATH` that imports them, or uses
+`STUDIO_WEBRTC_PYTHON`. Without any, it exits with the install command. GStreamer needs `x264enc` and
+`rtspclientsink` (Homebrew's `gstreamer` includes both). Fetch the scene assets first (the games and `serve` read
+`../Matrix-Game-4/resources`; use `--resources` for another place), then build the games from `Matrix-Game-4/` (the
+shooter build needs no asset flag; the racing build is described under "City racing on macOS"):
+
+```bash
+for scene in castle ancient-egypt racing; do
+  matrix-game-mlx download --manifest releases/game-assets.json --repo-id Skywork/Matrix-Game-4.0 --repo-type model \
+    --revision 4419accdb7bb7881234c5914de8cd915266e0325 --scene $scene --resources ../Matrix-Game-4/resources
+done
+cd ../Matrix-Game-4 && bash scripts/build_game.sh && bash scripts/build_racing.sh -DRACING_ASSET_ROOT="$PWD/resources/racing"; cd -
+```
+
+(Download first, then build: the builds run ctest under `set -e`; `build_game.sh`'s tests need the castle assets
+(`castle-map.bin`) and `build_racing.sh`'s asset tests need the racing assets. `verify --scene castle|ancient-egypt|racing`
+passes on the machine used for the measurements.)
+
+### Run
+
+Terminal 1, MediaMTX with the loopback-only configuration (no binary is downloaded for you):
+
+```bash
+mediamtx ../Matrix-Game-4/configs/mediamtx.yml
+```
+
+Terminal 2, one scene at a time (`--game-root` and `--resources` default to `game` and `resources` in the working
+directory, so pass them when running from `Matrix-Game-4-mlx/`):
+
+```bash
+S="--game-root ../Matrix-Game-4/game --resources ../Matrix-Game-4/resources"
+matrix-game-mlx serve --scene castle --preset realtime --fps 4 $S            # or --scene ancient-egypt
+matrix-game-mlx serve --scene racing --preset realtime --fps 4 $S            # fixed caption
+matrix-game-mlx serve --scene racing --prompt-mode dynamic --prompt-interval-chunks 1 --fps 4 $S   # see "Memory"
+matrix-game-mlx serve --scene castle --preset quality --fps 4 $S             # Wan VAE, two denoising steps
+matrix-game-mlx serve --scene castle --reference-only --fps 24 $S            # no model: game, media and browser only
+matrix-game-mlx serve --scene castle --fps 4 --profile-chunks $S             # per-chunk timings in runtime/
+```
+
+(Under zsh use an array for `$S`, as for `opts` above.) Open `http://127.0.0.1:8025/`, press Play, click the video for pointer lock.
+`--reference-only` is the no-model transport check (the browser's Mode menu then offers `reference`). Only one
+session is active at a time; Stop before starting another. Ports: HTTP 8025, WHEP 8890, ICE/TCP 8190, internal RTSP
+8555 (change both the server options and `configs/mediamtx.yml` together). This is for one trusted local user:
+no accounts, TLS or authentication. For a remote browser, use upstream's tunnel (substitute your own values):
+
+```bash
+ssh -N -p SSH_PORT -L 8025:127.0.0.1:8025 -L 8890:127.0.0.1:8890 -L 8190:127.0.0.1:8190 USER@HOST
+```
+
+The browser's `window.castleDebug()` shows frame matching, presented frames and audio counters. `--profile-chunks`
+writes `runtime/profile-<session>.json`; upstream's help text still says "CPU/CUDA timings", but on this port the
+stage keys are `gpu_<stage>_ms` (`gpu_encode_ms`, `gpu_denoise_ms`, `gpu_clean_kv_ms`, `gpu_decode_ms`, ...).
+`model_fps` counts generated frames over inference time (from the third chunk); `online_fps` also counts waiting
+for the live game and is reported only after 25 chunks.
+With the stream pipeline, `background_prepare_tensor_ms` measures building the lazy MLX graph on the reference thread; the
+actual conversion runs later, in the producer's `encode`, so it is not comparable to upstream's figure.
+
+### Measured rates
+
+Apple M2 Pro, 32 GB, macOS 27.0.1, MLX 0.31.1, one headless Chromium page playing (`tests/measure_serve.py`, one session per
+row, alone on the machine, 32 chunks; chunk = 4 frames; times are `processing_ms` medians). "Footprint" is the summed
+physical footprint (`top` MEM, which includes MLX's Metal buffers) of server, game, sidecar and MediaMTX, excluding
+the browser (1.1 GB). `ps` RSS undercounts MLX by 5 to 14 GB, so it is not used. Swap is the growth of
+`vm.swapusage` during the session.
+
+| Configuration | `--fps` | Chunk | `model_fps` | `online_fps` | Footprint | Swap |
+| --- | --- | --- | --- | --- | --- | --- |
+| castle realtime | 40 | 3.75 s | 1.09 | 0.99 | 16.2 GB | 0 |
+| castle realtime | 4 | 3.83 s | 1.07 | 0.97 | 16.2 GB | 0 |
+| racing realtime, fixed caption | 24 | 3.77 s | 1.09 | 1.01 | 16.5 GB | 0 |
+| racing realtime, fixed caption | 4 | 3.75 s | 1.09 | 1.01 | 16.6 GB | 0 |
+| racing realtime, dynamic captions, no browser | 24 | 4.0 s, then 31 to 35 s | 0.34 | 0.14 | 25.5 GB | +3.8 GB |
+| racing realtime, dynamic captions, browser | 24 | 5.4 s, then 14 to 34 s | 0.55 (21 chunks) | n/a | 25.5 GB | +3.1 GB |
+| castle quality (6 chunks, no browser) | 4 | 27.8 s | 0.15 | n/a | 24.2 GB | +0.4 GB |
+
+Time to the first encoded frame: realtime 3.6 to 7.8 s (13.5 s with dynamic captions), quality 12.4 s (13.3 s in
+the end-to-end test). Realtime chunk medians are about 3.3 s over a 14-chunk session and 3.8 s over 32 (the KV window fills at chunk 19).
+The `--fps` flag does not change the generation rate: the model sets the pace and the game waits for it, so
+`--fps` sets how much game time one generated frame covers.
+
+What a player sees (Chromium counters over the last 18 s, `window.castleDebug()`: frames presented by the browser
+and game frames, per second): about 0.7 to 1.1 presented and 0.9 to 1.2 game frames per second for every realtime row,
+whatever `--fps`: **a slideshow of about one image per second**, with the 4-frame chunks arriving in bursts. Only the
+game clock differs. The 125 frames of a 32-chunk session (about two minutes) cover 3.1 s of game time at `--fps 40`, 5.2 s at 24 and 31 s
+at 4: the world runs about 40, 24 and 4 times slower than real time. Image quality also differs, from one screenshot of each (castle 14 chunks, racing 14 chunks, a
+keyboard-driven drive): at 40 fps the castle had turned into a brown smear after 53 frames (plausibly because
+the model sees almost no change between frames at 1/40 s steps; not tested further); at 4 fps the castle stayed coherent, with a wider spacing than the training
+data but readable. Racing at 24 fps stayed sharp (the car had barely left the start line); at 4 fps the racing
+frames show visible texture smearing on walls, and the car had driven 10 s of the route (its HUD timer). These are single sessions, not
+a quality metric.
+
+**Recommendation: `--fps 4` for both scenes and both presets**, which is the lowest rate that keeps the game
+playable (a time trial then lasts minutes instead of tens of minutes), with the caveat that the image is rougher
+than at upstream's 24 to 40 fps (`--fps 8`, untested here, trades game speed for a tighter frame spacing; 8 divides
+120 for the shooters). The quality preset delivers one chunk per 28 s, so even at `--fps 4` the game runs about 28
+times slower than real time: usable to look at the picture, not to play. Do not read `--fps` as a
+speed-up (upstream says the same).
+
+### Memory
+
+Realtime fixed-caption sessions peak at 16.2 to 16.6 GB footprint, quality at 24.2 GB: both fit in 32 GB with the
+browser. **Racing with dynamic captions does not fit sustainably on a 32 GB Mac.** T5 stays resident (no offload),
+the footprint reaches 25.5 GB (24.5 GB in the end-to-end test, which stops after 9 frames), and the machine swaps:
+swap grew by 3.8 GB without a browser and 3.1 GB with one, later chunks took 31 to 35 s instead of 4 s,
+and with the browser the session was lost ("Browser disconnected": the page stopped answering the server's
+15 s watchdog). These runs were at `--fps 24`; `--fps` changes neither the generation rate nor the memory, so the
+same holds at `--fps 4`. Use `--prompt-mode fixed` (the default) on 32 GB; dynamic captions need a Mac with more memory.
+(The swap file already held 4 to 5 GB from earlier work when these runs started, so a freshly booted Mac
+may do better; that was not tested.)
+
+### Quality preset in a browser
+
+A browser keeps an idle `/api/start` request open for a limited time (WebKit about 60 s), while the server waits for
+the first encoded frame. On this Mac quality reached it in 12 to 14 s, well inside that, but a slower Mac may not.
+`serve` allows 300 s for the Wan-VAE presets (45 s for `realtime`, upstream's value). The 15 s silence watchdog
+still applies: the browser sends controls continuously, but a client that does not (a script) must send one at
+least every 15 s, as `tests/test_serve_e2e.py` does.
+
+### macOS port changes
+
+Upstream's server modules are copied with `matrix_game.` renamed to `matrix_game_mlx.`; the changes in
+`server/app.py` each carry a `# macOS port:` comment:
+
+- The sidecar interpreter is found by `media_env.default_sidecar_python()` (upstream's `serve.sh` uses `/usr/bin/python3`, which has no GStreamer here), and `serve` applies `serve.sh`'s environment defaults itself
+  (`STUDIO_WEBRTC_RTSP_PORT=8555`, `STUDIO_MEDIA_MAXRATE_KBPS=2500`, `STUDIO_WEBRTC_FRAME_PACING=clock`). A machine without a
+  GI-enabled Python is a usage error with the install command, not a traceback. `OMP_NUM_THREADS=8` and
+  `OPENBLAS_NUM_THREADS=1` are set by `serve` after NumPy and MLX are imported, so unlike upstream's `serve.sh` they reach
+  only child processes (the game and the sidecar), not the server itself.
+- `validate_renderer` also rejects "Apple Software Renderer" (Apple's software OpenGL) unless `--allow-software-rendering`.
+- The first-frame deadline is 45 s for `--preset realtime` (upstream's value) and 300 s for the Wan-VAE presets, which need
+  longer on Apple Silicon; the error text keeps upstream's shape.
+- `Runtime.__init__` no longer resets `attention_backend` (the MLX loader sets `mlx-sdpa`).
+- No torch: the session report drops `profile_torch_threads`; the stream hands an owned `uint8` array to `on_rgb` (no `.numpy()`); profile keys are
+  `gpu_<stage>_ms` instead of `cuda_<stage>_ms`.
+- CUDA-only model options keep the treatment `render` gives them (for example `--preset rtx5090` exits with "--preset rtx5090 is CUDA-only"); the realtime DiT runtime is `native`.
+- The web client is copied byte-for-byte, and `matrix_game_mlx/web/mediamtx-reader.LICENSE` ships in the wheel (`license-files`).
+- Game patches: none. Both `CastleReferenceServer` and `CitySampleReferenceServer` create their hidden SDL/OpenGL window from a
+  subprocess on macOS unchanged.
+
+Upstream behavior kept as is: stopping a session (Stop, or closing the tab) while the browser is still sending controls
+can log `ERROR Error handling request` with `OSError: [Errno 9] Bad file descriptor` from `game.py`'s `send`. It is
+harmless: `CastleGame.close()` closes the game socket without taking the send lock, so a control that passed the
+closed check writes to the closed socket, and `send` only ignores `BrokenPipeError` and `ConnectionResetError`. The
+session is still cleaned up (`webrtc_cleanup_confirmed: true` in its report). It shows up mostly in racing, where the
+client sends controls continuously. The server code is upstream's, so CUDA has the same race.
+
+### Online tests
+
+Online tests need MediaMTX and a GI-enabled Python (`needs_media`), the built games (`needs_castle_game`, `needs_racing_server`), the
+weights (`needs_weights`) and, for the browser tests, Playwright (`needs_playwright`). Playwright lives outside the repo:
+
+```bash
+mkdir -p ~/.cache/matrix-game-4-mlx/playwright && cd ~/.cache/matrix-game-4-mlx/playwright && npm init -y && npm install playwright && npx playwright install chromium webkit
+```
+
+Environment: `MG4_RESOURCES` (game assets, default `../Matrix-Game-4/resources`), `MATRIX_GAME_4_MLX_WEIGHTS_DIR`,
+`MG4_FIXTURES_DIR`, `PLAYWRIGHT_MODULE` (default the path above). `tests/test_serve_app.py`, `test_display.py`,
+`test_media_environment.py` and `test_cli.py` need none of them beyond Python; `test_online_games.py`, `test_transport.py`, `test_serve_e2e.py` and
+`test_browser_upstream.py` run the real stack; `slow` marks the quality session (several minutes). The browser tests run upstream's
+`tests/browser/*.cjs` unmodified: Chromium uses Playwright's full Chromium (`CHROME_PATH`, set by the tests), because
+the default headless shell rejects pointer lock; WebKit runs with `DISPLAY_ONLY=1`, since Playwright's WebKit never grants
+it (Safari itself is not automated; do upstream's manual Safari check). The exception is `test_browser_model`
+(`needs_weights`): it runs `test_browser.cjs` in full (reference, model, model dual view at 1728 wide) against a castle
+realtime session at `--fps 4` with `DISPLAY_ONLY=1`, from a temporary copy with two edits asserted against upstream's
+text, because the script's timings assume CUDA speed: 8 new game frames in 20 s instead of 40, and a wait for the HUD
+before the final inspection (the client hides it after 1.5 s without video). Keyboard, mouse and audio are therefore
+browser-tested in reference mode only, not under the model; check them by hand. If WebKit receives no video on a fresh machine, check System Settings, Privacy & Security, Local Network for the
+browser: after a new install WebKit got no WHEP video for about an hour, then worked without any change. Measure with
+`python3 -m tests.measure_serve --scene castle --fps 4 --chunks 32 [--browser] [--prompt-mode dynamic]`.
 
 ## Weights
 
@@ -382,6 +570,7 @@ so the gap is the DiT's alone, which is preset-independent and gated per call an
   scope (upstream logs that ring changes the reduction order and that native is the baseline).
 - No CUDA VAE graph (`vae_graph`): it only captures the same TAEHV ops.
 - TAEHV convs accumulate in float32 and round once to bf16 (see Numerics).
+- `serve`: the macOS port changes listed under "Online play on macOS" (sidecar interpreter, Apple software renderer, startup deadline, `gpu_` timing keys, no torch).
 
 ## Parity methodology
 
@@ -429,7 +618,7 @@ MATRIX_GAME_4_MLX_WEIGHTS_DIR=... python -m tests.parity.gen_fixtures --scene ca
 | `--taehv-only` | Realtime only: regenerate only the TAEHV fixtures (~20 s) |
 | `--blocks-only` | Regenerate only the per-block fixture (chunk 0 call 0; chunk 1 call 0 for racing) and its floors |
 
-They are written to `$MG4_FIXTURES_DIR/<scene>_quality/` or `<scene>_realtime/` (`egypt_quality`, `castle_quality`, `racing_quality`, `egypt_realtime`, `castle_realtime`, `racing_realtime`, `racing_take_realtime`, `racing_take_quality`;
+They are written to `$MG4_FIXTURES_DIR/<scene>_quality/` or `<scene>_realtime/` (`egypt_quality`, `castle_quality`, `racing_quality`, `egypt_realtime`, `castle_realtime`, `racing_realtime`, `racing_take_realtime`, `racing_take_quality`, `racing_online_dynamic`, `castle_online_realtime`;
 default `~/.cache/matrix-game-4-mlx/fixtures`): about 1.5 GB per scene without `--long` (ancient-egypt 1.7 GB)
 and about 6 GB with `--long` (ancient-egypt 5.7 GiB, racing 5.2 GiB) (the chunk-22 per-call fixture alone is 3.8 GB). A full castle set takes about 1 h to
 generate, a racing set with `--long` about 1 h 15. For racing the torch DiT runs on the CPU (no sink-priming
@@ -450,6 +639,7 @@ Variant fixtures (the CLI's new options) are generated with `--variant NAME`, an
 | `python -m tests.parity.gen_fixtures --captions-only` | umT5 caption embeddings vs upstream torch (`test_real_weights_captions.py`) |
 | `--variant racing_switch_realtime` / `racing_switch_quality` | Dynamic prompt switch (prompt A to prompt B) (`test_real_weights_variants.py`) |
 | `--variant racing_take_realtime` / `racing_take_quality` | The first 9 frames of a real recorded racing take (scene sink image, fixed prompt); needs the take (`MG4_RACING_TAKE`) (`test_real_weights_variants.py`) |
+| `--variant racing_online_dynamic` / `castle_online_realtime` | The first 9 frames of a real `serve` session capture (`python -m tests.parity.capture_online --scene racing\|castle`, into `$MG4_RESOURCES/online-captures/<scene>-online/`); racing replays the engine captions with the upstream dynamic-prompt rule (`set_prompt` on every caption change) (`test_real_weights_variants.py`) |
 | `--variant castle_nosink_realtime` / `racing_nosink_realtime` | `--no-sink-image` |
 | `--variant castle_taehv_2step` | TAEHV with a custom 2-step schedule |
 | `--variant egypt_wan_custom_first` | Wan VAE with custom `--first-steps` |
@@ -470,6 +660,14 @@ The fast suite (no weights, no fixtures) is `python -m pytest -m "not needs_weig
 it also runs the racing game (see "Racing tests"). Add `and not needs_racing_game` to skip the game.
 `tests/test_cli_smoke.py` (`needs_weights`) renders a 9-frame 864x480 racing clip in realtime dynamic mode through the CLI
 and checks `peak_memory_gb < 30`.
+
+### Online tests
+
+`tests/test_serve_app.py`, `test_display.py`, `test_media_environment.py`, `test_cli.py` and the web-asset check run anywhere. The
+real-stack tests (`test_online_games.py`, `test_transport.py`, `test_serve_e2e.py`, `test_browser_upstream.py`) carry the
+markers `needs_media`, `needs_castle_game`, `needs_racing_server`, `needs_weights`, `needs_playwright` and `slow` and skip with the
+install or build command when an input is missing; setup and environment variables (`MG4_RESOURCES`, `PLAYWRIGHT_MODULE`) are
+under "Online play on macOS". With every input present, `python3 -m pytest -q -rs` skips nothing.
 
 ### Racing tests
 
