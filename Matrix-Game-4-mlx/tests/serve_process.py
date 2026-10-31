@@ -151,7 +151,10 @@ class MemoryMonitor:
 
     def _run(self):
         while not self._stop.is_set():
-            self._sample()
+            try:
+                self._sample()
+            except Exception:                         # one failed ps/top sample must not end the sampling
+                pass                                  # (the peaks of the last good samples are kept)
             self._stop.wait(1.0)
 
     def __enter__(self):
