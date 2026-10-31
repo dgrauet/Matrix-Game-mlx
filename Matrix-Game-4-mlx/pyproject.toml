@@ -3,6 +3,7 @@ name = "matrix-game-4-mlx"
 version = "0.1.0"
 description = "MLX inference port of Matrix-Game 4.0 (offline rendering)"
 requires-python = ">=3.11"
+license-files = ["matrix_game_mlx/web/mediamtx-reader.LICENSE"]
 dependencies = ["mlx>=0.31.0", "numpy", "Pillow", "imageio-ffmpeg", "huggingface_hub",
                 "safetensors", "tokenizers", "transformers", "ftfy", "regex"]
 

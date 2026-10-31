@@ -76,7 +76,15 @@ max(2e-2, 1.5 x the torch floor of the chunk), since with one step torch against
 matrix_game_mlx/
   scenes.py                      # scene profiles (prompts, sink policy), model-loading parts only
   configs/                       # ancient-egypt.json, castle.json, racing.json (scene name and prompt)
-  cli.py                         # `matrix-game-mlx` console script: render, download, verify (serve not ported)
+  cli.py                         # `matrix-game-mlx` console script: render, download, verify, serve
+  profiling.py                   # bounded opt-in per-chunk wall-clock profiling (ChunkTimer) of the online producer, `--profile-chunks`
+  server/                        # online `serve` (upstream copies, macOS changes marked `# macOS port:` in app.py)
+    app.py                       # aiohttp app, Runtime/Session, `main`; first_frame_timeout, Apple software renderer check
+    game.py, racing.py           # native game IPC (CastleReferenceServer, CitySampleReferenceServer) and racing controls
+    reference_input.py           # per-chunk reference preprocessing for the stream
+    media_env.py                 # sidecar interpreter (gi + numpy + GStreamer) and serve.sh's environment defaults
+    transport/                   # GStreamer/MediaMTX publisher sidecar (output, publisher, rtsp)
+  web/                           # upstream browser client, byte-identical (mediamtx-reader.LICENSE ships via license-files)
   inference/
     offline.py                   # `render`: --input clip | --take recording -> rendered.mp4 + render.json; dynamic captions
     loader.py                    # ModelComponents: pack dir, pinned shared MG3 files (sha256), T5 -> DiT -> VAE
@@ -103,6 +111,14 @@ tests/
   parity/test_real_weights_captions.py  # caption embeddings vs torch
   parity/test_gen_fixtures.py    # generator helper checks
   test_cli_smoke.py              # needs_weights: realtime dynamic render through the CLI (peak < 30 GB)
+  media.py                       # media_missing(), mediamtx_server(): MediaMTX for the online tests
+  serve_process.py               # serve(args, runtime): the serve CLI as a child process, MemoryMonitor (footprint incl. Metal)
+  measure_serve.py               # not collected: python3 -m tests.measure_serve, one measured online session (README "Measured rates")
+  test_serve_app.py, test_display.py, test_media_environment.py  # serve app, display and media environment (fakes, no model)
+  test_online_games.py           # needs_castle_game/needs_racing_server: game IPC handshakes, stream-vs-serial frame equality
+  test_transport.py              # needs_media: real sidecar and MediaMTX
+  test_serve_e2e.py              # real serve sessions over HTTP/ws (reference, realtime, dynamic, quality, disconnect)
+  test_browser_upstream.py       # needs_playwright: upstream tests/browser/*.cjs unmodified
   racing_game.py                 # helpers: locate/build-check/run the upstream racing game, scripted take (env MG4_RESOURCES, MG4_RACING_TAKE)
   test_racing_game.py            # needs_racing_game: headless smoke of the built upstream game (free, race, pursuit)
   test_racing_take.py            # scripted take: input script, complete and finalizable, reproducible
@@ -119,7 +135,7 @@ Python 3.11+, MLX >= 0.31.0, NumPy, Pillow, imageio-ffmpeg, HuggingFace `tokeniz
 
 ## Testing
 
-Fast suite: `python -m pytest -m "not needs_weights and not needs_fixtures"`. Variant fixtures: `python -m tests.parity.gen_fixtures --variant NAME` / `--captions-only` (`--print-variant-commands` lists them). CLI: `matrix-game-mlx render|download|verify`; quality + dynamic captions needs more than 32 GB (T5 resident).
+Fast suite: `python -m pytest -m "not needs_weights and not needs_fixtures"`. Variant fixtures: `python -m tests.parity.gen_fixtures --variant NAME` / `--captions-only` (`--print-variant-commands` lists them). CLI: `matrix-game-mlx render|download|verify|serve`; quality + dynamic captions needs more than 32 GB (T5 resident).
 
 Racing game tests carry the marker `needs_racing_game` (built game in `../Matrix-Game-4/game/racing/bin`, assets under
 `$MG4_RESOURCES/racing`, default `../Matrix-Game-4/resources`; the recorded take is `$MG4_RACING_TAKE`, default
@@ -137,7 +153,7 @@ installed for Homebrew Python 3.14)
 
 ## What NOT to Port
 
-- `serve` (the server, browser demo); the game is upstream's native racing game, built and used as is (README "City racing on macOS")
+- The games are upstream's native games, built and used as is (README "City racing on macOS", "Online play on macOS")
 - `rtx5090*` files
 - Ring / fused / cudagraph runtimes (realtime uses the `native` DiT runtime) and the CUDA VAE graph
 - Training branches (teacher forcing, ctx slots, kv_mem, kv_capture, flex_attention masks,
