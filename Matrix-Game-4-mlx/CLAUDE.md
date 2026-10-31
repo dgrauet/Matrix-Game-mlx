@@ -52,7 +52,7 @@ wrapper-level APIs keep upstream shapes `[B, F, C, h, w]`.
 - float64 islands run on the MLX CPU stream instead of the GPU
 - KV-cache end indices are Python ints instead of 1-element tensors
 - Test-only `renoise` argument on `CastleStream.push`
-- `--dit-runtime ring-fused` (realtime default, as upstream) is the MLX ring-KV + GPU-RoPE runtime (`inference/runtime.py`): no CUDA graphs/varlen/fused kernels yet, bf16 caches required, all layers validated before planning; differs from `native` only by SDPA key order (ring). No CUDA VAE graph (`vae_graph`)
+- `--dit-runtime ring-fused` (realtime default, as upstream) is the MLX ring-KV + GPU-RoPE + fused-kernel runtime (`inference/runtime.py`, `inference/kernels.py`): no CUDA graphs/varlen, bf16 caches/modulation required, all layers validated before planning; the fused Metal kernels (`ln_modulate`, `gate_ln_affine`, `gate_residual`, plus port-only `rms_norm` and compiled `gelu_tanh`) reproduce native rounding and MLX's row-reduction order at the model widths (bitwise native), so it differs from `native` only by SDPA key order (ring). No CUDA VAE graph (`vae_graph`)
 - TAEHV convs accumulate in float32 and round once to bf16 (torch semantics)
 
 ## Validation Status
@@ -97,6 +97,7 @@ matrix_game_mlx/
     rollout.py                   # warp_steps, set_attention_window
     runtime.py                   # --dit-runtime ring-fused: plan_cache (ring KV), to/from_linear, run_blocks, CastleRuntime, install_runtime
     rope_kernel.py               # GPU RoPE kernel, bitwise equal to the float64 CPU path
+    kernels.py                   # fused Metal block-glue kernels (ring-fused), bitwise equal to the native block pieces
     preprocessing.py             # RGB crop/resize and tensor <-> uint8
     wan/modules/
       causal_model.py            # causal DiT, rolling KV cache, fixed-sink RoPE, float64 timestep MLP

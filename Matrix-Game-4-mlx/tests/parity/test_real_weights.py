@@ -232,7 +232,8 @@ def block_case(scene, comps, loaded):
 
 
 def _ring_block(model, i, cache, cross, x, e0, context, start, sink_rope_mode):
-    """Block i through the ring runtime's `run_blocks` with a single Plan (what CastleRuntime.run does per layer)."""
+    """Block i through the ring runtime's `run_blocks` with a single Plan (what CastleRuntime.run does per layer),
+    fused or not as the installed runtime."""
     from matrix_game_mlx.inference.rope_kernel import build_causal_rope_rotations
     from matrix_game_mlx.inference.runtime import Plan, plan_cache, run_blocks
     block, (h, w) = model.blocks[i], (15, 27)
@@ -246,7 +247,8 @@ def _ring_block(model, i, cache, cross, x, e0, context, start, sink_rope_mode):
     cross["k"] = a.norm_k(a.k(context)).reshape(1, -1, a.num_heads, a.head_dim)
     cross["v"] = a.v(context).reshape(1, -1, a.num_heads, a.head_dim)
     cross["is_init"] = True
-    return run_blocks([Plan(block, cache, cross, s, end)], x, e0, rotations, sink_rotations)
+    return run_blocks([Plan(block, cache, cross, s, end)], x, e0, rotations, sink_rotations,
+                      model.castle_runtime.fused)
 
 
 def _window_of(model) -> int:

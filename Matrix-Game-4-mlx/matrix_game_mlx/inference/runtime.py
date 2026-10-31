@@ -113,26 +113,39 @@ def _gate(h, g, frames, tokens):
     return (h.reshape(h.shape[0], frames, tokens, -1) * g).reshape(h.shape)
 
 
+def _qk_norm(norm, h, fused):
+    """Native `WanRMSNorm` (q / k), or the fused kernel with the same rounding."""
+    if fused:
+        from matrix_game_mlx.inference.kernels import rms_norm
+        return rms_norm(h, norm.weight, norm.eps)
+    return norm(h)
+
+
 def run_blocks(plans, x, e, rotations, sink_rotations, fused=False):
-    """Run the DiT blocks over planned caches (upstream `run_blocks`; `fused` is Task 6's fused-kernel path).
+    """Run the DiT blocks over planned caches (upstream `run_blocks`).
 
     Unfused: exactly the native `CausalWanAttentionBlock` arithmetic, with RoPE from the GPU kernel and attention
     over the cache in ring order (`cache[:, :end]`, or the re-roped sink + `cache[:, tokens:end]` in fixed-sink
-    steady state).
+    steady state). Fused (upstream's structure): the LayerNorm + modulation, gate + residual (+ affine LayerNorm)
+    chains, the q / k RMSNorms and the FFN activation run as single kernels (`kernels.py`) with the native rounding;
+    cross-attention is inlined as upstream does (same projections, norms and attention call as the native module).
     """
     from matrix_game_mlx.inference.rope_kernel import apply_causal_rope
     from matrix_game_mlx.inference.wan.modules.attention import attention
     if fused:
-        raise NotImplementedError("fused DiT kernels are not implemented yet")
+        from matrix_game_mlx.inference.kernels import gate_ln_affine, gate_residual, gelu_tanh, ln_modulate
     frames, tokens = e.shape[1], x.shape[1] // e.shape[1]
     for p in plans:
         block, cache = p.block, p.cache
-        mod = mx.split(block.modulation[:, None] + e, 6, axis=2)
-        z = _modulate(block.norm1(x), mod[0], mod[1], frames, tokens)
+        if fused:
+            z, _ = ln_modulate(x, e, block.modulation, block.norm1.eps, 0, 1)
+        else:
+            mod = mx.split(block.modulation[:, None] + e, 6, axis=2)
+            z = _modulate(block.norm1(x), mod[0], mod[1], frames, tokens)
         attn = block.self_attn
         b, s, n, d = z.shape[0], z.shape[1], attn.num_heads, attn.head_dim
-        q = attn.norm_q(attn.q(z)).reshape(b, s, n, d)
-        k = attn.norm_k(attn.k(z)).reshape(b, s, n, d)
+        q = _qk_norm(attn.norm_q, attn.q(z), fused).reshape(b, s, n, d)
+        k = _qk_norm(attn.norm_k, attn.k(z), fused).reshape(b, s, n, d)
         v = attn.v(z).reshape(b, s, n, d)
         q = apply_causal_rope(q, rotations).astype(v.dtype)
         cache["k"][:, p.start:p.end] = apply_causal_rope(k, rotations).astype(v.dtype)
@@ -146,12 +159,33 @@ def run_blocks(plans, x, e, rotations, sink_rotations, fused=False):
             keys = mx.concatenate([sink, cache["k"][:, tokens:p.end]], axis=1)
             values = mx.concatenate([cache["v"][:, :tokens], cache["v"][:, tokens:p.end]], axis=1)
         y = attn.o(attention(q, keys, values).reshape(b, s, n * d))
-        x = x + _gate(y, mod[2], frames, tokens)
-        # Cross K/V were initialised by the planner, so the native module reads them from the cache.
-        x = x + block.cross_attn(block.norm3(x), None, None, crossattn_cache=p.cross)
-        y = block.ffn(_modulate(block.norm2(x), mod[3], mod[4], frames, tokens))
-        x = x + _gate(y, mod[5], frames, tokens)
+        if fused:
+            normed, x = gate_ln_affine(x, y, e, block.modulation, 2, block.norm3.weight, block.norm3.bias,
+                                       block.norm3.eps)
+            cross = block.cross_attn
+            n, d = cross.num_heads, cross.head_dim
+            q = _qk_norm(cross.norm_q, cross.q(normed), fused).reshape(b, s, n, d)
+            y = cross.o(attention(q, p.cross["k"], p.cross["v"]).reshape(b, s, n * d))
+            z, x = ln_modulate(x, e, block.modulation, block.norm2.eps, 3, 4, residual=y)
+            x = gate_residual(x, block.ffn_linear2(gelu_tanh(block.ffn_linear1(z))), e, block.modulation, 5)
+        else:
+            x = x + _gate(y, mod[2], frames, tokens)
+            # Cross K/V were initialised by the planner, so the native module reads them from the cache.
+            x = x + block.cross_attn(block.norm3(x), None, None, crossattn_cache=p.cross)
+            y = block.ffn(_modulate(block.norm2(x), mod[3], mod[4], frames, tokens))
+            x = x + _gate(y, mod[5], frames, tokens)
     return x
+
+
+def _fusable(block, e) -> bool:
+    """Whether the fused kernels can run `block` (checked for every layer before any cache is planned)."""
+    from matrix_game_mlx.inference.wan.modules.model import WanLayerNorm, WanRMSNorm
+    norms = (block.self_attn.norm_q, block.self_attn.norm_k, block.cross_attn.norm_q)
+    if not (isinstance(block.norm3, WanLayerNorm) and block.norm3.elementwise_affine
+            and all(isinstance(norm, WanRMSNorm) for norm in norms)):
+        return False
+    tensors = [e, block.modulation, block.norm3.weight, block.norm3.bias] + [norm.weight for norm in norms]
+    return all(t.dtype == mx.bfloat16 for t in tensors)
 
 
 class CastleRuntime:
@@ -162,7 +196,7 @@ class CastleRuntime:
             raise ValueError("Unknown castle runtime")
         self.mode = mode
         self.ring = True
-        self.fused = False  # Task 6 enables the fused kernels
+        self.fused = True
 
     def clear(self):
         """Drop per-session state (none yet: no graphs; kept for the upstream call sites)."""
@@ -194,6 +228,9 @@ class CastleRuntime:
                 raise ValueError("Expected identical bounded windows, one sink, and T2V cross attention")
             if any(cache[name].dtype != mx.bfloat16 for name in ("k", "v", "k_sink_raw")):
                 raise ValueError("Expected bfloat16 KV caches")
+            if self.fused and not _fusable(block, e):
+                raise ValueError("Fused kernels expect bfloat16 modulation, an affine cross-attention LayerNorm "
+                                 "and RMS q/k norms")
         _check_rope_len(model.freqs, position + 1)  # native's message for an exhausted RoPE table
         rotations = build_causal_rope_rotations(model.freqs, 1, h, w, position)
         steady = position > window

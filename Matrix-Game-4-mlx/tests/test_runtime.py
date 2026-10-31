@@ -9,6 +9,7 @@ import re
 import types
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 import pytest
 from mlx.utils import tree_flatten, tree_map
@@ -175,14 +176,17 @@ def test_runtime_free_running_matches_native(weights, mode):
     print("max rel L2 (output, cache):", MEASURED)
 
 
+@pytest.mark.parametrize("fused", [True, False], ids=["fused", "unfused"])
 @pytest.mark.parametrize("mode", ["absolute", "fixed"])
-def test_runtime_linear_layout_is_bitwise_native(weights, mode):
+def test_runtime_linear_layout_is_bitwise_native(weights, mode, fused):
     """With the ring disabled (native linear slot order) the runtime is bitwise native: GPU RoPE, the composed
-    block pieces, cross-attention and the fixed-sink key set round exactly as native; only the ring order differs."""
+    block pieces (or the fused kernels, whose row reductions follow MLX's order at these widths), cross-attention
+    and the fixed-sink key set round exactly as native; only the ring order differs."""
     rng = np.random.default_rng(4)
     ctx = rng.standard_normal((1, 8, 32)).astype(np.float32)
     native, runtime = _model(weights), _model(weights, runtime=True)
     runtime.castle_runtime.ring = False
+    runtime.castle_runtime.fused = fused
     (kv_n, xc_n), (kv_r, xc_r) = _caches(), _caches()
     calls = _schedule(CHUNKS, clean_first=True)
     for index, ((position, t), x) in enumerate(zip(calls, _inputs(rng, len(calls)))):
@@ -192,6 +196,36 @@ def test_runtime_linear_layout_is_bitwise_native(weights, mode):
             for name in ("k", "v", "k_sink_raw"):
                 assert mx.array_equal(cr[name], cn[name]), f"call {index} {name}"
     assert runtime.castle_runtime.calls == len(calls)
+
+
+@pytest.mark.parametrize("mode", ["absolute", "fixed"])
+def test_runtime_fused_is_bitwise_unfused(weights, mode, monkeypatch):
+    """ring-fused runs the fused kernels by default, and they round exactly as the composed native pieces: a
+    60-chunk free-running rollout (clean-first, ring layout) is bitwise equal with fused on and off."""
+    from matrix_game_mlx.inference import kernels
+    counts = {}
+    for name in ("ln_modulate", "gate_ln_affine", "gate_residual", "rms_norm", "gelu_tanh"):
+        def counted(*args, _f=getattr(kernels, name), _n=name, **kwargs):
+            counts[_n] = counts.get(_n, 0) + 1
+            return _f(*args, **kwargs)
+        monkeypatch.setattr(kernels, name, counted)
+    rng = np.random.default_rng(5)
+    ctx = rng.standard_normal((1, 8, 32)).astype(np.float32)
+    fused, unfused = _model(weights, runtime=True), _model(weights, runtime=True)
+    assert fused.castle_runtime.fused
+    unfused.castle_runtime.fused = False
+    (kv_f, xc_f), (kv_u, xc_u) = _caches(), _caches()
+    calls = _schedule(CHUNKS, clean_first=True)
+    for index, ((position, t), x) in enumerate(zip(calls, _inputs(rng, len(calls)))):
+        assert mx.array_equal(_call(fused, x, t, ctx, kv_f, xc_f, position, mode),
+                              _call(unfused, x, t, ctx, kv_u, xc_u, position, mode)), f"call {index}"
+        for cf, cu in zip(kv_f, kv_u):
+            for name in ("k", "v", "k_sink_raw"):
+                assert mx.array_equal(cf[name], cu[name]), f"call {index} {name}"
+    n = len(calls) * LAYERS
+    # Kernels ran only on the fused model: per layer 2 ln_modulate, 1 gate_ln_affine, 1 gate_residual, 3 rms_norm.
+    assert counts == {"ln_modulate": 2 * n, "gate_ln_affine": n, "gate_residual": n, "rms_norm": 3 * n,
+                      "gelu_tanh": n}
 
 
 def test_runtime_second_stream_matches_fresh(weights):
@@ -232,6 +266,7 @@ def test_install_runtime_modes(weights):
 UNSUPPORTED = "Unsupported runtime: "
 BATCH = "Castle runtime requires batch1/chunk1"
 LAYOUT = "Expected identical bounded windows, one sink, and T2V cross attention"
+FUSABLE = "Fused kernels expect bfloat16 modulation, an affine cross-attention LayerNorm and RMS q/k norms"
 
 
 class OtherCrossAttention(WanT2VCrossAttention):
@@ -270,12 +305,19 @@ def _reject_case(weights, case):
             block.self_attn.sink_size = 2
     elif case == "cache_start":
         kw["cache_start"] = FSL
+    elif case == "norm3_identity":  # cross_attn_norm=False: no affine LayerNorm for gate_ln_affine
+        model.blocks[-1].norm3 = nn.Identity()
+    elif case == "modulation_f32":
+        model.blocks[-1].modulation = model.blocks[-1].modulation.astype(mx.float32)
+    elif case == "qk_norm_off":
+        model.blocks[-1].cross_attn.norm_q = nn.Identity()
     return model, kw, kv, xc
 
 
 @pytest.mark.parametrize("case,message", [
     ("batch2", BATCH), ("chunk2", BATCH), ("sink_mode", UNSUPPORTED), ("float32", UNSUPPORTED),
-    ("cross_attention", LAYOUT), ("window1", LAYOUT), ("sink2", LAYOUT), ("cache_start", UNSUPPORTED)])
+    ("cross_attention", LAYOUT), ("window1", LAYOUT), ("sink2", LAYOUT), ("cache_start", UNSUPPORTED),
+    ("norm3_identity", FUSABLE), ("modulation_f32", FUSABLE), ("qk_norm_off", FUSABLE)])
 def test_runtime_rejects_unsupported(weights, case, message):
     model, kw, kv, xc = _reject_case(weights, case)
     frames = kw.get("frames", 1)

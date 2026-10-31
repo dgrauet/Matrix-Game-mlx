@@ -50,7 +50,7 @@ The offline default preset is `quality`, as upstream's offline renderer. Weights
 | `--preset {realtime,quality,baseline}` | Supported (default `quality`) |
 | `--preset {rtx5090,rtx5090-sage}` | Rejected: CUDA-only presets |
 | `--vae-backend {wan,taehv}` | Supported (default from the preset: `taehv` for realtime, `wan` otherwise) |
-| `--dit-runtime {native,ring-fused}` | Supported on every preset; default from the preset as upstream (`ring-fused` for realtime, `native` otherwise). `ring-fused` is the Apple fast path (ring KV cache, GPU RoPE kernel); see Known deviations |
+| `--dit-runtime {native,ring-fused}` | Supported on every preset; default from the preset as upstream (`ring-fused` for realtime, `native` otherwise). `ring-fused` is the Apple fast path (ring KV cache, GPU RoPE kernel, fused block-glue kernels); see Known deviations |
 | `--dit-runtime` other values (`kernels`, `cudagraph`, `ring`, `ring-graph`, `rtx5090`, `rtx5090-sage`) | Rejected: CUDA-only; the MLX port runs `native` or `ring-fused` |
 | `--steps`, `--first-steps` | Supported (comma-separated timesteps, strictly decreasing from 1000) |
 | `--vae-graph` | Rejected: CUDA graphs, not available on MLX |
@@ -568,14 +568,25 @@ so the gap is the DiT's alone, which is preset-independent and gated per call an
 - Only the inference path (`kv_cache is not None`) is ported; training branches raise `NotImplementedError`.
 - `--dit-runtime ring-fused` (the realtime default, as upstream) is an MLX runtime, not upstream's CUDA one: the
   same host ring-KV planner (`plan_cache`, `run_blocks`, `CastleRuntime`, `install_runtime`), RoPE applied by a GPU
-  kernel bitwise equal to the float64 CPU path, and no CUDA graphs (`prime`/`graph`), varlen `cu_seqlens` or fused
-  kernels yet. Its only numeric difference from `native` is the attention key order (ring slots change the SDPA
-  summation order; with the linear layout it is bitwise native). Measured on the tiny bf16 model over 60 chunks
+  kernel bitwise equal to the float64 CPU path, fused Metal block-glue kernels (`inference/kernels.py`, below), and
+  no CUDA graphs (`prime`/`graph`) or varlen `cu_seqlens`. Its only numeric difference from `native` is the
+  attention key order (ring slots change the SDPA summation order; with the linear layout it is bitwise native,
+  fused or not). Measured on the tiny bf16 model over 60 chunks
   (`tests/test_runtime.py`): max rel L2 vs native 2.4e-3 per call, 1.2e-3 on the written KV slot; most calls are
   bitwise (the fp32 reorder rarely changes a bf16 output bit). Like upstream, the loader logs that ring changes the
   reduction order and that native is the baseline. Port-only checks: KV caches must be bfloat16, and every layer is
   validated before any cache is planned; an unsupported configuration is a `ValueError`, never a native fallback.
   `CastleRuntime` accepts only `ring-fused`; `install_runtime` only `native` and `ring-fused`.
+- `ring-fused` fused kernels (`inference/kernels.py`, upstream's `kernels.py` names on MLX arrays): `ln_modulate`,
+  `gate_ln_affine` and `gate_residual` as upstream, plus two port additions, `rms_norm` (the q/k `WanRMSNorm`) and
+  `gelu_tanh` (the FFN activation as one `mx.compile`d kernel). They follow upstream's rounding contract (every bf16
+  intermediate of the separate ops rounded to bf16, fp32 statistics, `#pragma METAL fp contract(off)` so no FMA the
+  separate kernels would not do) and in addition sum each row in the layout of MLX's own contiguous row reduction
+  (`row_reduce_simple`: C/4 threads, 4 consecutive values each), so at the model widths (3072, and 128 in the tests)
+  they are bitwise equal to the native block pieces on MLX 0.31.1 (`tests/test_kernels.py`; a 60-chunk rollout is
+  bitwise fused vs unfused in `tests/test_runtime.py`). Port-only: the fused path requires bfloat16 modulation and
+  norm weights, an affine `norm3` and RMS q/k norms (`ValueError` otherwise, checked before any cache is planned);
+  `*_row` argument names (upstream `*_k`); no stride arguments (MLX makes kernel inputs row-contiguous).
 - No CUDA VAE graph (`vae_graph`): it only captures the same TAEHV ops.
 - TAEHV convs accumulate in float32 and round once to bf16 (see Numerics).
 - `serve`: the macOS port changes listed under "Online play on macOS" (sidecar interpreter, Apple software renderer, startup deadline, `gpu_` timing keys, no torch).
