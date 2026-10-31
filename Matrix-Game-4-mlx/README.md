@@ -262,21 +262,21 @@ pip install 'aiohttp>=3.10,<4'                                              # or
 The GStreamer sidecar needs a Python with `gi`, NumPy and the GStreamer 1.0 typelibs; `serve` picks the first of
 the current interpreter, `/opt/homebrew/bin/python3`, `python3` on the `PATH` that imports them, or uses
 `STUDIO_WEBRTC_PYTHON`. Without any, it exits with the install command. GStreamer needs `x264enc` and
-`rtspclientsink` (Homebrew's `gstreamer` includes both). Build the games from `Matrix-Game-4/` (the shooter
-build needs no asset flag; the racing build is described under "City racing on macOS"), and fetch the scene
-assets (the games and `serve` read `../Matrix-Game-4/resources`; use `--resources` for another place):
+`rtspclientsink` (Homebrew's `gstreamer` includes both). Fetch the scene assets first (the games and `serve` read
+`../Matrix-Game-4/resources`; use `--resources` for another place), then build the games from `Matrix-Game-4/` (the
+shooter build needs no asset flag; the racing build is described under "City racing on macOS"):
 
 ```bash
-cd ../Matrix-Game-4 && bash scripts/build_game.sh && bash scripts/build_racing.sh -DRACING_ASSET_ROOT="$PWD/resources/racing"; cd -
 for scene in castle ancient-egypt racing; do
   matrix-game-mlx download --manifest releases/game-assets.json --repo-id Skywork/Matrix-Game-4.0 --repo-type model \
     --revision 4419accdb7bb7881234c5914de8cd915266e0325 --scene $scene --resources ../Matrix-Game-4/resources
 done
+cd ../Matrix-Game-4 && bash scripts/build_game.sh && bash scripts/build_racing.sh -DRACING_ASSET_ROOT="$PWD/resources/racing"; cd -
 ```
 
-(The castle game does not start without its `download --scene castle` assets (`castle-map.bin`); racing assets must
-exist before `build_racing.sh`, as above. `verify --scene castle|ancient-egypt|racing` passes on the machine used for the
-measurements.)
+(Download first, then build: the builds run ctest under `set -e`; `build_game.sh`'s tests need the castle assets
+(`castle-map.bin`) and `build_racing.sh`'s asset tests need the racing assets. `verify --scene castle|ancient-egypt|racing`
+passes on the machine used for the measurements.)
 
 ### Run
 
@@ -314,6 +314,8 @@ writes `runtime/profile-<session>.json`; upstream's help text still says "CPU/CU
 stage keys are `gpu_<stage>_ms` (`gpu_encode_ms`, `gpu_denoise_ms`, `gpu_clean_kv_ms`, `gpu_decode_ms`, ...).
 `model_fps` counts generated frames over inference time (from the third chunk); `online_fps` also counts waiting
 for the live game and is reported only after 25 chunks.
+With the stream pipeline, `background_prepare_tensor_ms` measures building the lazy MLX graph on the reference thread; the
+actual conversion runs later, in the producer's `encode`, so it is not comparable to upstream's figure.
 
 ### Measured rates
 
