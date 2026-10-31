@@ -399,6 +399,13 @@ Upstream's server modules are copied with `matrix_game.` renamed to `matrix_game
 - Game patches: none. Both `CastleReferenceServer` and `CitySampleReferenceServer` create their hidden SDL/OpenGL window from a
   subprocess on macOS unchanged.
 
+Upstream behavior kept as is: stopping a session (Stop, or closing the tab) while the browser is still sending controls
+can log `ERROR Error handling request` with `OSError: [Errno 9] Bad file descriptor` from `game.py`'s `send`. It is
+harmless: `CastleGame.close()` closes the game socket without taking the send lock, so a control that passed the
+closed check writes to the closed socket, and `send` only ignores `BrokenPipeError` and `ConnectionResetError`. The
+session is still cleaned up (`webrtc_cleanup_confirmed: true` in its report). It shows up mostly in racing, where the
+client sends controls continuously. The server code is upstream's, so CUDA has the same race.
+
 ### Online tests
 
 Online tests need MediaMTX and a GI-enabled Python (`needs_media`), the built games (`needs_castle_game`, `needs_racing_server`), the
