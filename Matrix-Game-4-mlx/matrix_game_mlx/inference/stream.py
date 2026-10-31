@@ -6,6 +6,8 @@ from typing import Optional
 import mlx.core as mx
 import numpy as np
 
+from matrix_game_mlx.inference.scopes import scope
+
 LATENT_SHAPE = (1, 1, 48, 30, 54)
 FRAME_SIZE = (480, 864)
 
@@ -149,14 +151,15 @@ class CastleStream:
         count = self._validate(pixels, frame_start=frame_start, initial_noise=initial_noise)
         try:
             marks = [time.perf_counter()]
-            if self.vae_backend == "wan":
-                x = pixels.transpose(0, 2, 3, 1)[None]                               # [1, T, H, W, 3]
-                control = self.vae.encode_stream(x, self.encoder_features)           # [1, 1, 48, h, w]
-            else:
-                # TAEHV already uses the normalized Wan2.2 latent space.
-                x = pixels.transpose(1, 0, 2, 3)[None].astype(self.vae.dtype)        # [1, 3, T, H, W]
-                control = self.vae.encode_stream(x).transpose(0, 2, 1, 3, 4)
-            mx.eval(control)
+            with scope("encode"):
+                if self.vae_backend == "wan":
+                    x = pixels.transpose(0, 2, 3, 1)[None]                               # [1, T, H, W, 3]
+                    control = self.vae.encode_stream(x, self.encoder_features)           # [1, 1, 48, h, w]
+                else:
+                    # TAEHV already uses the normalized Wan2.2 latent space.
+                    x = pixels.transpose(1, 0, 2, 3)[None].astype(self.vae.dtype)        # [1, 3, T, H, W]
+                    control = self.vae.encode_stream(x).transpose(0, 2, 1, 3, 4)
+                mx.eval(control)
             marks.append(time.perf_counter())
             if tuple(control.shape) != self.shape:
                 raise RuntimeError("VAE encoder output cadence changed")
@@ -177,33 +180,36 @@ class CastleStream:
             cond = {"prompt_embeds": self.prompt, "control_latent": control}
             common = dict(kv_cache=self.kv, crossattn_cache=self.xc, current_start=position * self.fsl,
                           sink_rope_mode=self.sink_rope_mode)
-            for k, step in enumerate(steps):
-                t = mx.full((1, 1), float(step))
-                _, pred = self.gen(noisy_image_or_video=x, conditional_dict=cond, timestep=t, **common)
-                self._eval_caches(pred)
-                if k + 1 < len(steps):
-                    flat = pred.reshape(-1, *pred.shape[2:]).astype(mx.float32)
-                    noise = renoise[k].reshape(flat.shape) if renoise is not None else \
-                        self._next_noise("renoise_key").reshape(flat.shape)
-                    x = self.scheduler.add_noise(flat, noise.astype(mx.float32), mx.full((1,), float(steps[k + 1])))
-                    x = x.reshape(1, 1, *x.shape[1:]).astype(self.dtype)
-            if not bool(mx.all(mx.isfinite(pred))):
-                raise RuntimeError("Non-finite generated latent")
+            with scope("denoise"):
+                for k, step in enumerate(steps):
+                    t = mx.full((1, 1), float(step))
+                    _, pred = self.gen(noisy_image_or_video=x, conditional_dict=cond, timestep=t, **common)
+                    self._eval_caches(pred)
+                    if k + 1 < len(steps):
+                        flat = pred.reshape(-1, *pred.shape[2:]).astype(mx.float32)
+                        noise = renoise[k].reshape(flat.shape) if renoise is not None else \
+                            self._next_noise("renoise_key").reshape(flat.shape)
+                        x = self.scheduler.add_noise(flat, noise.astype(mx.float32), mx.full((1,), float(steps[k + 1])))
+                        x = x.reshape(1, 1, *x.shape[1:]).astype(self.dtype)
+                if not bool(mx.all(mx.isfinite(pred))):
+                    raise RuntimeError("Non-finite generated latent")
             marks.append(time.perf_counter())
 
             def clean():
-                self.gen(noisy_image_or_video=pred, conditional_dict=cond, timestep=mx.zeros((1, 1)),
-                         drop_control=True, **common)
-                self._eval_caches()
+                with scope("clean_kv"):
+                    self.gen(noisy_image_or_video=pred, conditional_dict=cond, timestep=mx.zeros((1, 1)),
+                             drop_control=True, **common)
+                    self._eval_caches()
 
             if on_rgb is None:
                 clean()
                 marks.append(time.perf_counter())
-            if self.vae_backend == "wan":
-                decoded = self.decoder.push(pred)
-            else:
-                decoded = self.vae.decode_stream(pred.transpose(0, 2, 1, 3, 4))[0].transpose(1, 0, 2, 3)
-            mx.eval(decoded)
+            with scope("decode"):
+                if self.vae_backend == "wan":
+                    decoded = self.decoder.push(pred)
+                else:
+                    decoded = self.vae.decode_stream(pred.transpose(0, 2, 1, 3, 4))[0].transpose(1, 0, 2, 3)
+                mx.eval(decoded)
             if tuple(decoded.shape) != (count, 3, *FRAME_SIZE):
                 raise RuntimeError("VAE decoder output cadence changed")
             marks.append(time.perf_counter())
