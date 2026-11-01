@@ -475,7 +475,7 @@ def test_compiled_graph_is_bitwise_eager_on_real_weights():
         kv, xc = init_kv_cache(gen, 1, 21 * fsl, mx.bfloat16), init_crossattn_cache(gen, 1, mx.bfloat16)
         for cache in kv:
             cache.update(k=normal(cache["k"].shape), v=normal(cache["v"].shape),
-                         k_sink_raw=normal(cache["k"][:, :fsl].shape), global_end_index=(position - 1) * fsl,
+                         k_sink_raw=normal(cache["k"][:, :fsl].shape), global_end_index=position * fsl,
                          local_end_index=21 * fsl)
         prompt, preds = normal((1, 512, 4096)), []
         for t, control in ((1000.0, True), (0.0, False)):
