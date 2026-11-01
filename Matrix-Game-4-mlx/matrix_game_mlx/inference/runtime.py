@@ -19,7 +19,7 @@ Deviations from upstream: `mx.compile` instead of CUDA graphs (a compiled functi
 graph bound to buffer addresses) and no varlen `cu_seqlens` in `Plan`; the only mode is `ring-fused`; caches are also
 required to be bfloat16; every layer is validated before any cache is planned (upstream plans layer by layer and can
 leave earlier layers planned when a later one fails); the timestep-embedding MLP is memoized per timestep value
-(`CastleRuntime.time_embedding`).
+(`CastleRuntime.time_embedding` / `time_memo`, port-only).
 """
 from dataclasses import dataclass
 
@@ -198,8 +198,11 @@ def _fusable(block, e) -> bool:
 class CastleRuntime:
     """Ring KV + GPU RoPE + fused-kernel DiT runtime with one compiled steady-window graph (upstream: CUDA graph).
 
-    Upstream's CUDA modes (kernels, cudagraph, ring, ring-graph) do not exist. `captures` counts graph compilations
-    (traces) and `replays` the calls that ran the compiled graph, as upstream's counters.
+    Upstream's CUDA modes (kernels, cudagraph, ring, ring-graph) do not exist. `use_graph` (upstream's name; always
+    on for ring-fused, the tests turn it off for the eager reference) selects the compiled steady-window graph.
+    `captures` counts graph compilations (traces) and `replays` the calls that ran the compiled graph, the tracing
+    call included, as upstream's counters (upstream's capture call also replays). `time_memo` (port-only, see
+    `time_embedding`) holds the memoized timestep embeddings.
     """
 
     TIME_MEMO_MAX = 8
@@ -210,7 +213,7 @@ class CastleRuntime:
         self.mode = mode
         self.ring = True
         self.fused = True
-        self.compile = True
+        self.use_graph = True
         self.entry = None
         self.captures = self.replays = 0
         self.time_memo = {}
@@ -245,7 +248,7 @@ class CastleRuntime:
         Runs one clean (t=0) call at the first steady position on zero latents. The text K/V it initialises comes
         from the real prompt and is kept, as upstream; every self-attention cache is reset to zeros.
         """
-        if not self.compile:
+        if not self.use_graph:
             return
         window = generator.model.blocks[0].self_attn.local_attn_size
         for cache in kv:
@@ -261,7 +264,8 @@ class CastleRuntime:
         finally:
             for cache in kv:
                 for name in ("k", "v", "k_sink_raw"):
-                    cache[name] = mx.zeros_like(cache[name])
+                    if name in cache:      # a cache the runtime rejected may lack one: keep its ValueError visible
+                        cache[name] = mx.zeros_like(cache[name])
                 cache["global_end_index"] = cache["local_end_index"] = 0
 
     def run(self, model, x, e, grid_sizes, context, kv, xc, current_start, *, sink_rope_mode, unsupported=False):
@@ -310,7 +314,7 @@ class CastleRuntime:
                 cross["v"] = a.v(context).reshape(1, -1, a.num_heads, a.head_dim)
                 cross["is_init"] = True
             plans.append(Plan(block, cache, cross, start, end))
-        if not self.compile or not steady:
+        if not self.use_graph or not steady:
             return run_blocks(plans, x, e, rotations, sink_rotations, self.fused)
         return self.graph(model, plans, x, e, rotations, sink_rotations)
 

@@ -136,16 +136,15 @@ class CastleStream:
             raise ValueError("Session reached its configured RoPE/frame budget")
         if not mx.issubdtype(pixels.dtype, mx.floating):
             raise ValueError("RGB input must be finite floating point in [-1,1]")
-        if initial_noise is not None and tuple(initial_noise.shape) != self.shape:
-            raise ValueError("Initial noise must be finite and match one latent frame")
-        # Every value check in one host sync (pixels finite and in range, noise finite).
+        # Every value check in one host sync (pixels finite and in range, noise finite), rejected in upstream's
+        # order: pixel values first, then the noise shape and values.
         reads = [mx.all(mx.isfinite(pixels)), pixels.min(), pixels.max()]
         if initial_noise is not None:
             reads.append(mx.all(mx.isfinite(initial_noise)))
         mx.eval(reads)
         if not bool(reads[0]) or float(reads[1]) < -1 or float(reads[2]) > 1:
             raise ValueError("RGB input must be finite floating point in [-1,1]")
-        if initial_noise is not None and not bool(reads[3]):
+        if initial_noise is not None and (tuple(initial_noise.shape) != self.shape or not bool(reads[3])):
             raise ValueError("Initial noise must be finite and match one latent frame")
         return count
 

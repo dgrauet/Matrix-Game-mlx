@@ -101,7 +101,8 @@ def build_causal_rope_rotations(freqs, frames: int, height: int, width: int, sta
 
 
 def build_rope_rotations_frames(freqs, frame_pos: Sequence[int], height: int, width: int) -> RopeRotations:
-    """Rotations with explicit per-frame temporal positions (fixed-sink re-RoPE), as `rope_apply_frames`."""
+    """Rotations with explicit per-frame temporal positions, as `rope_apply_frames` (test-only helper: production's
+    fixed-sink re-RoPE is `build_causal_rope_rotations(freqs, 1, h, w, position - window)`, runtime.py)."""
     freqs = _check_freqs(freqs)
     pos = [int(p) for p in frame_pos]
     if not pos:

@@ -44,9 +44,14 @@ class T5LayerNorm(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         # sum / dim, not mean(): mx.compile fuses mean()'s 1/n scale into the reduction and sums in another order
-        # (CaptionEncoder graph=True); sum / dim compiles bitwise and, dim being a power of two (4096), is bitwise
-        # the eager mean() (tests/test_caption_encoder.py).
-        variance = (x.astype(mx.float32) ** 2).sum(axis=-1, keepdims=True) / self.dim
+        # (CaptionEncoder graph=True); sum / dim compiles bitwise and, only when dim is a power of two (umT5: 4096,
+        # 1/dim exact), is bitwise the eager mean(). Any other width keeps mean(), so native values never change
+        # (tests/test_caption_encoder.py).
+        squares = x.astype(mx.float32) ** 2
+        if self.dim & (self.dim - 1) == 0:
+            variance = squares.sum(axis=-1, keepdims=True) / self.dim
+        else:
+            variance = squares.mean(axis=-1, keepdims=True)
         x = x * mx.rsqrt(variance + self.eps)
         if self.weight.dtype in [mx.float16, mx.bfloat16]:
             x = x.astype(self.weight.dtype)

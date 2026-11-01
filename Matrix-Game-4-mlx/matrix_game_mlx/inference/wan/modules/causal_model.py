@@ -318,10 +318,11 @@ class CausalWanModel(nn.Module):
         if runtime is not None:
             x = runtime.run(self, x, e0, grid_sizes, context, kv_cache, crossattn_cache, current_start,
                             sink_rope_mode=sink_rope_mode, unsupported=cache_start not in (0, None))
-        for block_index, block in (() if runtime is not None else enumerate(self.blocks)):
-            x = block(x, e0, seq_lens, grid_sizes, self.freqs, context, None, None,
-                      kv_cache=kv_cache[block_index], crossattn_cache=crossattn_cache[block_index],
-                      current_start=current_start, cache_start=cache_start, sink_rope_mode=sink_rope_mode)
+        else:
+            for block_index, block in enumerate(self.blocks):
+                x = block(x, e0, seq_lens, grid_sizes, self.freqs, context, None, None,
+                          kv_cache=kv_cache[block_index], crossattn_cache=crossattn_cache[block_index],
+                          current_start=current_start, cache_start=cache_start, sink_rope_mode=sink_rope_mode)
 
         x = self.head(x, e.reshape(*t.shape, 1, self.dim))
         return mx.stack(self.unpatchify(x.reshape(x.shape[0], -1, x.shape[-1]), grid_sizes))

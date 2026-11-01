@@ -114,3 +114,27 @@ def test_t5_layer_norm_compiles_bitwise_and_keeps_native_values():
     variance = (x.astype(mx.float32) ** 2).mean(axis=-1, keepdims=True)          # the former expression
     former = norm.weight * (x * mx.rsqrt(variance + norm.eps)).astype(mx.bfloat16)
     assert mx.array_equal(eager, former) and mx.array_equal(eager, compiled)
+
+
+def test_graph_replays_count_the_tracing_encode():
+    """`replays` counts every encode that ran the compiled encoder, the tracing one included (as CastleRuntime's
+    counters; upstream's capture call also replays)."""
+    graph = CaptionEncoder(_tiny_t5_text(), graph=True)
+    graph("first caption")
+    assert (graph.captures, graph.replays, graph.encodes) == (1, 1, 1)
+    graph("second caption")
+    assert (graph.captures, graph.replays, graph.encodes) == (1, 2, 2)
+
+
+@pytest.mark.parametrize("dim", [64, 48, 4000])
+def test_t5_layer_norm_keeps_mean_values_at_any_width(dim):
+    """`sum / dim` is bitwise `mean()` only when 1/dim is exact (dim a power of two); other widths keep `mean()`, so
+    the eager values equal the former expression at every width."""
+    from matrix_game_mlx.inference.wan.modules.t5 import T5LayerNorm
+    mx.random.seed(2)
+    x = (mx.random.normal((1, 64, dim)) * 1500).astype(mx.bfloat16)
+    norm = T5LayerNorm(dim)
+    norm.weight = (1 + 0.1 * mx.random.normal((dim,))).astype(mx.bfloat16)
+    variance = (x.astype(mx.float32) ** 2).mean(axis=-1, keepdims=True)
+    former = norm.weight * (x * mx.rsqrt(variance + norm.eps)).astype(mx.bfloat16)
+    assert mx.array_equal(norm(x), former)

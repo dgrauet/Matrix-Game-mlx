@@ -8,6 +8,7 @@ traced ops, so the embeddings are bitwise the native path's (tests/test_caption_
 from collections import OrderedDict
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 
 
@@ -17,7 +18,9 @@ class CaptionEncoder:
         self.capacity, self.cache = capacity, OrderedDict()
         self.entry = None
         self.encodes = self.hits = 0
-        self.captures = self.replays = 0      # traces of the compiled encoder / encodes that ran it
+        # Traces of the compiled encoder / encodes that ran it, the tracing encode included (as CastleRuntime's
+        # counters; upstream's capture call also replays).
+        self.captures = self.replays = 0
 
     def _graph(self, model):
         """The compiled encoder (upstream: the captured CUDA graph), built on first use for this model."""
@@ -26,7 +29,12 @@ class CaptionEncoder:
                 self.captures += 1                     # Python runs only while tracing
                 return model(ids, mask)
             # Weights are implicit inputs: a replaced weight array is read on the next call, without a new trace.
-            self.entry = (model, mx.compile(encode, inputs=[getattr(model, "state", {})]))
+            if isinstance(model, nn.Module):
+                inputs = [model.state]
+            else:
+                # Test-only: the fake encoders of tests/test_caption_encoder.py are plain callables without weights.
+                inputs = []
+            self.entry = (model, mx.compile(encode, inputs=inputs))
         return self.entry[1]
 
     def __call__(self, prompt):

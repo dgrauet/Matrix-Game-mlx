@@ -329,3 +329,27 @@ def test_vae_graph_rejects_other_signatures(bf16_adapter):
     graph.decode_stream(mx.zeros((1, 48, 1, GH // 16, GW // 16), mx.bfloat16))
     with pytest.raises(ValueError, match="VAE graph signature changed"):
         graph.decode_stream(mx.zeros((1, 48, 1, GH // 16, GW // 8), mx.bfloat16))
+
+
+def test_vae_graph_decoder_checks_its_invariants(bf16_adapter):
+    """The compiled decoder carries only the MemBlock arrays and emits every decoded frame: it refuses a decoder
+    still inside its startup (trimmed) frames or holding non-array (TPool list) state, which it would drop."""
+    from matrix_game_mlx.inference.vae_graph import StreamingVAEGraph
+    graph = StreamingVAEGraph(bf16_adapter)
+    graph.clear_cache()
+    latent = mx.zeros((1, 48, 1, GH // 16, GW // 16), mx.bfloat16)
+    graph.decode_stream(latent)                                   # eager first chunk
+    stream = bf16_adapter._streaming_decoder
+    assert stream.n_frames_decoded >= bf16_adapter.core.frames_to_trim
+    decoded = stream.n_frames_decoded
+    stream.n_frames_decoded = bf16_adapter.core.frames_to_trim - 1
+    with pytest.raises(ValueError, match="past its startup frames"):
+        graph.decode_stream(latent)
+    stream.n_frames_decoded = decoded
+    slot = next(i for i, value in enumerate(stream.decoder_memory) if not isinstance(value, mx.array))
+    stream.decoder_memory[slot] = [latent]
+    with pytest.raises(ValueError, match="no pooled frames pending"):
+        graph.decode_stream(latent)
+    assert graph.decoder_graph is None
+    stream.decoder_memory[slot] = None
+    assert graph.decode_stream(latent).shape[2] == 4 and graph.decoder_graph.replays == 1

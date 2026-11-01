@@ -207,6 +207,9 @@ def test_validate_rejects_bad_pixels_and_noise():
         s._validate(mx.zeros((1, 3, 480, 864)), frame_start=0, initial_noise=mx.full(LATENT_SHAPE, float("nan")))
     with pytest.raises(ValueError, match="Initial noise"):
         s._validate(mx.zeros((1, 3, 480, 864)), frame_start=0, initial_noise=mx.zeros((1, 2, 3)))
+    # Upstream's order: bad pixel values are reported before a bad noise shape.
+    with pytest.raises(ValueError, match=r"\[-1,1\]"):
+        s._validate(mx.full((1, 3, 480, 864), 2.0), frame_start=0, initial_noise=mx.zeros((1, 2, 3)))
     assert s._validate(mx.ones((1, 3, 480, 864)), frame_start=0, initial_noise=mx.zeros(LATENT_SHAPE)) == 1
 
 

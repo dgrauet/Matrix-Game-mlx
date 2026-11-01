@@ -11,6 +11,7 @@ first chunk of a stream runs the eager adapter, as upstream.
 """
 import mlx.core as mx
 
+from matrix_game_mlx.inference.stream import FRAME_SIZE
 from matrix_game_mlx.inference.taehv import TWorkItem, apply_model_with_memblocks_sequential_single_step
 
 
@@ -56,7 +57,7 @@ class StreamingVAEGraph:
         try:
             self.clear_cache()
             for frames in (1, 4):
-                self.decode_stream(self.encode_stream(mx.zeros((1, 3, frames, 480, 864), self.base.dtype)))
+                self.decode_stream(self.encode_stream(mx.zeros((1, 3, frames, *FRAME_SIZE), self.base.dtype)))
         finally:
             self.clear_cache()
 
@@ -96,8 +97,14 @@ class StreamingVAEGraph:
             return base.decode_stream(latent)
         if stream.decoder_work_queue:
             raise ValueError("Decoder contains pending frames")
+        # The graph carries only the decoder's array state (MemBlock inputs) and emits every frame it decodes, so it
+        # relies on two facts the eager first chunk establishes: the startup frames (frames_to_trim) are consumed,
+        # and no TPool list state is pending (the TAEHV decoder has no TPool; such a list would be dropped).
+        core = base.core
+        if stream.n_frames_decoded < core.frames_to_trim or any(
+                value for value in stream.decoder_memory if not isinstance(value, mx.array)):
+            raise ValueError("VAE graph requires a decoder past its startup frames, with no pooled frames pending")
         if self.decoder_graph is None:
-            core = base.core
             indices = [i for i, value in enumerate(stream.decoder_memory) if isinstance(value, mx.array)]
 
             def decode(value, state):
@@ -110,6 +117,10 @@ class StreamingVAEGraph:
                     frame = apply_model_with_memblocks_sequential_single_step(core.decoder, memory, queue)
                     if frame is not None:
                         frames.append(core.postprocess_output_frames(frame))
+                # Runs while tracing: the state the graph returns must be all the decoder state there is.
+                if any(value is not None and not (isinstance(value, list) and not value)
+                       for i, value in enumerate(memory) if i not in indices):
+                    raise ValueError("VAE graph would drop decoder state")
                 video = (mx.concatenate(frames, axis=1) * 2 - 1).transpose(0, 4, 1, 2, 3)
                 return video, [memory[i] for i in indices]
 
