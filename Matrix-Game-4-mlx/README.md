@@ -57,7 +57,7 @@ The offline default preset is `quality`, as upstream's offline renderer. Weights
 | `--no-vae-graph` | Accepted, no effect (VAE graphs are never used on MLX) |
 | `--prompt-mode {fixed,dynamic}`, `--prompt`, `--prompt-interval-chunks` | Supported; dynamic is racing only (see below) |
 | `--captions FILE` | Supported, dynamic mode only (required there) |
-| `--t5-runtime {native,graph}` | Accepted; `graph` behaves as `native` (no CUDA graphs) |
+| `--t5-runtime {native,graph}` | Supported (default `graph`, as upstream); `graph` runs the dynamic-caption encoder as one `mx.compile`d graph instead of a CUDA graph, bitwise `native` (see Known deviations) |
 | `--sink-image PATH`, `--no-sink-image` | Supported (mutually exclusive) |
 | `--resources DIR` | Accepted; `render` does not read weights or the sink image from it (those come from the MLX pack). It sets the game-asset root and is the default `download --resources` target |
 | `--asset-root DIR` | Accepted: overrides the game-asset root derived from `--resources`; `render` does not read it |
@@ -603,6 +603,15 @@ so the gap is the DiT's alone, which is preset-independent and gated per call an
 - `CastleStream._validate` reads its value checks (pixels finite and in [-1, 1], initial noise finite) in one host
   sync, and the finite check of the generated latent is read with the denoising step's own evaluation (same
   checks and messages as upstream).
+- `--t5-runtime graph` (`CaptionEncoder`, dynamic captions): upstream's `entry` and one graph traced once, on
+  `mx.compile` instead of CUDA graph capture (the padded `(1, 512)` ids and mask are inputs, the T5 weights implicit
+  inputs, `captures` / `replays` counters); no CUDA / eval-mode check (MLX has neither). Its embeddings are bitwise
+  `native` on real weights. Two port edits in `wan/modules/t5.py` make that so without changing the native values:
+  the relative-position buckets are computed eagerly once per length and kept (`T5RelativeEmbedding.buckets`;
+  compiled, the bucket formula's division lands one bucket lower at distances 16/32/64), and `T5LayerNorm` writes
+  its variance as `sum / dim` instead of `mean()` (compiled, mean's 1/n scale is fused into the reduction, which
+  then sums in another order; with dim 4096 a power of two, `sum / dim` is bitwise the eager `mean()`).
+  Measured: −21 ms (−1.3 %) per caption encode, 1515 vs 1535 ms (M2 Pro, T5 alone).
 - No CUDA VAE graph (`vae_graph`): it only captures the same TAEHV ops.
 - TAEHV convs accumulate in float32 and round once to bf16 (see Numerics).
 - `serve`: the macOS port changes listed under "Online play on macOS" (sidecar interpreter, Apple software renderer, startup deadline, `gpu_` timing keys, no torch).

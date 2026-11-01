@@ -53,6 +53,7 @@ wrapper-level APIs keep upstream shapes `[B, F, C, h, w]`.
 - KV-cache end indices are Python ints instead of 1-element tensors
 - Test-only `renoise` argument on `CastleStream.push`
 - `--dit-runtime ring-fused` (realtime default, as upstream) is the MLX ring-KV + GPU-RoPE + fused-kernel runtime (`inference/runtime.py`, `inference/kernels.py`): no CUDA graphs/varlen, bf16 caches/modulation required, all layers validated before planning; one `mx.compile`d steady-window graph per session instead of a CUDA graph (`prime` at stream creation, `clear` on close, bitwise eager), timestep-MLP memo per t value; the fused Metal kernels (`ln_modulate`, `gate_ln_affine`, `gate_residual`, plus port-only `rms_norm` and compiled `gelu_tanh`) reproduce native rounding and MLX's row-reduction order at the model widths (bitwise native), so it differs from `native` only by SDPA key order (ring). No CUDA VAE graph (`vae_graph`)
+- `--t5-runtime graph` (default): `CaptionEncoder` runs T5 as one `mx.compile`d graph (upstream: CUDA graph), bitwise native; it relies on two t5.py port edits (relative-position buckets computed eagerly and cached, `T5LayerNorm` variance as `sum / dim`), since compiled division and fused mean() differ from eager
 - TAEHV convs accumulate in float32 and round once to bf16 (torch semantics)
 
 ## Validation Status
