@@ -13,6 +13,10 @@ extended to any length. Each chunk's generated latent and decoded frames are sav
 float32, `decoded_<i>` float16 [-1, 1]) with `meta.json`. The stream is free running: each runtime conditions on
 its own past outputs, so any per-call difference (here the ring's attention key order) compounds over chunks.
 
+`--perturb-frame F` raises input frame F by one 8-bit level (2/255, clipped to 1): a run with it against one
+without, on the same runtime, measures how far the free-running stream carries an input change of that size (a
+sensitivity baseline for the runtime comparison).
+
 The comparison takes the first directory as the reference and reports per chunk the pred rel L2, the decoded rel L2
 and PSNR (peak-to-peak 2, as the parity tests), whether the pred is bitwise equal, and summaries over the chunks
 before and from `--window-chunk` (default 21) on.
@@ -55,11 +59,12 @@ class Pan:
             raise ValueError(f"{image_path}: {w}x{h} is smaller than one 864x480 frame")
         self.top, self.span = (h - 480) // 2, w - 864
 
-    def frame(self, i: int) -> np.ndarray:
+    def frame(self, i: int, perturb: bool = False) -> np.ndarray:
         x = (i * PAN_STEP) % (2 * self.span) if self.span else 0
         left = x if x <= self.span else 2 * self.span - x
         crop = self.image[self.top:self.top + 480, left:left + 864]
-        return (crop.transpose(2, 0, 1).astype(np.float32) * (2.0 / 255.0) - 1.0).astype(np.float32)
+        out = (crop.transpose(2, 0, 1).astype(np.float32) * (2.0 / 255.0) - 1.0).astype(np.float32)
+        return np.minimum(out + np.float32(2.0 / 255.0), np.float32(1.0)) if perturb else out
 
 
 def run(args) -> dict:
@@ -82,7 +87,7 @@ def run(args) -> dict:
     arrays, chunks, frame = {}, [], 0
     for i in range(args.chunks):
         count = 1 if i == 0 else 4
-        pixels = mx.array(np.stack([pan.frame(frame + k) for k in range(count)]))
+        pixels = mx.array(np.stack([pan.frame(frame + k, frame + k == args.perturb_frame) for k in range(count)]))
         position = stream.index + stream.sink_offset
         chunk = stream.push(pixels, frame_start=frame)
         arrays[f"pred_{i}"] = np.array(chunk.latent.astype(mx.float32))
@@ -105,6 +110,7 @@ def run(args) -> dict:
             "sink_offset": stream.sink_offset, "window": window, "steps": list(args.steps),
             "first_steps": list(args.first_steps), "vae_backend": args.vae_backend,
             "vae_graph": getattr(args, "vae_graph", None), "input": f"pan of {args.sink_image.name}, {PAN_STEP} px/frame",
+            "perturb_frame": args.perturb_frame,
             "runtime_counters": counters, "seconds": round(time.perf_counter() - t0, 1),
             "peak_memory_gb": round(mx.get_peak_memory() / 1e9, 2), "mlx": mx.__version__, "commit": commit,
             "per_chunk": chunks}
@@ -130,6 +136,8 @@ def compare(reference: Path, other: Path, window_chunk: int, json_path=None) -> 
     for key in ("scene", "preset", "chunks", "seed", "sink_mode", "steps", "input"):
         if meta_a[key] != meta_b[key]:
             raise SystemExit(f"Runs differ in {key}: {meta_a[key]} vs {meta_b[key]}")
+    if meta_a.get("perturb_frame") is not None and meta_b.get("perturb_frame") is not None:
+        raise SystemExit("At most one run may be perturbed")
     a, b = np.load(Path(reference) / "chunks.npz"), np.load(Path(other) / "chunks.npz")
     rows = []
     for i, chunk in enumerate(meta_a["per_chunk"]):
@@ -145,7 +153,10 @@ def compare(reference: Path, other: Path, window_chunk: int, json_path=None) -> 
               "from_window": _summary([r for r in rows if r["index"] >= window_chunk]),
               "per_chunk": rows, "runs": {"reference": {k: v for k, v in meta_a.items() if k != "per_chunk"},
                                           "other": {k: v for k, v in meta_b.items() if k != "per_chunk"}}}
-    print(f"{result['scene']} {result['preset']}: {result['other']} vs {result['reference']} "
+    perturbed = {name: meta.get("perturb_frame") for name, meta in (("reference", meta_a), ("other", meta_b))}
+    result["perturb_frame"] = perturbed
+    label = "".join(f" ({name} input frame {f} +1 level)" for name, f in perturbed.items() if f is not None)
+    print(f"{result['scene']} {result['preset']}: {result['other']} vs {result['reference']}{label} "
           f"(window {result['window']}, sink offset {result['sink_offset']})")
     print("| chunk | position | pred bitwise | pred rel L2 | decoded rel L2 | decoded PSNR (dB) |")
     print("| --- | --- | --- | --- | --- | --- |")
@@ -165,6 +176,7 @@ def main(argv=None):
     add_model_arguments(parser)
     parser.add_argument("--chunks", type=int, default=32)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--perturb-frame", type=int, help="Raise this input frame by one 8-bit level (baseline)")
     parser.add_argument("--out", help="Run mode: output directory (chunks.npz, meta.json)")
     parser.add_argument("--compare", nargs=2, metavar=("REFERENCE", "OTHER"), help="Compare two run directories")
     parser.add_argument("--window-chunk", type=int, default=21, help="First chunk of the 'from window' summary")

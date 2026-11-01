@@ -17,6 +17,8 @@ def test_pan_is_the_fixture_pan(tmp_path):
     want = pan_frames(SimpleNamespace(sink_image=path), 40)       # 136 px of travel: wraps (ping-pong) at frame 17
     pan = Pan(path)
     assert np.array_equal(np.stack([pan.frame(i) for i in range(40)]), want)
+    bumped = pan.frame(3, perturb=True)
+    assert np.array_equal(bumped, np.minimum(want[3] + np.float32(2 / 255), 1)) and bumped.max() <= 1
 
 
 def _dump(path, runtime, preds, decoded, sink_offset=1):
