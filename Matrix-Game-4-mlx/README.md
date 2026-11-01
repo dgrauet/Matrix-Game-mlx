@@ -12,6 +12,7 @@ ancient-egypt, castle and racing scenes.
 | M1 | ancient-egypt, quality preset (Wan VAE, steps `1000,500`), offline CLI, real-weight parity | Done: parity-validated; a 19 s recorded take (909 frames, 48 FPS) rendered in 1 h 52 min (29.4 s/chunk, peak 24.4 GB) |
 | M2 | castle and racing (first-frame sink, absolute RoPE, racing RNG role), fixtures for both | Done: parity-validated, same methodology as ancient-egypt (racing RNG role transcribed from upstream, not parity-validated: parity injects noise on both sides); acceptance renders: 97-frame pan renders of castle (37.7 s/chunk) and racing (27.3 s/chunk), peak 24.4 GB |
 | M3 | realtime preset: TAEHV encode/decode (`taehv.py`), one-step schedule, upstream `native` DiT runtime | Done: parity-validated on the three scenes (`<scene>_realtime` fixtures, torch bf16 CPU reference); acceptance renders: 97-frame pans of egypt (3.57 s/chunk), castle (3.58 s/chunk) and racing (3.51 s/chunk), peak 14.96 GB (~1.1 processed frames/s, M2 Pro 32 GB) |
+| Apple fast path | `--dit-runtime ring-fused` on MLX (GPU RoPE, ring KV, fused kernels, compiled steady graph), `--vae-graph`, `--t5-runtime graph` | Done: every parity slice passes on both runtimes with thresholds unchanged; castle realtime `serve` 0.95 -> 1.13 `online_fps` (see "Apple fast path") |
 
 ## Quick start
 
@@ -247,8 +248,8 @@ correct). It is not patched.
 `docs/racing.md`): the native game renders the scene, the MLX model restyles each chunk, GStreamer encodes it and
 MediaMTX serves it to the browser over WHEP, with upstream's web client (`matrix_game_mlx/web/`, byte-identical).
 Same options, validations, routes and messages as upstream's `serve`, except the CUDA-only options (see "Known
-deviations"). **It is not real time on a laptop**: the realtime preset generates about 1.1 frames per second and the
-quality preset about 0.15 (table below), so a session is a slow-motion game. Commands run from `Matrix-Game-4-mlx/`
+deviations"). **It is not real time on a laptop**: the realtime preset generates about 1.2 frames per second (1.1 with
+`--dit-runtime native`) and the quality preset about 0.15 (table below), so a session is a slow-motion game. Commands run from `Matrix-Game-4-mlx/`
 unless noted; `matrix-game-mlx serve` and `python3 -m matrix_game_mlx.cli serve` are the same entry point.
 
 ### Setup
@@ -324,24 +325,39 @@ physical footprint (`top` MEM, which includes MLX's Metal buffers) of server, ga
 the browser (1.1 GB). `ps` RSS undercounts MLX by 5 to 14 GB, so it is not used. Swap is the growth of
 `vm.swapusage` during the session.
 
-| Configuration | `--fps` | Chunk | `model_fps` | `online_fps` | Footprint | Swap |
-| --- | --- | --- | --- | --- | --- | --- |
-| castle realtime | 40 | 3.75 s | 1.09 | 0.99 | 16.2 GB | 0 |
-| castle realtime | 4 | 3.83 s | 1.07 | 0.97 | 16.2 GB | 0 |
-| racing realtime, fixed caption | 24 | 3.77 s | 1.09 | 1.01 | 16.5 GB | 0 |
-| racing realtime, fixed caption | 4 | 3.75 s | 1.09 | 1.01 | 16.6 GB | 0 |
-| racing realtime, dynamic captions, no browser | 24 | 4.0 s, then 31 to 35 s | 0.34 | 0.14 | 25.5 GB | +3.8 GB |
-| racing realtime, dynamic captions, browser | 24 | 5.4 s, then 14 to 34 s | 0.55 (21 chunks) | n/a | 25.5 GB | +3.1 GB |
-| castle quality (6 chunks, no browser) | 4 | 27.8 s | 0.15 | n/a | 24.2 GB | +0.4 GB |
+| Configuration | DiT runtime | `--fps` | Chunk | `model_fps` | `online_fps` | Footprint | Swap |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| castle realtime | `native` | 40 | 3.75 s | 1.09 | 0.99 | 16.2 GB | 0 |
+| castle realtime | `native` | 4 | 3.83 s | 1.07 | 0.97 | 16.2 GB | 0 |
+| castle realtime, no browser | `native` | 4 | 3.89 s | 1.05 | 0.95 | 16.2 GB | 0 |
+| **castle realtime** | **`ring-fused`** | 4 | **3.42 s** | **1.20** | **1.10** | 16.2 GB | 0 |
+| **castle realtime, no browser** | **`ring-fused`** | 4 | **3.29 s** | **1.24** | **1.13** | 16.2 GB | 0 |
+| racing realtime, fixed caption | `native` | 24 | 3.77 s | 1.09 | 1.01 | 16.5 GB | 0 |
+| racing realtime, fixed caption | `native` | 4 | 3.75 s | 1.09 | 1.01 | 16.6 GB | 0 |
+| **racing realtime, fixed caption, no browser** | **`ring-fused`** | 4 | **3.35 s** | **1.24** | **1.15** | 16.6 GB | 0 |
+| racing realtime, dynamic captions, no browser | `native` | 24 | 4.0 s, then 31 to 35 s | 0.34 | 0.14 | 25.5 GB | +3.8 GB |
+| racing realtime, dynamic captions, browser | `native` | 24 | 5.4 s, then 14 to 34 s | 0.55 (21 chunks) | n/a | 25.5 GB | +3.1 GB |
+| castle quality (6 chunks, no browser) | `native` | 4 | 27.8 s | 0.15 | n/a | 24.2 GB | +0.4 GB |
+| castle quality (6 chunks, no browser) | `ring-fused` | 4 | 27.3 s | 0.15 | n/a | 24.2 GB | +2.6 GB |
 
-Time to the first encoded frame: realtime 3.6 to 7.8 s (13.5 s with dynamic captions), quality 12.4 s (13.3 s in
-the end-to-end test). Realtime chunk medians are about 3.3 s over a 14-chunk session and 3.8 s over 32 (the KV window fills at chunk 19).
+`ring-fused` has been the realtime default since the Apple fast path (see "Apple fast path"). The `native` rows were
+measured before it; `--dit-runtime native` still selects that path. The `ring-fused` rows are single sessions on
+macOS 27.2 (same machine and MLX). Over the chunks with a full KV window (chunk 21 on), the `ring-fused` chunk median
+is 3.53 s (castle), 3.63 s (castle with browser) and 3.48 s (racing). The quality `ring-fused` row's swap is the
+system-wide growth of `vm.swapusage` (about 4.4 GB was already in use before these runs); its footprint equals
+`native`'s.
+
+Time to the first encoded frame, `native`: realtime 3.6 to 7.8 s (10.5 s for the castle no-browser row, 13.5 s with
+dynamic captions), quality 12.4 s (13.3 s in the end-to-end test). `ring-fused`: castle realtime 8.2 s, racing
+realtime 6.6 s, castle quality 16.6 s, including the compiled graphs' warm-up at stream creation; all well inside
+`serve`'s deadline (45 s realtime, 300 s quality). With `native`, realtime chunk medians are about 3.3 s over a
+14-chunk session and 3.8 s over 32 (the KV window fills at chunk 19).
 The `--fps` flag does not change the generation rate: the model sets the pace and the game waits for it, so
 `--fps` sets how much game time one generated frame covers.
 
 What a player sees (Chromium counters over the last 18 s, `window.castleDebug()`: frames presented by the browser
-and game frames, per second): about 0.7 to 1.1 presented and 0.9 to 1.2 game frames per second for every realtime row,
-whatever `--fps`: **a slideshow of about one image per second**, with the 4-frame chunks arriving in bursts. Only the
+and game frames, per second): about 0.7 to 1.1 presented and 0.9 to 1.2 game frames per second for every `native`
+realtime row, and 1.09 presented and 1.09 game frames per second for `ring-fused` castle at `--fps 4`, whatever `--fps`: **a slideshow of about one image per second**, with the 4-frame chunks arriving in bursts. Only the
 game clock differs. The 125 frames of a 32-chunk session (about two minutes) cover 3.1 s of game time at `--fps 40`, 5.2 s at 24 and 31 s
 at 4: the world runs about 40, 24 and 4 times slower than real time. Image quality also differs, from one screenshot of each (castle 14 chunks, racing 14 chunks, a
 keyboard-driven drive): at 40 fps the castle had turned into a brown smear after 53 frames (plausibly because
@@ -369,6 +385,12 @@ same holds at `--fps 4`. Use `--prompt-mode fixed` (the default) on 32 GB; dynam
 (The swap file already held 4 to 5 GB from earlier work when these runs started, so a freshly booted Mac
 may do better; that was not tested.)
 
+The Apple fast path does not change this: dynamic captions on a 32 GB Mac are **memory-bound, not compute-bound**.
+Measured with `ring-fused` on racing realtime (`CastleStream` driven directly, a new caption every other chunk, T5
+resident): peak 26.4 GB; one caption update costs 4.6 to 7.9 s in situ against 1.5 s of T5 compute alone, and it
+slows the next 1 to 2 chunks by up to several seconds. `--t5-runtime graph` saves 21 ms per encode; the levers that
+would help are memory ones (T5 off the GPU or quantized, fewer distinct captions), outside this parity-kept path.
+
 ### Quality preset in a browser
 
 A browser keeps an idle `/api/start` request open for a limited time (WebKit about 60 s), while the server waits for
@@ -394,6 +416,9 @@ Upstream's server modules are copied with `matrix_game.` renamed to `matrix_game
 - No torch: the session report drops `profile_torch_threads`; the stream hands an owned `uint8` array to `on_rgb` (no `.numpy()`); profile keys are
   `gpu_<stage>_ms` instead of `cuda_<stage>_ms`.
 - CUDA-only model options keep the treatment `render` gives them (for example `--preset rtx5090` exits with "--preset rtx5090 is CUDA-only"); the realtime DiT runtime is `ring-fused`, as upstream.
+  `serve --dit-runtime {native,ring-fused}` is accepted on every preset (`native` is the reference path; the CUDA-only
+  values are rejected); `ring-fused` warms its compiled graphs up at stream creation, inside the first-frame deadline
+  (see "Measured rates" and "Apple fast path").
 - The web client is copied byte-for-byte, and `matrix_game_mlx/web/mediamtx-reader.LICENSE` ships in the wheel (`license-files`).
 - Game patches: none. Both `CastleReferenceServer` and `CitySampleReferenceServer` create their hidden SDL/OpenGL window from a
   subprocess on macOS unchanged.
@@ -427,7 +452,7 @@ text, because the script's timings assume CUDA speed: 8 new game frames in 20 s 
 before the final inspection (the client hides it after 1.5 s without video). Keyboard, mouse and audio are therefore
 browser-tested in reference mode only, not under the model; check them by hand. If WebKit receives no video on a fresh machine, check System Settings, Privacy & Security, Local Network for the
 browser: after a new install WebKit got no WHEP video for about an hour, then worked without any change. Measure with
-`python3 -m tests.measure_serve --scene castle --fps 4 --chunks 32 [--browser] [--prompt-mode dynamic]`.
+`python3 -m tests.measure_serve --scene castle --fps 4 --chunks 32 [--browser] [--prompt-mode dynamic] [--dit-runtime native|ring-fused]`.
 
 ## Weights
 
@@ -499,11 +524,125 @@ quality preset on the same inputs (castle 37.7 s/chunk, racing 27.3 s/chunk, pea
 | racing | 3.51 |
 
 That is about 1.1 processed frames per second. Outputs are in `output/{egypt,castle,racing}-pan-realtime/`.
+These renders predate the Apple fast path (`native` DiT runtime); "Apple fast path" has the `ring-fused` timings.
+
+## Apple fast path
+
+`--dit-runtime ring-fused` is the MLX counterpart of upstream's CUDA `ring-fused` runtime and, as upstream, the
+default of the realtime preset (`render` and `serve`); the quality and baseline presets default to `native`. Both
+runtimes are accepted on every preset (`$S` as under "Online play on macOS", Run):
+
+```bash
+matrix-game-mlx render --scene castle --preset realtime --dit-runtime native --input clip.mp4 --output output/castle-native
+matrix-game-mlx serve --scene castle --preset realtime --dit-runtime native --fps 4 $S      # the reference path
+matrix-game-mlx serve --scene castle --preset quality --dit-runtime ring-fused --fps 4 $S   # fast path on quality
+```
+
+`native` stays the reference (upstream: "Fast runtime modes alter floating-point reduction order. Keep `native` for
+reference checks."). `--vae-graph` (default on for realtime + TAEHV) and `--t5-runtime graph` (default) are the two
+smaller compiled paths; `--no-vae-graph` and `--t5-runtime native` turn them off. An unsupported configuration
+under `ring-fused` is a `ValueError`, never a silent fall back to `native`.
+
+### What each lever does and what it gave
+
+Measured with `python3 -m tests.bench_dit --scene castle --preset realtime` (real weights, `CastleStream.push` on
+synthetic frames, each DiT call and codec stage timed with `mx.eval`; M2 Pro 32 GB, MLX 0.31.1), one run alone per
+row. Chunk = one latent (4 frames): one denoising call, one cache-update (`clean_kv`) call, TAEHV encode and decode.
+
+| Step (cumulative) | Chunks | Denoise | Clean KV | Chunk median | Steady chunk (window full) | Peak |
+| --- | --- | --- | --- | --- | --- | --- |
+| `native` (before) | 14 | 1766 ms | 1717 ms | 3589 ms | | 14.94 GB |
+| + ring KV cache, GPU RoPE kernel | 14 | 1526 ms | 1516 ms | 3190 ms (−11 %) | | 14.94 GB |
+| + fused block-glue kernels | 14 | 1463 ms | 1383 ms | 2941 ms (−18 %) | | 14.94 GB |
+| same code, 32 chunks | 32 | 1681 ms | 1652 ms | 3454 ms | 3700 ms | 14.94 GB |
+| + compiled steady-window graph, timestep-MLP memo, fewer syncs | 32 | 1675 ms | 1624 ms | 3422 ms | 3676 ms | 14.94 GB |
+| + `--vae-graph` (TAEHV encode 46 -> 39 ms, decode 79 -> 71 ms) | 32 | 1643 ms | 1590 ms | 3345 ms | 3656 ms | 14.86 GB |
+
+DiT time grows with the KV cache until the 21-latent window is full (about chunk 20 in castle realtime), then stays
+flat; a 14-chunk median therefore sits below a 32-chunk one, and only the 32-chunk rows compare with each other.
+Sequential runs drift by 30 to 40 ms (thermal), so the compiled graph's gain was measured interleaved instead.
+
+End to end in `serve` (castle realtime, `--fps 4`, 32 chunks, no browser, `tests/measure_serve.py`): chunk median
+3.89 s with `native` and 3.29 s with `ring-fused` (−15 %), `model_fps` 1.05 -> 1.24, `online_fps` 0.95 -> 1.13
+(+19 %), first frame 10.5 -> 8.2 s, footprint 16.2 GB both, no swap. All rows are under "Measured rates".
+
+1. **RoPE on the GPU** (`inference/rope_kernel.py`, upstream's `build_causal_rope_rotations` / `apply_causal_rope`).
+   The rotation table of a call's positions is built once per DiT call (float64 bits, about 0.3 ms on the host) and
+   shared by the 30 layers and q/k; one Metal kernel applies it. One call's 60 RoPE applications: 326 ms on the
+   CPU float64 path, 15.8 ms on the GPU, and no GPU -> CPU -> GPU round trip per layer. **Bitwise guarantee**: the
+   kernel emulates the float64 chain in 64-bit integer soft-float (exact products, round-to-nearest-even sums with a
+   sticky bit, then MLX's own float64 -> float32 -> bf16 double rounding), so its bf16 output equals the CPU path's
+   bit for bit. `tests/test_rope_kernel.py` compares raw bf16 bits with `causal_rope_apply` on every finite bf16
+   pattern (65,024, in both lanes) at start frames 0, 22 and 8000, on random tensors at 21 position/scale cases, on
+   rounding hard cases (ties, cancellation), on inf/NaN inputs and for the fixed-sink re-RoPE
+   (`rope_apply_frames`); the kernel's emulated float64 lanes also equal the CPU float64 lanes on all 64 bits.
+2. **Ring KV cache** (`inference/runtime.py`: `plan_cache`, `run_blocks`, `CastleRuntime`, `install_runtime`, as
+   upstream). The host planner writes each new latent into a ring slot and evicts one frame per chunk instead of
+   shifting the window. Together with the GPU RoPE: −399 ms per chunk (14-chunk median; the two were measured
+   together).
+3. **Fused block glue** (`inference/kernels.py`): `ln_modulate`, `gate_ln_affine`, `gate_residual` as upstream,
+   plus `rms_norm` (q/k norm) and a compiled `gelu_tanh`, one launch each. −249 ms per chunk. Cost of reverting
+   each one alone (same session): LayerNorm pair +138 ms, `rms_norm` +60 ms, `gelu_tanh` +35 ms, `gate_residual`
+   +26 ms (within noise, kept: upstream's kernel, bitwise).
+4. **Fewer copies**: measured, not changed. Removing the fixed-sink K/V concatenation and the ring-eviction copy
+   (timing-only ablations on a real steady call) changed nothing beyond the ±20 to 30 ms noise: MLX overlaps these
+   memory-bound copies with the GEMMs.
+5. **Compiled steady-window graph, fewer syncs** (`CastleRuntime.prime` / `graph` / `clear`, upstream's "one
+   steady-window graph per session" on `mx.compile`). Once the window is full, the 30 blocks run as one compiled
+   function; host graph build drops from 25 to 8 ms per call. With the timestep-MLP memo (about 25 ms of float64
+   CPU-stream work per call) and one-sync stream checks: **−59 ms per steady chunk (−1.6 %)**, interleaved A/B,
+   10 rounds, real weights. The warm-up runs at stream creation (as upstream), adding about 1.7 s to the first frame.
+6. **Smaller items (lever 5), done only above 3 % of the steady chunk (about 110 ms)**:
+
+   | Item | Measured cost | Decision |
+   | --- | --- | --- |
+   | Timestep MLP (float64 accumulation), with the memo | 0.88 ms per chunk (0.02 %) | skipped |
+   | flow-to-x0 (float64, CPU stream) | 0.39 ms per chunk (0.01 %) | skipped |
+   | TAEHV encode + decode | 121 ms per chunk (3.3 %) | done: `--vae-graph`, −15 ms per chunk |
+   | Caption encode (racing `--prompt-mode dynamic`) | 1535 ms of T5 compute per caption update | done: `--t5-runtime graph`, −21 ms per encode (1515 vs 1535 ms) |
+
+Where the time goes now (one steady fixed-sink castle call, full window, real weights, each part timed alone):
+the call takes 1786 ms, of which 1174 ms are the 210 GEMMs (about 3.1 TFLOPS) and 513 ms are attention (SDPA,
+self 484 ms + cross 29 ms): **GEMM + SDPA are 94 % of a DiT call**. Their kernels are MLX's own; making them
+faster at the same precision would need custom GEMM/attention kernels, and anything else (fp16, quantized weights,
+a lighter cache-update pass) changes the numerics. So the end-to-end gain stays modest. Per-part numbers here come
+from direct `mx.eval` timings. smeltr's scope totals are consistent with them (GPU time per DiT call now equals
+its wall time: the CPU RoPE was the off-GPU part), but its per-op split is not reliable on this machine (ops of one
+command buffer share its time), so no per-op percentage is quoted.
+
+### Parity: `ring-fused` against `native`
+
+Every real-weight parity slice passes on both runtimes with **thresholds and fixtures unchanged**
+(`pytest tests/parity/test_real_weights*.py --dit-runtime {native,ring-fused}`). The fast path may differ from
+`native` only by floating-point summation order, never by precision:
+
+- GPU RoPE, fused kernels, the compiled graph, the memo, `--vae-graph` and `--t5-runtime graph` are each **bitwise**
+  their eager / native counterpart (tests in `tests/test_rope_kernel.py`, `test_kernels.py`, `test_runtime.py`,
+  `test_taehv.py`, `test_caption_encoder.py`; on real castle weights, three steady positions x (denoise + cache
+  update), the compiled DiT graph equals the eager one bit for bit, prediction and every K/V).
+- The one numeric difference is the ring's attention key order, which changes SDPA's summation order. It shows only
+  in the `--long` chunk-22 per-call tests, past the window, where ring slots are permuted:
+
+| Per-call test (teacher forced) | pred rel L2 `native` | `ring-fused` | gate |
+| --- | --- | --- | --- |
+| ancient-egypt chunk 22, call 0 | 0.0381 | 0.0308 | 0.07 |
+| ancient-egypt chunk 22, call 1 | 0.0202 | 0.0200 | 0.04 |
+| racing chunk 22, call 0 | 0.0129 | 0.0119 | 0.02 |
+| racing chunk 22, call 1 | 0.0102 | 0.0108 | 0.02 |
+
+  Every other printed metric is identical on both runtimes: per-call pred and layer 0/29 KV of chunks 0 to 2 on the
+  three scenes, the 90 block errors (max 0.55 to 0.56 of the gate on both), the end-to-end quality stream (chunk 0
+  pred 1.71e-2 / 1.41e-2 / 0, decoded 44.9 / 43.7 / 56.4 dB), and the realtime and variant chunk metrics.
+- `mx.compile` is not bitwise for every op on MLX 0.31.1: a division by a non-power-of-two constant rounds
+  differently once compiled, and `mean()` gets its 1/n scale fused into the reduction, which then sums in another
+  order. The compiled DiT graph is nevertheless bitwise eager on real weights (measured, above); `wan/modules/t5.py`
+  was rewritten so that the compiled T5 stays bitwise (see Known deviations).
 
 ## Numerics
 
 Upstream's float64 islands (RoPE complex product and tables, flow-to-x0, timestep sinusoid) run in float64,
-on the MLX CPU stream where MLX has no GPU float64. bf16 rounding points follow torch's opmath rather than
+on the MLX CPU stream where MLX has no GPU float64 (under `ring-fused`, the RoPE product runs on the GPU as an
+integer emulation of the same float64 arithmetic, bitwise equal; see "Apple fast path"). bf16 rounding points follow torch's opmath rather than
 MLX's per-op defaults: SiLU / tanh-GELU and the VAE `RMS_norm` compute in fp32 and round once, and the
 timestep-MLP linears (one row per timestep entry, B x F) accumulate in float64, bias included, and round once
 (MLX's single-row bf16 addmm rounds the product before adding the bias, and fp32 summation order flips a few
@@ -561,7 +700,8 @@ so the gap is the DiT's alone, which is preset-independent and gated per call an
 ## Known deviations from upstream
 
 - float64 runs on the MLX CPU stream (RoPE, flow-to-x0, timestep MLP accumulation) because MLX has no float64
-  on the GPU; the values are upstream's, the device is not.
+  on the GPU; the values are upstream's, the device is not. Under `ring-fused`, RoPE runs on the GPU instead
+  (bitwise the same values, below).
 - KV-cache end indices are Python ints instead of 1-element tensors.
 - `CastleStream.push` has a test-only `renoise` argument.
 - Only the inference path (`kv_cache is not None`) is ported; training branches raise `NotImplementedError`.
@@ -571,12 +711,22 @@ so the gap is the DiT's alone, which is preset-independent and gated per call an
   steady-window graph compiled with `mx.compile` (below) instead of a CUDA graph, and no varlen `cu_seqlens`. Its
   only numeric difference from `native` is the
   attention key order (ring slots change the SDPA summation order; with the linear layout it is bitwise native,
-  fused or not). Measured on the tiny bf16 model over 60 chunks
+  fused or not). This is the difference upstream itself documents for its fast runtimes ("Fast runtime modes alter
+  floating-point reduction order. Keep `native` for reference checks.", `docs/architecture.md`; the loader warns
+  "Ring/fused runtime changes floating-point reduction order; use native for baseline comparisons"). On real weights
+  it shows only in the `--long` chunk-22 per-call parity tests (see "Apple fast path"). Measured on the tiny bf16 model over 60 chunks
   (`tests/test_runtime.py`): max rel L2 vs native 2.4e-3 per call, 1.2e-3 on the written KV slot; most calls are
   bitwise (the fp32 reorder rarely changes a bf16 output bit). Like upstream, the loader logs that ring changes the
   reduction order and that native is the baseline. Port-only checks: KV caches must be bfloat16, and every layer is
   validated before any cache is planned; an unsupported configuration is a `ValueError`, never a native fallback.
   `CastleRuntime` accepts only `ring-fused`; `install_runtime` only `native` and `ring-fused`.
+- `ring-fused` RoPE: a Metal kernel (`inference/rope_kernel.py`, `mx.fast.metal_kernel`) instead of upstream's
+  Triton kernel, with upstream's names (`build_causal_rope_rotations`, `apply_causal_rope`) and validation messages.
+  Apple GPUs have no float64, so the rotation table holds the float64 bits as uint64 and the kernel emulates the
+  float64 complex product in 64-bit integer soft-float, then rounds as MLX's CPU float64 -> bf16 cast does (through
+  float32). Its bf16 output is bitwise the CPU float64 path's (`causal_rope_apply`, and `rope_apply_frames` for the
+  fixed-sink re-RoPE; `tests/test_rope_kernel.py`). Port addition: `build_rope_rotations_frames` (explicit frame
+  positions for that re-RoPE).
 - `ring-fused` fused kernels (`inference/kernels.py`, upstream's `kernels.py` names on MLX arrays): `ln_modulate`,
   `gate_ln_affine` and `gate_residual` as upstream, plus two port additions, `rms_norm` (the q/k `WanRMSNorm`) and
   `gelu_tanh` (the FFN activation as one `mx.compile`d kernel). They follow upstream's rounding contract (every bf16
@@ -584,7 +734,10 @@ so the gap is the DiT's alone, which is preset-independent and gated per call an
   separate kernels would not do) and in addition sum each row in the layout of MLX's own contiguous row reduction
   (`row_reduce_simple`: C/4 threads, 4 consecutive values each), so at the model widths (3072, and 128 in the tests)
   they are bitwise equal to the native block pieces on MLX 0.31.1 (`tests/test_kernels.py`; a 60-chunk rollout is
-  bitwise fused vs unfused in `tests/test_runtime.py`). Port-only: the fused path requires bfloat16 modulation and
+  bitwise fused vs unfused in `tests/test_runtime.py`). Upstream's Triton kernels differ from its unfused block in
+  the summation order inside a row reduction; here that difference is not used at the model widths, and at other
+  widths (or with another MLX version whose row reduction is dispatched differently) the summation order is the only
+  possible difference. Port-only: the fused path requires bfloat16 modulation and
   norm weights, an affine `norm3` and RMS q/k norms (`ValueError` otherwise, checked before any cache is planned);
   `*_row` argument names (upstream `*_k`); no stride arguments (MLX makes kernel inputs row-contiguous).
 - `ring-fused` steady-window graph: upstream's `CastleRuntime.prime` / `graph` / `clear` names and its "one
@@ -593,7 +746,10 @@ so the gap is the DiT's alone, which is preset-independent and gated per call an
   function is keyed on the model, shapes, sink mode and write spans (not buffer addresses), takes every KV / text
   cache tensor as an input and returns the updated K/V, and reads the block weights as implicit inputs. Compilation
   keeps the traced arithmetic (the fused kernels and SDPA are opaque to it): a 60-chunk rollout is bitwise compiled
-  vs eager (`tests/test_runtime.py`). `CastleStream` calls `prime` before gameplay and `clear` on `close()`, as
+  vs eager (`tests/test_runtime.py`), and on real castle weights three steady positions x (denoise + cache update)
+  give bitwise equal predictions and K/V (compiled vs eager). `mx.compile` on MLX 0.31.1 is not bitwise for every op
+  (a division by a non-power-of-two constant, `mean()`; see `--t5-runtime graph` below), so the DiT graph's
+  equality is a measured result, not assumed. `CastleStream` calls `prime` before gameplay and `clear` on `close()`, as
   upstream; the warm-up (one DiT call plus the trace) is part of stream creation.
 - `ring-fused` memoizes the timestep-embedding MLP per timestep value (`CastleRuntime.time_embedding`, port
   addition): the float64-accumulated MLP runs on the MLX CPU stream and every block waits for it, while a stream
