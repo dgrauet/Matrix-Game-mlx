@@ -1,6 +1,7 @@
 """Measure one online configuration (not collected by pytest): chunk time, model_fps, online_fps, memory, swap.
 
     python3 -m tests.measure_serve --scene castle --preset realtime --fps 24 --chunks 30 [--browser] [--prompt-mode dynamic]
+        [--dit-runtime native|ring-fused]
 
 Starts MediaMTX and `serve` through tests.serve_process.serve, drives a session until `--chunks` chunks were produced
 (an HTTP client as in the e2e tests, or with `--browser` a headless Chromium page that also reports what a player
@@ -157,12 +158,15 @@ def main():
     parser.add_argument("--fps", type=int, required=True)
     parser.add_argument("--chunks", type=int, default=30)
     parser.add_argument("--prompt-mode")
+    parser.add_argument("--dit-runtime", choices=("native", "ring-fused"), help="passed to serve (default: the preset's)")
     parser.add_argument("--browser", action="store_true", help="a headless Chromium page plays and is sampled")
     parser.add_argument("--timeout", type=float, default=1800.0)
     options = parser.parse_args()
     args = ["--scene", options.scene, "--preset", options.preset, "--fps", str(options.fps), "--profile-chunks"]
     if options.prompt_mode == "dynamic":
         args += ["--prompt-mode", "dynamic", "--prompt-interval-chunks", "1"]
+    if options.dit_runtime:
+        args += ["--dit-runtime", options.dit_runtime]
     controls = racing_controls if options.scene == "racing" else shooter_controls
     runtime = Path(tempfile.mkdtemp(prefix="measure-serve-"))
     failure, result = None, {"session": None, "first_frame_s": float("nan")}
@@ -179,6 +183,7 @@ def main():
     times = [row["processing_ms"] for row in rows[2:]]
     late = [row["processing_ms"] for row in rows[-4:]]
     out = {"scene": options.scene, "preset": options.preset, "fps": options.fps, "prompt_mode": options.prompt_mode,
+           "dit_runtime": report.get("dit_runtime"),
            "browser": options.browser, "chunks": report["chunk"] + 1, "frames": report["frames"],
            "first_frame_s": round(result["first_frame_s"], 1),
            "chunk_ms_median": round(statistics.median(times)), "chunk_ms_max": round(max(times)), "chunk_ms_last4": round(statistics.mean(late)),
