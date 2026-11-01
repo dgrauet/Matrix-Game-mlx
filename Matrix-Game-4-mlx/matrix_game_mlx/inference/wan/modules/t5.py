@@ -43,7 +43,15 @@ class T5LayerNorm(nn.Module):
         self.weight = mx.ones(dim)
 
     def __call__(self, x: mx.array) -> mx.array:
-        variance = (x.astype(mx.float32) ** 2).mean(axis=-1, keepdims=True)
+        # sum / dim, not mean(): mx.compile fuses mean()'s 1/n scale into the reduction and sums in another order
+        # (CaptionEncoder graph=True); sum / dim compiles bitwise and, only when dim is a power of two (umT5: 4096,
+        # 1/dim exact), is bitwise the eager mean(). Any other width keeps mean(), so native values never change
+        # (tests/test_caption_encoder.py).
+        squares = x.astype(mx.float32) ** 2
+        if self.dim & (self.dim - 1) == 0:
+            variance = squares.sum(axis=-1, keepdims=True) / self.dim
+        else:
+            variance = squares.mean(axis=-1, keepdims=True)
         x = x * mx.rsqrt(variance + self.eps)
         if self.weight.dtype in [mx.float16, mx.bfloat16]:
             x = x.astype(self.weight.dtype)
@@ -220,10 +228,28 @@ class T5RelativeEmbedding(nn.Module):
 
         # layers
         self.embedding = nn.Embedding(num_buckets, num_heads)
+        # Evaluated bucket indices per (lq, lk), outside the module tree (not a parameter, not a graph input).
+        object.__setattr__(self, "_bucket_cache", {})
+
+    def buckets(self, lq: int, lk: int) -> mx.array:
+        """Bucket indices for (lq, lk), computed eagerly once and kept (port addition).
+
+        They depend only on the lengths, so they are evaluated here even while a compiled caller is being traced:
+        compiled, the bucket formula's division by log(max_dist / max_exact) rounds differently and lands one bucket
+        lower at relative distances 16/32/64, which a compiled T5 (CaptionEncoder graph=True) must not do. The values
+        are the eager ones, as before.
+        """
+        key = (lq, lk)
+        if key not in self._bucket_cache:
+            rel_pos = mx.arange(lk).reshape(1, -1) - mx.arange(lq).reshape(-1, 1)
+            buckets = self._relative_position_bucket(rel_pos)
+            mx.eval(buckets)
+            self._bucket_cache.clear()
+            self._bucket_cache[key] = buckets
+        return self._bucket_cache[key]
 
     def __call__(self, lq: int, lk: int) -> mx.array:
-        rel_pos = mx.arange(lk).reshape(1, -1) - mx.arange(lq).reshape(-1, 1)
-        rel_pos = self._relative_position_bucket(rel_pos)
+        rel_pos = self.buckets(lq, lk)
         rel_pos_embeds = self.embedding(rel_pos)
         # [Lq, Lk, N] -> [N, Lq, Lk] -> [1, N, Lq, Lk]
         rel_pos_embeds = mx.transpose(rel_pos_embeds, axes=(2, 0, 1))

@@ -67,10 +67,8 @@ def _reject_unsupported(args):
                              f"(set {WEIGHTS_ENV} to use a local MLX pack)")
     if args.preset in OPTIMIZED_RUNTIMES:
         raise ValueError(f"--preset {args.preset} is CUDA-only")
-    if args.dit_runtime not in (None, "native"):
-        raise ValueError(f"--dit-runtime {args.dit_runtime} is CUDA-only; the MLX port runs native only")
-    if args.vae_graph:
-        raise ValueError("--vae-graph is CUDA-only (CUDA graphs); not available on MLX")
+    if args.dit_runtime not in (None, "native", "ring-fused"):
+        raise ValueError(f"--dit-runtime {args.dit_runtime} is CUDA-only; the MLX port runs native or ring-fused")
 
 
 def resolve_model_arguments(args, require_model=True):
@@ -86,10 +84,13 @@ def resolve_model_arguments(args, require_model=True):
         raise ValueError("Prompt interval must be 1..1024 chunks")
     realtime = args.preset == "realtime"
     args.vae_backend = args.vae_backend or ("taehv" if realtime else "wan")
-    args.dit_runtime = "native"
+    args.dit_runtime = args.dit_runtime or ("ring-fused" if realtime else "native")
     args.steps = args.steps or ((1000,) if realtime else (1000, 500))
     args.first_steps = args.first_steps or args.steps
-    args.vae_graph = False
+    if args.vae_graph is None:
+        args.vae_graph = realtime and args.vae_backend == "taehv"
+    if args.vae_graph and args.vae_backend != "taehv":
+        raise ValueError("VAE graph requires TAEHV")
     if require_model:
         files = []
         if explicit_sink is not None:

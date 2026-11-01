@@ -1,6 +1,7 @@
 """Model ownership shared by offline inference (MLX port of matrix_game/inference/loader.py)."""
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Dict
@@ -10,6 +11,7 @@ from huggingface_hub import hf_hub_download, snapshot_download
 PACK_REPO_ID = "dgrauet/matrix-game-4.0-mlx"
 WEIGHTS_ENV = "MATRIX_GAME_4_MLX_WEIGHTS_DIR"
 PACK_REVISION = "327ce1f7ae729224ba37b0326fbf0eb4f79e0503"
+LOG = logging.getLogger(__name__)
 
 
 def pack_dir(components=None) -> Path:
@@ -106,9 +108,16 @@ class ModelComponents:
         gc.collect()
         mx.clear_cache()
         self.gen = build_dit(self.pack, self.component, timestep_shift=inference["scheduler_shift"])
+        from matrix_game_mlx.inference.runtime import install_runtime
+        if args.dit_runtime.startswith("ring"):
+            LOG.warning("Ring/fused runtime changes floating-point reduction order; use native for baseline comparisons")
+        install_runtime(self.gen, args.dit_runtime)
         if taehv:
             from matrix_game_mlx.inference.taehv import TAEHV
             self.vae = TAEHV.from_pack(self.pack / "taehv.safetensors", dtype=mx.bfloat16)
+            if getattr(args, "vae_graph", False):
+                from matrix_game_mlx.inference.vae_graph import StreamingVAEGraph
+                self.vae = StreamingVAEGraph(self.vae)
         else:
             from matrix_game_mlx.inference.wrappers import WanVAE22Wrapper
             self.vae = WanVAE22Wrapper(str(shared["vae.safetensors"]), dtype=mx.bfloat16)
@@ -125,6 +134,14 @@ class ModelComponents:
                             sink_latent=self.sink_latent, sink_mode=self.args.sink_mode,
                             sink_rope_mode=self.args.sink_rope_mode, **kwargs)
 
+    def dit_runtime(self) -> str:
+        """The DiT runtime in use: the installed one once loaded, else the resolved `--dit-runtime`."""
+        model = getattr(self.gen, "model", None)
+        if model is None:
+            return self.args.dit_runtime
+        runtime = getattr(model, "castle_runtime", None)
+        return "native" if runtime is None else runtime.mode
+
     def config(self):
         from matrix_game_mlx.scenes import SCENES
         a = self.args
@@ -135,9 +152,10 @@ class ModelComponents:
                     sink_image=a.sink_image.name if a.sink_image is not None else None, sink_sha256=self.sink_sha256,
                     prompt=a.prompt, hq_first_frame=a.sink_mode == "first_frame" and a.sink_image is not None,
                     prompt_mode=a.prompt_mode, prompt_interval_chunks=a.prompt_interval_chunks,
-                    t5_runtime=a.t5_runtime, dit_parallel="single", dit_runtime=a.dit_runtime,
-                    attention_backend=self.attention_backend, vae_graph=False,
+                    t5_runtime=a.t5_runtime, dit_parallel="single", dit_runtime=self.dit_runtime(),
+                    attention_backend=self.attention_backend, vae_graph=getattr(a, "vae_graph", False),
                     early_publish=getattr(a, "early_publish", False),
                     profile_chunks=getattr(a, "profile_chunks", False),
-                    reference_pipeline=getattr(a, "reference_pipeline", "stream"), experimental_runtime=False,
+                    reference_pipeline=getattr(a, "reference_pipeline", "stream"),
+                    experimental_runtime=self.dit_runtime().startswith("ring"),
                     preset=a.preset, component=self.component)

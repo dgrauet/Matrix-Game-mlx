@@ -22,11 +22,13 @@ def fake_pack(tmp_path, monkeypatch):
     return pack
 
 
-@pytest.mark.parametrize("preset,backend,steps", [
-    ("quality", "wan", (1000, 500)), ("baseline", "wan", (1000, 500)), ("realtime", "taehv", (1000,))])
-def test_preset_resolution_matches_upstream(preset, backend, steps):
+@pytest.mark.parametrize("preset,backend,steps,runtime", [
+    ("quality", "wan", (1000, 500), "native"), ("baseline", "wan", (1000, 500), "native"),
+    ("realtime", "taehv", (1000,), "ring-fused")])
+def test_preset_resolution_matches_upstream(preset, backend, steps, runtime):
     a = model_args("castle", preset)
-    assert (a.vae_backend, a.steps, a.first_steps, a.dit_runtime, a.vae_graph) == (backend, steps, steps, "native", False)
+    graph = preset == "realtime"                         # upstream: realtime + TAEHV defaults to the VAE graph
+    assert (a.vae_backend, a.steps, a.first_steps, a.dit_runtime, a.vae_graph) == (backend, steps, steps, runtime, graph)
 
 
 def test_steps_override_keeps_preset_codec():
@@ -42,16 +44,25 @@ def test_parse_steps_rejects(value):
         parse_steps(value)
 
 
-@pytest.mark.parametrize("argv", [
-    ["--dit-runtime", r] for r in ("kernels", "cudagraph", "ring", "ring-graph", "ring-fused", "rtx5090", "rtx5090-sage")
-] + [["--preset", "rtx5090"], ["--preset", "rtx5090-sage"], ["--vae-graph"]])
+@pytest.mark.parametrize("argv", [["--preset", "rtx5090"], ["--preset", "rtx5090-sage"]])
 def test_cuda_only_rejected(argv):
     with pytest.raises(ValueError, match="CUDA-only"):
         model_args("castle", "quality", argv)
 
 
-def test_native_runtime_passes():
-    assert model_args("castle", "quality", ["--dit-runtime", "native"]).dit_runtime == "native"
+@pytest.mark.parametrize("preset", ["quality", "realtime"])
+@pytest.mark.parametrize("runtime", ["kernels", "cudagraph", "ring", "ring-graph", "rtx5090", "rtx5090-sage"])
+def test_cuda_only_runtimes_rejected(preset, runtime):
+    with pytest.raises(ValueError) as raised:
+        model_args("castle", preset, ["--dit-runtime", runtime])
+    assert str(raised.value) == f"--dit-runtime {runtime} is CUDA-only; the MLX port runs native or ring-fused"
+
+
+@pytest.mark.parametrize("scene", list(scenes.SCENES))
+@pytest.mark.parametrize("preset", ["quality", "baseline", "realtime"])
+@pytest.mark.parametrize("runtime", ["native", "ring-fused"])
+def test_mlx_runtimes_pass(scene, preset, runtime):
+    assert model_args(scene, preset, ["--dit-runtime", runtime]).dit_runtime == runtime
 
 
 @pytest.mark.parametrize("flag", ["--model-dir", "--checkpoint", "--taehv-path"])
@@ -93,3 +104,11 @@ def test_missing_resources_only_with_local_pack(tmp_path, monkeypatch, fake_pack
         model_args("castle", "quality", require_model=True)
     with pytest.raises(FileNotFoundError, match="^Missing resources:"):
         model_args("castle", "realtime", ["--sink-image", str(tmp_path / "nope.png")], require_model=True)
+
+
+def test_vae_graph_resolution_matches_upstream():
+    assert model_args("castle", "realtime", ["--no-vae-graph"]).vae_graph is False
+    assert model_args("castle", "realtime", ["--vae-backend", "wan"]).vae_graph is False
+    assert model_args("castle", "quality", ["--vae-backend", "taehv", "--vae-graph"]).vae_graph is True
+    with pytest.raises(ValueError, match="VAE graph requires TAEHV"):
+        model_args("castle", "quality", ["--vae-graph"])

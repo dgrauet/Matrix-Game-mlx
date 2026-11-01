@@ -11,6 +11,7 @@ from matrix_game_mlx.inference.stream import CastleStream, LATENT_SHAPE
 def _bare_stream(index=0, frame=0, max_latents=8):
     s = CastleStream.__new__(CastleStream)
     s.closed, s.failed, s.index, s.frame, s.max_latents, s.shape = False, False, index, frame, max_latents, LATENT_SHAPE
+    s.gen = None                                                   # no generator, hence no DiT runtime to clear
     return s
 
 
@@ -161,6 +162,55 @@ def test_profile_timing_keys():
     assert tuple(early.timings_ms) == ("encode", "denoise", "decode", "pack_copy", "clean_kv")
     assert all(v >= 0 for c in (plain, early) for v in c.timings_ms.values())
     assert _run_pushes(_taehv_stream(), (1,))[0].timings_ms == {}
+
+
+class _FakeRuntime:
+    """Records the stream's runtime hooks (upstream: prime before gameplay, clear on close)."""
+
+    def __init__(self):
+        self.events = []
+
+    def prime(self, generator, prompt, shape, kv, xc, fsl, sink_rope_mode="fixed"):
+        self.events.append(("prime", generator, shape, len(kv), len(xc), fsl, sink_rope_mode))
+
+    def clear(self):
+        self.events.append(("clear",))
+
+
+def test_stream_primes_runtime_and_clears_it_on_close():
+    gen = _FakeGenerator()
+    gen.model.castle_runtime = runtime = _FakeRuntime()
+    stream = _taehv_stream(gen, sink_rope_mode="absolute")
+    assert runtime.events == [("prime", gen, LATENT_SHAPE, 1, 1, stream.fsl, "absolute")] and not gen.calls
+    _run_pushes(stream, (1,))
+    stream.close()
+    stream.close()
+    assert runtime.events[1:] == [("clear",)]                    # a new stream on the same model starts clean
+
+
+def test_stream_primes_taehv_graph_after_clearing():
+    """As upstream: a TAEHV stream clears the codec state, then primes the VAE graph when the VAE has one."""
+    vae, events = _taehv(), []
+    vae.clear_cache = lambda: events.append("clear")
+    vae.prime = lambda: events.append("prime")
+    CastleStream(_FakeGenerator(), vae, mx.zeros((1, 2, 4)), vae_backend="taehv", steps=(1000,), first_steps=(1000,))
+    assert events == ["clear", "prime"]
+
+
+def test_validate_rejects_bad_pixels_and_noise():
+    s = _bare_stream()
+    for bad in (mx.full((1, 3, 480, 864), -1.5), mx.full((1, 3, 480, 864), float("nan")),
+                mx.full((1, 3, 480, 864), float("inf")), mx.zeros((1, 3, 480, 864), mx.int32)):
+        with pytest.raises(ValueError, match=r"\[-1,1\]"):
+            s._validate(bad, frame_start=0)
+    with pytest.raises(ValueError, match="Initial noise"):
+        s._validate(mx.zeros((1, 3, 480, 864)), frame_start=0, initial_noise=mx.full(LATENT_SHAPE, float("nan")))
+    with pytest.raises(ValueError, match="Initial noise"):
+        s._validate(mx.zeros((1, 3, 480, 864)), frame_start=0, initial_noise=mx.zeros((1, 2, 3)))
+    # Upstream's order: bad pixel values are reported before a bad noise shape.
+    with pytest.raises(ValueError, match=r"\[-1,1\]"):
+        s._validate(mx.full((1, 3, 480, 864), 2.0), frame_start=0, initial_noise=mx.zeros((1, 2, 3)))
+    assert s._validate(mx.ones((1, 3, 480, 864)), frame_start=0, initial_noise=mx.zeros(LATENT_SHAPE)) == 1
 
 
 def test_push_from_worker_thread():

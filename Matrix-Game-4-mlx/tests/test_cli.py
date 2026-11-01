@@ -32,3 +32,12 @@ def test_game_assets_manifest_is_upstream():
     mine = ROOT / "releases" / "game-assets.json"
     upstream = ROOT.parent / "Matrix-Game-4" / "releases" / "game-assets.json"
     assert hashlib.sha256(mine.read_bytes()).hexdigest() == hashlib.sha256(upstream.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("command", ["render", "serve"])
+def test_cuda_only_runtime_rejected_by_commands(command, tmp_path, capsys):
+    argv = ["--input", str(tmp_path / "x.mp4"), "--output", str(tmp_path / "out")] if command == "render" else []
+    with pytest.raises(SystemExit) as stopped:
+        main([command, "--dit-runtime", "ring-graph", *argv])
+    assert stopped.value.code == 2
+    assert "--dit-runtime ring-graph is CUDA-only; the MLX port runs native or ring-fused" in capsys.readouterr().err
