@@ -115,6 +115,9 @@ class ModelComponents:
         if taehv:
             from matrix_game_mlx.inference.taehv import TAEHV
             self.vae = TAEHV.from_pack(self.pack / "taehv.safetensors", dtype=mx.bfloat16)
+            if getattr(args, "vae_graph", False):
+                from matrix_game_mlx.inference.vae_graph import StreamingVAEGraph
+                self.vae = StreamingVAEGraph(self.vae)
         else:
             from matrix_game_mlx.inference.wrappers import WanVAE22Wrapper
             self.vae = WanVAE22Wrapper(str(shared["vae.safetensors"]), dtype=mx.bfloat16)
@@ -150,7 +153,7 @@ class ModelComponents:
                     prompt=a.prompt, hq_first_frame=a.sink_mode == "first_frame" and a.sink_image is not None,
                     prompt_mode=a.prompt_mode, prompt_interval_chunks=a.prompt_interval_chunks,
                     t5_runtime=a.t5_runtime, dit_parallel="single", dit_runtime=self.dit_runtime(),
-                    attention_backend=self.attention_backend, vae_graph=False,
+                    attention_backend=self.attention_backend, vae_graph=getattr(a, "vae_graph", False),
                     early_publish=getattr(a, "early_publish", False),
                     profile_chunks=getattr(a, "profile_chunks", False),
                     reference_pipeline=getattr(a, "reference_pipeline", "stream"),

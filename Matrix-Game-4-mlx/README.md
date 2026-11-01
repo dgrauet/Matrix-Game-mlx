@@ -53,8 +53,7 @@ The offline default preset is `quality`, as upstream's offline renderer. Weights
 | `--dit-runtime {native,ring-fused}` | Supported on every preset; default from the preset as upstream (`ring-fused` for realtime, `native` otherwise). `ring-fused` is the Apple fast path (ring KV cache, GPU RoPE kernel, fused block-glue kernels); see Known deviations |
 | `--dit-runtime` other values (`kernels`, `cudagraph`, `ring`, `ring-graph`, `rtx5090`, `rtx5090-sage`) | Rejected: CUDA-only; the MLX port runs `native` or `ring-fused` |
 | `--steps`, `--first-steps` | Supported (comma-separated timesteps, strictly decreasing from 1000) |
-| `--vae-graph` | Rejected: CUDA graphs, not available on MLX |
-| `--no-vae-graph` | Accepted, no effect (VAE graphs are never used on MLX) |
+| `--vae-graph`, `--no-vae-graph` | Supported; default on for realtime + TAEHV, as upstream (`VAE graph requires TAEHV` otherwise). The streaming TAEHV encoder/decoder run as `mx.compile`d graphs instead of CUDA graphs, bitwise eager (see Known deviations) |
 | `--prompt-mode {fixed,dynamic}`, `--prompt`, `--prompt-interval-chunks` | Supported; dynamic is racing only (see below) |
 | `--captions FILE` | Supported, dynamic mode only (required there) |
 | `--t5-runtime {native,graph}` | Supported (default `graph`, as upstream); `graph` runs the dynamic-caption encoder as one `mx.compile`d graph instead of a CUDA graph, bitwise `native` (see Known deviations) |
@@ -612,7 +611,14 @@ so the gap is the DiT's alone, which is preset-independent and gated per call an
   its variance as `sum / dim` instead of `mean()` (compiled, mean's 1/n scale is fused into the reduction, which
   then sums in another order; with dim 4096 a power of two, `sum / dim` is bitwise the eager `mean()`).
   Measured: −21 ms (−1.3 %) per caption encode, 1515 vs 1535 ms (M2 Pro, T5 alone).
-- No CUDA VAE graph (`vae_graph`): it only captures the same TAEHV ops.
+- `--vae-graph` (`inference/vae_graph.py`: upstream's `StreamingVAEGraph`, `StatefulGraph`, `prime`,
+  `encoder_graph` / `decoder_graph`, `replays`): each steady streaming chunk (4-frame encode, 1-latent decode)
+  replays one `mx.compile`d function instead of a CUDA graph. The retained MemBlock state is passed in and
+  returned (MLX arrays are immutable: no persistent buffers to copy), the TAEHV weights are implicit inputs, and the
+  first chunk of a stream runs the eager adapter, as upstream. Bitwise eager (random bf16 weights in
+  `tests/test_taehv.py`, the real pack in Task 8's probe); upstream's CUDA / no-grad checks do not apply.
+  `CastleStream` primes it at stream creation, as upstream. Measured: −15 ms per chunk (encode 46 -> 39 ms,
+  decode 79 -> 71 ms, castle realtime on M2 Pro).
 - TAEHV convs accumulate in float32 and round once to bf16 (see Numerics).
 - `serve`: the macOS port changes listed under "Online play on macOS" (sidecar interpreter, Apple software renderer, startup deadline, `gpu_` timing keys, no torch).
 

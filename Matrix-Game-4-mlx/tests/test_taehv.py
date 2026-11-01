@@ -269,3 +269,63 @@ def test_real_decoder8_bf16_conv_matches_torch_bf16():
     assert got.dtype == mx.bfloat16
     err = rel_l2(np.array(got.astype(mx.float32)).transpose(0, 3, 1, 2), want)
     assert err < 1e-3, err
+
+
+@pytest.fixture
+def bf16_adapter(ref):
+    m = mt.TAEHV("taew2_2.pth", dtype=mx.float32, load=False)
+    m.core.load_weights(list(_convert(ref.state_dict()).items()), strict=True)
+    m.core.set_dtype(mx.bfloat16)
+    return m
+
+
+GH, GW = 480, 864                                              # the graphs are primed at the stream frame size
+
+
+def _stream_chunks(vae, seed=8, chunks=4):
+    """Encode then decode 1 + 4k frames chunk by chunk, as CastleStream does."""
+    rng = np.random.RandomState(seed)
+    out = []
+    for i in range(chunks):
+        x = mx.array(rng.uniform(-1, 1, (1, 3, 1 if i == 0 else 4, GH, GW)).astype(np.float32)).astype(mx.bfloat16)
+        latent = vae.encode_stream(x)
+        out.append((latent, vae.decode_stream(latent)))
+    return out
+
+
+def test_vae_graph_streams_bitwise_eager(bf16_adapter):
+    """--vae-graph (upstream StreamingVAEGraph, CUDA graphs) on mx.compile: after prime, the first chunk runs the
+    base adapter and every later chunk replays one compiled encoder and one compiled decoder graph; latents, frames
+    and retained state are bitwise the eager adapter's."""
+    from matrix_game_mlx.inference.vae_graph import StreamingVAEGraph
+    base = bf16_adapter
+    base.clear_cache()
+    want = _stream_chunks(base)
+    base.clear_cache()
+    graph = StreamingVAEGraph(base)
+    graph.clear_cache()
+    graph.prime()
+    assert graph.encoder_graph is not None and graph.decoder_graph is not None
+    assert (graph.encoder_graph.replays, graph.decoder_graph.replays) == (1, 1)      # prime's second chunk
+    got = _stream_chunks(graph)
+    for (lw, dw), (lg, dg) in zip(want, got):
+        assert lg.dtype == lw.dtype and mx.array_equal(lg, lw) and mx.array_equal(dg, dw)
+    assert (graph.encoder_graph.replays, graph.decoder_graph.replays) == (4, 4)
+    assert graph.dtype == base.dtype and graph.base is base
+
+
+def test_vae_graph_rejects_other_signatures(bf16_adapter):
+    from matrix_game_mlx.inference.vae_graph import StreamingVAEGraph
+    graph = StreamingVAEGraph(bf16_adapter)
+    graph.clear_cache()
+    graph.prime()
+    with pytest.raises(ValueError, match="batch1/chunk1"):
+        graph.encode_stream(mx.zeros((1, 3, 4, GH, GW), mx.bfloat16))                    # a new stream starts with 1
+    graph.encode_stream(mx.zeros((1, 3, 1, GH, GW), mx.bfloat16))
+    with pytest.raises(ValueError, match="batch1/chunk1"):
+        graph.encode_stream(mx.zeros((1, 3, 8, GH, GW), mx.bfloat16))
+    with pytest.raises(ValueError, match="batch1/chunk1"):
+        graph.decode_stream(mx.zeros((1, 48, 2, GH // 16, GW // 16), mx.bfloat16))
+    graph.decode_stream(mx.zeros((1, 48, 1, GH // 16, GW // 16), mx.bfloat16))
+    with pytest.raises(ValueError, match="VAE graph signature changed"):
+        graph.decode_stream(mx.zeros((1, 48, 1, GH // 16, GW // 8), mx.bfloat16))

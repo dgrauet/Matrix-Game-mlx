@@ -229,3 +229,10 @@ def test_preset_resolution(tmp_path, monkeypatch, preset, steps, backend):
     cfg = components.config()
     assert components.args.steps == steps and cfg["steps"] == list(steps) and cfg["first_steps"] == list(steps)
     assert cfg["vae_backend"] == backend and cfg["preset"] == preset and cfg["component"] == "dit_castle"
+
+
+def test_config_reports_vae_graph(tmp_path, monkeypatch):
+    from matrix_game_mlx.scenes import model_args
+    pack = _scene_pack(tmp_path, monkeypatch)
+    assert loader.ModelComponents(model_args("castle", "realtime"), pack=pack).config()["vae_graph"] is True
+    assert loader.ModelComponents(model_args("castle", "realtime", ["--no-vae-graph"]), pack=pack).config()["vae_graph"] is False

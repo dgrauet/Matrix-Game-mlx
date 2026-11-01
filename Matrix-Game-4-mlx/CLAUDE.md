@@ -52,7 +52,8 @@ wrapper-level APIs keep upstream shapes `[B, F, C, h, w]`.
 - float64 islands run on the MLX CPU stream instead of the GPU
 - KV-cache end indices are Python ints instead of 1-element tensors
 - Test-only `renoise` argument on `CastleStream.push`
-- `--dit-runtime ring-fused` (realtime default, as upstream) is the MLX ring-KV + GPU-RoPE + fused-kernel runtime (`inference/runtime.py`, `inference/kernels.py`): no CUDA graphs/varlen, bf16 caches/modulation required, all layers validated before planning; one `mx.compile`d steady-window graph per session instead of a CUDA graph (`prime` at stream creation, `clear` on close, bitwise eager), timestep-MLP memo per t value; the fused Metal kernels (`ln_modulate`, `gate_ln_affine`, `gate_residual`, plus port-only `rms_norm` and compiled `gelu_tanh`) reproduce native rounding and MLX's row-reduction order at the model widths (bitwise native), so it differs from `native` only by SDPA key order (ring). No CUDA VAE graph (`vae_graph`)
+- `--dit-runtime ring-fused` (realtime default, as upstream) is the MLX ring-KV + GPU-RoPE + fused-kernel runtime (`inference/runtime.py`, `inference/kernels.py`): no CUDA graphs/varlen, bf16 caches/modulation required, all layers validated before planning; one `mx.compile`d steady-window graph per session instead of a CUDA graph (`prime` at stream creation, `clear` on close, bitwise eager), timestep-MLP memo per t value; the fused Metal kernels (`ln_modulate`, `gate_ln_affine`, `gate_residual`, plus port-only `rms_norm` and compiled `gelu_tanh`) reproduce native rounding and MLX's row-reduction order at the model widths (bitwise native), so it differs from `native` only by SDPA key order (ring)
+- `--vae-graph` (default on for realtime + TAEHV, as upstream): `inference/vae_graph.py` `StreamingVAEGraph` replays one `mx.compile`d steady encoder chunk and decoder latent (state in, state out; first chunk eager; primed at stream creation), bitwise eager
 - `--t5-runtime graph` (default): `CaptionEncoder` runs T5 as one `mx.compile`d graph (upstream: CUDA graph), bitwise native; it relies on two t5.py port edits (relative-position buckets computed eagerly and cached, `T5LayerNorm` variance as `sum / dim`), since compiled division and fused mean() differ from eager
 - TAEHV convs accumulate in float32 and round once to bf16 (torch semantics)
 
@@ -94,6 +95,7 @@ matrix_game_mlx/
     wrappers.py                  # WanDiffusionWrapper (flow -> x0 in float64), WanTextEncoder, WanVAE22Wrapper, KV caches
     decoder.py                   # incremental Wan VAE decoding with persistent causal features
     taehv.py                     # TAEHV encode/decode (realtime codec), float32-accumulating convs
+    vae_graph.py                 # --vae-graph: StreamingVAEGraph (compiled steady TAEHV encode/decode, prime)
     scheduler.py                 # flow-matching scheduler, bitwise torch.linspace sigma grid
     rollout.py                   # warp_steps, set_attention_window
     runtime.py                   # --dit-runtime ring-fused: plan_cache (ring KV), to/from_linear, run_blocks, CastleRuntime (compiled steady graph, prime/clear), install_runtime
@@ -159,7 +161,7 @@ installed for Homebrew Python 3.14)
 
 - The games are upstream's native games, built and used as is (README "City racing on macOS", "Online play on macOS")
 - `rtx5090*` files
-- The CUDA DiT runtimes (`kernels`, `cudagraph`, `ring`, `ring-graph`; the port has `ring-fused` on MLX) and the CUDA VAE graph
+- The CUDA DiT runtimes (`kernels`, `cudagraph`, `ring`, `ring-graph`; the port has `ring-fused` on MLX); the CUDA VAE graph is replaced by `mx.compile` (`vae_graph.py`)
 - Training branches (teacher forcing, ctx slots, kv_mem, kv_capture, flex_attention masks,
   sequence parallel)
 

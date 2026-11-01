@@ -106,6 +106,8 @@ class CastleStream:
             self.decoder = IncrementalDecoder(vae)
         else:
             vae.clear_cache()
+            if hasattr(vae, "prime"):
+                vae.prime()
         runtime = getattr(getattr(generator, "model", None), "castle_runtime", None)
         if runtime is not None:
             runtime.prime(generator, self.prompt, self.shape, self.kv, self.xc, self.fsl, sink_rope_mode)

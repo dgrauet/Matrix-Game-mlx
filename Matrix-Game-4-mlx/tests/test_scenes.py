@@ -27,7 +27,8 @@ def fake_pack(tmp_path, monkeypatch):
     ("realtime", "taehv", (1000,), "ring-fused")])
 def test_preset_resolution_matches_upstream(preset, backend, steps, runtime):
     a = model_args("castle", preset)
-    assert (a.vae_backend, a.steps, a.first_steps, a.dit_runtime, a.vae_graph) == (backend, steps, steps, runtime, False)
+    graph = preset == "realtime"                         # upstream: realtime + TAEHV defaults to the VAE graph
+    assert (a.vae_backend, a.steps, a.first_steps, a.dit_runtime, a.vae_graph) == (backend, steps, steps, runtime, graph)
 
 
 def test_steps_override_keeps_preset_codec():
@@ -43,7 +44,7 @@ def test_parse_steps_rejects(value):
         parse_steps(value)
 
 
-@pytest.mark.parametrize("argv", [["--preset", "rtx5090"], ["--preset", "rtx5090-sage"], ["--vae-graph"]])
+@pytest.mark.parametrize("argv", [["--preset", "rtx5090"], ["--preset", "rtx5090-sage"]])
 def test_cuda_only_rejected(argv):
     with pytest.raises(ValueError, match="CUDA-only"):
         model_args("castle", "quality", argv)
@@ -103,3 +104,11 @@ def test_missing_resources_only_with_local_pack(tmp_path, monkeypatch, fake_pack
         model_args("castle", "quality", require_model=True)
     with pytest.raises(FileNotFoundError, match="^Missing resources:"):
         model_args("castle", "realtime", ["--sink-image", str(tmp_path / "nope.png")], require_model=True)
+
+
+def test_vae_graph_resolution_matches_upstream():
+    assert model_args("castle", "realtime", ["--no-vae-graph"]).vae_graph is False
+    assert model_args("castle", "realtime", ["--vae-backend", "wan"]).vae_graph is False
+    assert model_args("castle", "quality", ["--vae-backend", "taehv", "--vae-graph"]).vae_graph is True
+    with pytest.raises(ValueError, match="VAE graph requires TAEHV"):
+        model_args("castle", "quality", ["--vae-graph"])

@@ -188,6 +188,15 @@ def test_stream_primes_runtime_and_clears_it_on_close():
     assert runtime.events[1:] == [("clear",)]                    # a new stream on the same model starts clean
 
 
+def test_stream_primes_taehv_graph_after_clearing():
+    """As upstream: a TAEHV stream clears the codec state, then primes the VAE graph when the VAE has one."""
+    vae, events = _taehv(), []
+    vae.clear_cache = lambda: events.append("clear")
+    vae.prime = lambda: events.append("prime")
+    CastleStream(_FakeGenerator(), vae, mx.zeros((1, 2, 4)), vae_backend="taehv", steps=(1000,), first_steps=(1000,))
+    assert events == ["clear", "prime"]
+
+
 def test_validate_rejects_bad_pixels_and_noise():
     s = _bare_stream()
     for bad in (mx.full((1, 3, 480, 864), -1.5), mx.full((1, 3, 480, 864), float("nan")),
