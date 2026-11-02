@@ -42,6 +42,13 @@ float64 on the GPU): RoPE tables and complex product, timestep sinusoid and time
 flow-to-x0. A float32 GEMM or attention kernel in a smeltr op summary is a leak; the CPU-stream float64
 work is intended.
 
+Exception, port-only: `--dit-runtime apple` / `apple-fast` (and `--preset apple` / `apple-fast`) run the DiT in
+float16 (weights converted from the bf16 pack at load, one tensor at a time, so two DiT copies never coexist;
+activations, modulation, self- and cross-attention K/V caches in fp16). Every precision island above stays as is
+(fp32 norm statistics, opmath SiLU / tanh-GELU, float64 timestep MLP and flow-to-x0, RoPE as a float64 rotation
+rounded once to fp16). T5 and TAEHV stay bf16: the DiT casts the bf16 prompt embeddings and the bf16 control latent
+to fp16 where it consumes them, and the stream casts the fp16 pred to the VAE dtype (bf16) before decode.
+
 ### Layout
 
 Channels-last internally (`[F, H, W, C]` per sample in the DiT, `[B, T, H, W, C]` in the VAE);
@@ -52,12 +59,13 @@ wrapper-level APIs keep upstream shapes `[B, F, C, h, w]`.
 - float64 islands run on the MLX CPU stream instead of the GPU
 - KV-cache end indices are Python ints instead of 1-element tensors
 - Test-only `renoise` argument on `CastleStream.push`
-- `--dit-runtime ring-fused` (realtime default, as upstream; `native` stays the reference on every preset) is the MLX ring-KV + GPU-RoPE + fused-kernel runtime (`inference/runtime.py`, `inference/kernels.py`): no CUDA graphs/varlen, bf16 caches/modulation required, all layers validated before planning; one `mx.compile`d steady-window graph per session instead of a CUDA graph (`prime` at stream creation, `clear` on close, upstream's `use_graph` flag, bitwise eager), port-only timestep-MLP memo per t value (`time_memo`); the fused Metal kernels (`ln_modulate`, `gate_ln_affine`, `gate_residual`, plus port-only `rms_norm` and compiled `gelu_tanh`) reproduce native rounding and MLX's row-reduction order at the model widths (bitwise native), so it differs from `native` only by SDPA key order (ring), the reduction-order change upstream documents for its fast runtimes ("Keep `native` for reference checks."); on the parity fixtures (all pre-window but the teacher-forced `--long` chunk 22) only the chunk-22 per-call metrics differ, within the unchanged gates; free running past the window the streams diverge (`tests/compare_runtimes.py`, 48 chunks, chunks 21-47: castle pred rel L2 median/max 0.47/0.62, decoded PSNR min 16.1 dB; racing 0.072/0.14, 31.1 dB), as much as a one-8-bit-level input change on `native` does
-- RoPE under `ring-fused` is a Metal kernel (`rope_kernel.py`, upstream: Triton): float64 bits in a uint64 table, float64 product emulated in 64-bit integer soft-float, rounded as MLX's CPU float64 -> bf16 cast (via float32); bitwise the CPU float64 path; the fixed-sink re-RoPE uses `build_causal_rope_rotations(..., position - window)` as upstream (`build_rope_rotations_frames` is a test-only helper)
-- Fused kernels: upstream's Triton kernels differ from the unfused block by row-reduction summation order; ours copy MLX's `row_reduce_simple` layout and are bitwise at the model widths on MLX 0.31.1 (summation order is the only possible difference elsewhere)
+- `--dit-runtime ring-fused` (realtime default, as upstream; `native` stays the reference on every preset) is the MLX ring-KV + GPU-RoPE + fused-kernel runtime (`inference/runtime.py`, `inference/kernels.py`): no CUDA graphs/varlen, caches/modulation in the runtime's dtype required (bf16 for `ring-fused`), all layers validated before planning; one `mx.compile`d steady-window graph per session instead of a CUDA graph (`prime` at stream creation, `clear` on close, upstream's `use_graph` flag, bitwise eager), port-only timestep-MLP memo per t value (`time_memo`); the fused Metal kernels (`ln_modulate`, `gate_ln_affine`, `gate_residual`, plus port-only `rms_norm` and compiled `gelu_tanh`) reproduce native rounding and MLX's row-reduction order at the model widths (bitwise native), so it differs from `native` only by SDPA key order (ring), the reduction-order change upstream documents for its fast runtimes ("Keep `native` for reference checks."); on the parity fixtures (all pre-window but the teacher-forced `--long` chunk 22) only the chunk-22 per-call metrics differ, within the unchanged gates; free running past the window the streams diverge (`tests/compare_runtimes.py`, 48 chunks, chunks 21-47: castle pred rel L2 median/max 0.47/0.62, decoded PSNR min 16.1 dB; racing 0.072/0.14, 31.1 dB), as much as a one-8-bit-level input change on `native` does
+- RoPE under `ring-fused` / `apple*` is a Metal kernel (`rope_kernel.py`, upstream: Triton): float64 bits in a uint64 table, float64 product emulated in 64-bit integer soft-float, rounded as MLX's CPU float64 cast to the input dtype: bf16 through float32 (double rounding), fp16 once (RNE with fp16 subnormals and overflow to inf; fp16 NaN payloads kept as the CPU does); both bitwise the CPU float64 path (`tests/test_rope_kernel.py`, every finite pattern of each dtype); no float32 rotation is used; the fixed-sink re-RoPE uses `build_causal_rope_rotations(..., position - window)` as upstream (`build_rope_rotations_frames` is a test-only helper)
+- Fused kernels: upstream's Triton kernels differ from the unfused block by row-reduction summation order; ours copy MLX's `row_reduce_simple` layout and are bitwise at the model widths on MLX 0.31.1 (summation order is the only possible difference elsewhere); the `half` variants (apple runtimes) hold the same contract against the native fp16 expressions (`*_fp16` tests in `tests/test_kernels.py`); the bf16 kernels are unchanged
 - `mx.compile` replaces CUDA graphs (DiT steady window, TAEHV, T5); on MLX 0.31.1 it is not bitwise for division by a non-power-of-two constant or `mean()`, so every compiled graph is checked bitwise against eager (DiT: real castle weights, 6/6 calls, K/V equal)
 - `--vae-graph` (default on for realtime + TAEHV, as upstream): `inference/vae_graph.py` `StreamingVAEGraph` replays one `mx.compile`d steady encoder chunk and decoder latent (state in, state out; first chunk eager; primed at stream creation), bitwise eager
 - `--t5-runtime graph` (default): `CaptionEncoder` runs T5 as one `mx.compile`d graph (upstream: CUDA graph), bitwise native; it relies on two t5.py port edits (relative-position buckets computed eagerly and cached, `T5LayerNorm` variance as `sum / dim`), since compiled division and fused mean() differ from eager
+- Port-only `--preset apple` / `apple-fast` (`--dit-runtime apple` / `apple-fast` on any preset, as upstream's `rtx5090`): `RUNTIME_SPECS` in `runtime.py` (`ring-fused` bf16/21, `apple` fp16/21, `apple-fast` fp16/11), `dit_dtype(mode)` picks the DiT dtype the loader builds, `CastleStream` takes the window from the installed runtime (21 for `native`); a mismatch (apple on a bf16 DiT, bf16 caches) is a `ValueError`, never a fallback. fp16 DiT is a precision change, not only a reduction order: free running vs `native` (48 chunks, chunks 21-47) castle pred rel L2 median/max 0.59/0.65, PSNR min 16.0 dB; racing 0.47/0.57, 19.1 dB (racing's one-level perturbation baseline is 0.070/0.20, 29.0 dB, so racing ends far above it; castle's is 0.46/0.59, 17.0 dB). Window 11 (sink included): the model sees 10 history frames instead of 20 past position 11; bitwise `apple` before that. Casts: T5/TAEHV/Wan VAE stay bf16; the DiT casts prompt and control to fp16, the stream casts the sink to fp16 and the pred to the VAE dtype before decode
 - TAEHV convs accumulate in float32 and round once to bf16 (torch semantics)
 
 ## Validation Status
@@ -81,6 +89,15 @@ one process at a time).
 Measured rates and per-lever gains: README "Apple fast path" and "Measured rates" (castle realtime `serve` `--fps 4`:
 `online_fps` 0.95 native -> 1.13 ring-fused). The DiT is now ~94 % GEMM + SDPA per call; further speed at stage-1
 precision would need faster GEMM/attention kernels. Heavy runs (real weights, parity, serve) one at a time.
+
+Apple presets (`apple`, `apple-fast`, port-only, not upstream-exact): `tests/parity/test_real_weights_apple.py` (one
+scene per process, `-k castle|ancient-egypt|racing`, ~4 min and up to 22.9 GB process footprint each) gates the
+realtime fixtures' gated chunks a priori (pred rel L2 <= max(6e-2, 2 x realtime gate), PSNR >= 30 dB, control < 2e-2):
+castle chunk 0 0.0246 / 41.8 dB, egypt 0.0308 / 41.9 dB, racing chunk 0 = fp16 sink cast bitwise, chunk 1 0.0244 /
+47.8 dB; `apple-fast` bitwise `apple` on the fixtures; fp16 safety over 32 free-running chunks per scene and runtime
+(all finite, residual max 790 < 65504/16). Castle `tests.bench_dit` 32 chunks: chunk median 3358 / 2887 / 2654 ms
+(ring-fused / apple / apple-fast), MLX peak 14.86 / 14.86 / 13.37 GB. Serve `--fps 4` no browser: castle
+`online_fps` 1.13 / 1.25 / 1.43 at 16.2 / 16.2 / 15.2 GB, racing 1.15 / 1.28 / 1.46 at 16.6 / 16.6 / 14.6 GB.
 
 ## File Map
 
@@ -109,9 +126,9 @@ matrix_game_mlx/
     text.py                      # CaptionEncoder (dynamic captions); --t5-runtime graph runs T5 as one compiled graph
     scheduler.py                 # flow-matching scheduler, bitwise torch.linspace sigma grid
     rollout.py                   # warp_steps, set_attention_window
-    runtime.py                   # --dit-runtime ring-fused: plan_cache (ring KV), to/from_linear, run_blocks, CastleRuntime (compiled steady graph, prime/clear, time-MLP memo), install_runtime
-    rope_kernel.py               # GPU RoPE kernel, bitwise equal to the float64 CPU path
-    kernels.py                   # fused Metal block-glue kernels (ring-fused), bitwise equal to the native block pieces
+    runtime.py                   # --dit-runtime ring-fused / apple / apple-fast (RUNTIME_SPECS: dtype, window): plan_cache (ring KV), to/from_linear, run_blocks, CastleRuntime (compiled steady graph, prime/clear, time-MLP memo), install_runtime
+    rope_kernel.py               # GPU RoPE kernel (bf16 or fp16 output), bitwise equal to the float64 CPU path
+    kernels.py                   # fused Metal block-glue kernels (bf16 ring-fused, fp16 apple*), bitwise equal to the native block pieces
     scopes.py                    # optional smeltr scopes (encode/denoise/clean_kv/decode in CastleStream.push); inert without smeltr
     preprocessing.py             # RGB crop/resize and tensor <-> uint8
     wan/modules/
@@ -127,13 +144,14 @@ tests/
   parity/test_real_weights.py    # per-call, per-block and end-to-end real-weight parity
   parity/test_real_weights_variants.py  # prompt switch, no sink, TAEHV 2-step, Wan custom first-steps vs torch
   parity/test_real_weights_captions.py  # caption embeddings vs torch
+  parity/test_real_weights_apple.py     # apple presets: a priori gates on the realtime fixtures, apple-fast == apple, fp16 safety
   parity/test_gen_fixtures.py    # generator helper checks
   test_cli_smoke.py              # needs_weights: realtime dynamic render through the CLI (peak < 30 GB)
   media.py                       # media_missing(), mediamtx_server(): MediaMTX for the online tests
   serve_process.py               # serve(args, runtime): the serve CLI as a child process, MemoryMonitor (footprint incl. Metal)
   measure_serve.py               # not collected: python3 -m tests.measure_serve, one measured online session (README "Measured rates"); --dit-runtime pass-through
   bench_dit.py                   # not collected: python3 -m tests.bench_dit, CastleStream per-stage timings, --dit-runtime, --json (README "Apple fast path")
-  compare_runtimes.py            # not collected: python3 -m tests.compare_runtimes, free-running stream dump per runtime + --compare (README "Free-running streams past the window"); --perturb-frame baseline
+  compare_runtimes.py            # not collected: python3 -m tests.compare_runtimes, free-running stream dump per runtime (meta: DiT dtype, window) + --compare (README "Free-running streams past the window", "Apple presets"); --perturb-frame baseline
   test_rope_kernel.py, test_kernels.py, test_runtime.py, test_runtime_plan.py  # ring-fused: bitwise RoPE/kernels vs native, ring planner, runtime vs native, compiled vs eager
   test_serve_app.py, test_display.py, test_media_environment.py  # serve app, display and media environment (fakes, no model)
   test_online_games.py           # needs_castle_game/needs_racing_server: game IPC handshakes, stream-vs-serial frame equality
