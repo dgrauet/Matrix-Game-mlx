@@ -13,7 +13,7 @@ ancient-egypt, castle and racing scenes.
 | M2 | castle and racing (first-frame sink, absolute RoPE, racing RNG role), fixtures for both | Done: parity-validated, same methodology as ancient-egypt (racing RNG role transcribed from upstream, not parity-validated: parity injects noise on both sides); acceptance renders: 97-frame pan renders of castle (37.7 s/chunk) and racing (27.3 s/chunk), peak 24.4 GB |
 | M3 | realtime preset: TAEHV encode/decode (`taehv.py`), one-step schedule, upstream `native` DiT runtime | Done: parity-validated on the three scenes (`<scene>_realtime` fixtures, torch bf16 CPU reference); acceptance renders: 97-frame pans of egypt (3.57 s/chunk), castle (3.58 s/chunk) and racing (3.51 s/chunk), peak 14.96 GB (~1.1 processed frames/s, M2 Pro 32 GB) |
 | Apple fast path | `--dit-runtime ring-fused` on MLX (GPU RoPE, ring KV, fused kernels, compiled steady graph), `--vae-graph`, `--t5-runtime graph` | Done: every parity slice passes on both runtimes with thresholds unchanged; castle realtime `serve` 0.95 -> 1.13 `online_fps` (see "Apple fast path") |
-| Apple presets | Port-only `--preset apple` (float16 DiT) and `--preset apple-fast` (float16, 11-latent attention window) for `render` and `serve` | Done: a priori fixture gates pass on the three scenes (not upstream-exact); castle realtime `serve` `online_fps` 1.13 -> 1.25 (`apple`) and 1.43 (`apple-fast`) (see "Apple presets") |
+| Apple presets | Port-only `--preset apple` (float16 DiT) and `--preset apple-fast` (float16, 11-latent attention window) for `render` and `serve` | Done: a priori fixture gates pass on the three scenes (not upstream-exact); castle `serve` `online_fps` 1.13 (realtime, `ring-fused`) -> 1.25 (`apple`) and 1.43 (`apple-fast`) (see "Apple presets") |
 
 ## Quick start
 
@@ -53,7 +53,7 @@ The offline default preset is `quality`, as upstream's offline renderer. Weights
 | `--preset {rtx5090,rtx5090-sage}` | Rejected: CUDA-only presets |
 | `--preset {apple,apple-fast}` | Port-only speed presets: the realtime base (TAEHV, steps `1000`, `--vae-graph` on) with `--dit-runtime` defaulting to the preset's name, as upstream resolves `rtx5090`. They leave upstream exactness (float16 DiT; `apple-fast` also an 11-latent attention window); see "Apple presets" |
 | `--vae-backend {wan,taehv}` | Supported (default from the preset: `taehv` for realtime, `wan` otherwise) |
-| `--dit-runtime {native,ring-fused}` | Supported on every preset; default from the preset as upstream (`ring-fused` for realtime, `native` otherwise). `ring-fused` is the Apple fast path (ring KV cache, GPU RoPE kernel, fused block-glue kernels); see Known deviations |
+| `--dit-runtime {native,ring-fused}` | Supported on every preset; default from the preset as upstream (`ring-fused` for realtime, the preset's name for `apple` / `apple-fast`, `native` otherwise). `ring-fused` is the Apple fast path (ring KV cache, GPU RoPE kernel, fused block-glue kernels); see Known deviations |
 | `--dit-runtime {apple,apple-fast}` | Port-only: `ring-fused` with the DiT in float16 (`apple-fast`: self-attention window of 11 latents instead of 21, sink and current latent included). Accepted on every preset, as upstream accepts `--dit-runtime rtx5090`; the default only under `--preset apple` / `apple-fast`. See "Apple presets" and Known deviations |
 | `--dit-runtime` other values (`kernels`, `cudagraph`, `ring`, `ring-graph`, `rtx5090`, `rtx5090-sage`) | Rejected: CUDA-only; the MLX port runs `native`, `ring-fused`, `apple` or `apple-fast` |
 | `--steps`, `--first-steps` | Supported (comma-separated timesteps, strictly decreasing from 1000) |
@@ -252,8 +252,8 @@ correct). It is not patched.
 MediaMTX serves it to the browser over WHEP, with upstream's web client (`matrix_game_mlx/web/`, byte-identical).
 Same options, validations, routes and messages as upstream's `serve`, except the CUDA-only options (see "Known
 deviations"). **It is not real time on a laptop**: the realtime preset generates about 1.2 frames per second (1.1 with
-`--dit-runtime native`, about 1.4 with the port-only `--preset apple` and 1.5 with `apple-fast`, see "Apple
-presets") and the quality preset about 0.15 (table below), so a session is a slow-motion game. Commands run from `Matrix-Game-4-mlx/`
+`--dit-runtime native`), the port-only `--preset apple` and `apple-fast` about 1.4 and 1.5 (see "Apple
+presets"), and the quality preset about 0.15 (table below), so a session is a slow-motion game. Commands run from `Matrix-Game-4-mlx/`
 unless noted; `matrix-game-mlx serve` and `python3 -m matrix_game_mlx.cli serve` are the same entry point.
 
 ### Setup
@@ -648,8 +648,9 @@ The fast path may differ from `native` only by floating-point summation order, n
 
 - GPU RoPE, fused kernels, the compiled graph, the memo, `--vae-graph` and `--t5-runtime graph` are each **bitwise**
   their eager / native counterpart (tests in `tests/test_rope_kernel.py`, `test_kernels.py`, `test_runtime.py`,
-  `test_taehv.py`, `test_caption_encoder.py`; on real castle weights, three steady positions x (denoise + cache
-  update), the compiled DiT graph equals the eager one bit for bit, prediction and every K/V).
+  `test_taehv.py`, `test_caption_encoder.py`; on real castle weights, one steady fixed-sink position (denoise +
+  cache update) on `ring-fused` and `apple`, the compiled DiT graph equals the eager one bit for bit, prediction and
+  every K/V).
 - The one numeric difference is the ring's attention key order, which changes SDPA's summation order. Among the
   parity tests it shows only in the `--long` chunk-22 per-call tests, past the window, where ring slots are permuted:
 
@@ -793,6 +794,12 @@ and cache update: prediction and every K/V; `tests/test_runtime.py`).
 
 Free running (`tests/compare_runtimes.py`, as under "Free-running streams past the window": 48 chunks, the parity pan,
 stream seed 0, against `native`; `--preset realtime --dit-runtime apple|apple-fast`), reported, not gated:
+
+```bash
+python3 -m tests.compare_runtimes --scene castle --preset realtime --chunks 48 --dit-runtime apple --out out/apple
+python3 -m tests.compare_runtimes --scene castle --preset realtime --chunks 48 --dit-runtime apple-fast --out out/apple-fast
+python3 -m tests.compare_runtimes --compare out/native out/apple --json out/compare-apple.json   # out/native as above
+```
 
 | Scene | Runtime | Chunks | pred rel L2, median / max | decoded PSNR, median / min |
 | --- | --- | --- | --- | --- |
@@ -941,8 +948,8 @@ so the gap is the DiT's alone, which is preset-independent and gated per call an
   function is keyed on the model, shapes, sink mode and write spans (not buffer addresses), takes every KV / text
   cache tensor as an input and returns the updated K/V, and reads the block weights as implicit inputs. Compilation
   keeps the traced arithmetic (the fused kernels and SDPA are opaque to it): a 60-chunk rollout is bitwise compiled
-  vs eager (`tests/test_runtime.py`), and on real castle weights three steady positions x (denoise + cache update)
-  give bitwise equal predictions and K/V (compiled vs eager). `mx.compile` on MLX 0.31.1 is not bitwise for every op
+  vs eager (`tests/test_runtime.py`), and on real castle weights one steady fixed-sink position (denoise + cache
+  update) gives bitwise equal predictions and K/V (compiled vs eager, `ring-fused` and `apple`). `mx.compile` on MLX 0.31.1 is not bitwise for every op
   (a division by a non-power-of-two constant, `mean()`; see `--t5-runtime graph` below), so the DiT graph's
   equality is a measured result, not assumed. `CastleStream` calls `prime` before gameplay and `clear` on `close()`, as
   upstream; the warm-up (one DiT call plus the trace) is part of stream creation.

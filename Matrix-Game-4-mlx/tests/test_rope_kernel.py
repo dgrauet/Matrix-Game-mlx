@@ -451,6 +451,49 @@ def test_apply_bitwise_rounding_hard_cases_fp16(freqs, start_frame):
     _assert_bitwise_fp16(out, causal_rope_apply(x, GRID, freqs, start_frame))
 
 
+def _exact_f16_tie(v: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """For exact float64 v: (v lies exactly halfway between two fp16 neighbours, the lower neighbour is odd)."""
+    r = np.abs(v)
+    _, e = np.frexp(r)
+    scaled = np.ldexp(r, -np.maximum(e - 11, -24))  # in fp16 ulps of r's binade (subnormal ulp 2^-24)
+    low = np.floor(scaled)
+    return (scaled - low == 0.5) & (r < 65520.0), low % 2 == 1
+
+
+def test_apply_bitwise_exact_ties_fp16():
+    """Dyadic rotations (cos 0.75, sin 0.5) make every float64 lane exact, so many lanes sit exactly on an fp16 tie.
+
+    The kernel's exact-tie branch of f64_to_half (normal and subnormal) must round to even, as the CPU float64 ->
+    float16 cast does: a ties-away or ties-up rounding differs on the ties whose lower neighbour is odd (or even).
+    """
+    rng = np.random.default_rng(31)
+    s_len, n_heads, pairs = SHAPE[1], SHAPE[2], SHAPE[3] // 2
+    n = s_len * n_heads * pairs
+    # a, b with close exponents (normal halves) or both subnormal (second half): their sums keep few bits.
+    exp_a = np.where(np.arange(n) < n // 2, rng.integers(-13, 15, n), -24)
+    a = rng.integers(-2048, 2049, n) * np.exp2(exp_a - 10.0)
+    b = rng.integers(-2048, 2049, n) * np.exp2(exp_a + rng.integers(-2, 3, n) - 10.0)
+    a_bits = _f16_round(np.clip(a, -FP16_MAX, FP16_MAX))
+    b_bits = _f16_round(np.clip(b, -FP16_MAX, FP16_MAX))
+    av, bv = _f16_val(a_bits), _f16_val(b_bits)
+    lanes = np.stack([av * 0.75 - bv * 0.5, av * 0.5 + bv * 0.75], axis=-1)  # exact in float64
+    tie, odd = _exact_f16_tie(lanes)
+    sub = np.abs(lanes) < 2.0 ** -14
+    counts = {k: int(np.sum(m)) for k, m in {"normal_even": tie & ~sub & ~odd, "normal_odd": tie & ~sub & odd,
+                                              "sub_even": tie & sub & ~odd, "sub_odd": tie & sub & odd}.items()}
+    assert min(counts.values()) >= 10000, counts
+
+    table = np.empty((s_len, pairs, 2), np.float64)
+    table[..., 0], table[..., 1] = 0.75, 0.5
+    rot = RopeRotations(table=mx.array(table.view(np.uint64)), seq_len=s_len, pairs=pairs)
+    x = _from_bits_fp16(np.stack([a_bits, b_bits], axis=-1).ravel())
+    out = apply_causal_rope(x, rot)
+    with mx.stream(mx.cpu):
+        ref = mx.array(_cpu_float64_lanes(x, rot).view(np.float64)).astype(mx.float16)
+    _assert_bitwise_fp16(out, ref)
+    assert np.array_equal(_bits_fp16(out).ravel(), _f16_round(lanes).ravel())  # numpy's single RNE rounding
+
+
 @pytest.mark.parametrize("start_frame", [0, 22, 8000])
 def test_float64_emulation_bitwise_fp16(freqs, start_frame):
     """fp16 x: the emulated float64 lanes equal the CPU float64 lanes on all 53 bits (11-bit x 53-bit products)."""

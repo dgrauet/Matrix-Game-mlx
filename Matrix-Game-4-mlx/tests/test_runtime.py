@@ -482,7 +482,7 @@ def _stream_model(seed=0, mode="ring-fused"):
     mx.random.seed(seed)
     model = CausalWanModel(**{**CFG, "in_dim": 96, "out_dim": 48})
     model.update(tree_map(lambda a: (0.05 * mx.random.normal(a.shape)).astype(mx.bfloat16), model.parameters()))
-    model.update(tree_map(lambda a: a.astype(RUNTIME_SPECS[mode].dtype), model.parameters()))
+    model.update(tree_map(lambda a: a.astype(dit_dtype(mode)), model.parameters()))
     gen = WanDiffusionWrapper(model)
     install_runtime(gen, mode)
     return gen

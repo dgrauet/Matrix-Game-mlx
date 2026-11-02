@@ -61,20 +61,17 @@ def test_compare_refuses_runs_with_other_inputs(tmp_path):
         compare(tmp_path / "a", tmp_path / "b", window_chunk=21)
 
 
-@pytest.mark.parametrize("mode", ["ring-fused", "apple", "apple-fast"])
-def test_run_meta_records_dtype_and_window(mode):
+@pytest.mark.parametrize("mode, dtype, window", [("native", "bfloat16", 21), ("ring-fused", "bfloat16", 21),
+                                                ("apple", "float16", 21), ("apple-fast", "float16", 11)])
+def test_run_meta_records_dtype_and_window(mode, dtype, window):
     """A run's meta names the DiT dtype and the attention window the stream set (tiny DiT, stand-in codec)."""
     import mlx.core as mx
-    from matrix_game_mlx.inference.runtime import RUNTIME_SPECS
     from matrix_game_mlx.inference.stream import CastleStream
     from tests.compare_runtimes import dit_meta
     from tests.test_runtime import _PoolVAE, _stream_model
     stream = CastleStream(_stream_model(mode=mode), _PoolVAE(), mx.zeros((1, 8, 32), mx.bfloat16),
                           vae_backend="taehv", steps=(1000,), first_steps=(1000,))
-    want = {"float16": mx.float16, "bfloat16": mx.bfloat16}
-    meta = dit_meta(stream)
-    assert set(meta) == {"dit_dtype", "window"} and meta["window"] == RUNTIME_SPECS[mode].window
-    assert want[meta["dit_dtype"]] == RUNTIME_SPECS[mode].dtype
+    assert dit_meta(stream) == {"dit_dtype": dtype, "window": window}
     stream.close()
 
 
