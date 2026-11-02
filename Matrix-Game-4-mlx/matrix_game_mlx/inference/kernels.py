@@ -10,9 +10,9 @@ with a single launch:
                     optionally adds a residual to x first.
 * `gate_ln_affine`  x + y * gate, followed by the affine LayerNorm before cross-attention.
 * `gate_residual`   x + y * gate.
-* `rms_norm`        `WanRMSNorm` (q / k normalisation): fp32 statistics, cast to bf16, times the bf16 weight.
+* `rms_norm`        `WanRMSNorm` (q / k normalisation): fp32 statistics, cast to the storage dtype, times the weight.
   (port addition, not in upstream's kernels.py)
-* `gelu_tanh`       the FFN activation `nn.gelu_approx(x.astype(float32)).astype(bfloat16)` as one compiled
+* `gelu_tanh`       the FFN activation `nn.gelu_approx(x.astype(float32)).astype(x.dtype)` as one compiled
                     kernel (`mx.compile` of the native expression; port addition).
 
 Rounding follows the native MLX block (which is upstream's unfused bf16 block): every intermediate the chain of
@@ -26,6 +26,11 @@ summed in the layout of MLX's own contiguous row reduction (`row_reduce_simple`,
 where MLX dispatches that kernel with that layout (measured on MLX 0.31.1 at C = 128, 3072, 4096; C = 3072 is the
 model width) the statistics, and with them every output, are bitwise native. At other widths only the summation
 order differs. `gate_residual`, the residual sums and `gelu_tanh` are bitwise native at any width.
+
+Every function takes bf16 or fp16 arrays (all arrays of one call share one dtype, the output has that dtype). The
+kernel source is compiled per dtype with the storage type `bfloat16_t` replaced by `half`; "bf16" in the comments
+and in `bf()` then means "the storage type", rounded to nearest even, and the contract is the same, measured in
+fp16 ulps.
 
 One threadgroup handles one row ([B, S, C] is B * S rows); a row's values stay in registers between the statistics
 and the output pass. Inputs are checked on the host and rejected with a ValueError; nothing falls back to an
@@ -48,7 +53,8 @@ MODULATION_ROWS = 6  # shift / scale / gate rows of a block's timestep modulatio
 _HEADER = r"""
 #pragma METAL fp contract(off)
 
-// Round a float to bf16 (round to nearest even, as a separate MLX bf16 op) and return it as float.
+// Round a float to the storage type (bf16, or half in the fp16 variant; round to nearest even, as a separate MLX
+// op) and return it as float.
 inline float bf(float v) { return float(bfloat16_t(v)); }
 
 // Sum of one float per thread over the threadgroup (NSG simdgroups of 32); every thread gets the total.
@@ -175,7 +181,12 @@ def _f32_bits(v: float) -> int:
 
 
 @lru_cache(maxsize=None)
-def _kernel(name: str, inputs: tuple, outputs: tuple, source: str):
+def _kernel(name: str, inputs: tuple, outputs: tuple, source: str, dtype=mx.bfloat16):
+    """The kernel compiled for `dtype`: the fp16 variant swaps the storage type for `half` and gets a `_f16` name."""
+    if dtype == mx.float16:
+        return mx.fast.metal_kernel(name=name + "_f16", input_names=list(inputs), output_names=list(outputs),
+                                    source=source.replace("bfloat16_t", "half"),
+                                    header=_HEADER.replace("bfloat16_t", "half"))
     return mx.fast.metal_kernel(name=name, input_names=list(inputs), output_names=list(outputs), source=source,
                                 header=_HEADER)
 
@@ -191,31 +202,36 @@ def _row_layout(c: int) -> tuple[int, int, int]:
 def _row_kernel(name, inputs, outputs, body, arrays, rows, c, template, out_shapes):
     """Launch a one-threadgroup-per-row kernel over `rows` rows of `c` channels."""
     tg, blocks, extra = _row_layout(c)
-    kernel = _kernel(name, inputs, outputs, _ROW_PROLOGUE + body)
+    kernel = _kernel(name, inputs, outputs, _ROW_PROLOGUE + body, arrays[0].dtype)
     return kernel(inputs=list(arrays),
                   template=[("C", c), ("TG", tg), ("BLOCKS", blocks), ("EXTRA", extra),
                             ("K", 4 * (blocks + (extra > 0))), ("INVN", _f32_bits(1.0 / c))] + list(template.items()),
                   grid=(rows * tg, 1, 1), threadgroup=(tg, 1, 1),
-                  output_shapes=out_shapes, output_dtypes=[mx.bfloat16] * len(out_shapes))
+                  output_shapes=out_shapes, output_dtypes=[arrays[0].dtype] * len(out_shapes))
 
 
 # --- input checks ---------------------------------------------------------------------------------------------
 
+_DTYPES = (mx.bfloat16, mx.float16)
+
+
 def _check_rows(name: str, x) -> None:
-    if not isinstance(x, mx.array) or x.dtype != mx.bfloat16 or x.ndim != 3:
-        raise ValueError(f"{name} must be a BF16 array [B, S, C], got "
+    if not isinstance(x, mx.array) or x.dtype not in _DTYPES or x.ndim != 3:
+        raise ValueError(f"{name} must be a BF16 or FP16 array [B, S, C], got "
                          f"{getattr(x, 'shape', None)} {getattr(x, 'dtype', type(x))}")
 
 
 def _check_same(name: str, y, x) -> None:
     _check_rows(name, y)
+    if y.dtype != x.dtype:
+        raise ValueError(f"{name} is {y.dtype}, x is {x.dtype}: all arrays of a call must share one dtype")
     if y.shape != x.shape:
         raise ValueError(f"{name} {tuple(y.shape)} does not match x {tuple(x.shape)}")
 
 
-def _check_vector(name: str, v, channels: int) -> None:
-    if not isinstance(v, mx.array) or v.dtype != mx.bfloat16 or v.shape != (channels,):
-        raise ValueError(f"{name} must be a BF16 vector of {channels} elements, got "
+def _check_vector(name: str, v, channels: int, dtype) -> None:
+    if not isinstance(v, mx.array) or v.dtype != dtype or v.shape != (channels,):
+        raise ValueError(f"{name} must be a {dtype} vector of {channels} elements (the dtype of x), got "
                          f"{getattr(v, 'shape', None)} {getattr(v, 'dtype', type(v))}")
 
 
@@ -232,13 +248,13 @@ def _check_eps(eps) -> None:
 def _modulation_layout(x, e, modulation) -> dict:
     """Validate e [B, F, 6, C] / modulation [1, 6, C]; returns the frame template values (S, NF, FT)."""
     b, s, c = x.shape
-    if not isinstance(e, mx.array) or e.dtype != mx.bfloat16 or e.ndim != 4 or e.shape[0] != b \
+    if not isinstance(e, mx.array) or e.dtype != x.dtype or e.ndim != 4 or e.shape[0] != b \
             or e.shape[2:] != (MODULATION_ROWS, c):
-        raise ValueError(f"e must be BF16 [B, F, {MODULATION_ROWS}, C] matching x {tuple(x.shape)}, got "
+        raise ValueError(f"e must be {x.dtype} (the dtype of x) [B, F, {MODULATION_ROWS}, C] matching x {tuple(x.shape)}, got "
                          f"{getattr(e, 'shape', None)} {getattr(e, 'dtype', type(e))}")
-    if not isinstance(modulation, mx.array) or modulation.dtype != mx.bfloat16 \
+    if not isinstance(modulation, mx.array) or modulation.dtype != x.dtype \
             or modulation.shape != (1, MODULATION_ROWS, c):
-        raise ValueError(f"modulation must be BF16 [1, {MODULATION_ROWS}, C], got "
+        raise ValueError(f"modulation must be {x.dtype} (the dtype of x) [1, {MODULATION_ROWS}, C], got "
                          f"{getattr(modulation, 'shape', None)} {getattr(modulation, 'dtype', type(modulation))}")
     if s % e.shape[1]:
         raise ValueError(f"{s} tokens do not divide into {e.shape[1]} frames")
@@ -251,8 +267,9 @@ def ln_modulate(x: mx.array, e: mx.array, modulation: mx.array, eps: float, shif
                 residual: mx.array | None = None) -> tuple[mx.array, mx.array]:
     """z = LayerNorm(x') * (1 + (modulation + e)[scale_row]) + (modulation + e)[shift_row]; returns (z, x').
 
-    x' is `x + residual` (a new bf16 array) when `residual` is given, otherwise `x` itself.
-    x, residual [B, S, C]; e [B, F, 6, C] (one modulation per frame); modulation [1, 6, C]; all bf16.
+    x' is `x + residual` (a new array) when `residual` is given, otherwise `x` itself.
+    x, residual [B, S, C]; e [B, F, 6, C] (one modulation per frame); modulation [1, 6, C];
+    all bf16 or all fp16.
     """
     _check_rows("x", x)
     layout = _modulation_layout(x, e, modulation)
@@ -277,15 +294,16 @@ def gate_ln_affine(x: mx.array, y: mx.array, e: mx.array, modulation: mx.array, 
                    weight: mx.array, bias: mx.array, eps: float) -> tuple[mx.array, mx.array]:
     """x' = x + y * (modulation + e)[gate_row] and z = LayerNorm(x') * weight + bias; returns (z, x').
 
-    x, y [B, S, C]; e [B, F, 6, C]; modulation [1, 6, C]; weight, bias [C]; all bf16. Both results are new arrays.
+    x, y [B, S, C]; e [B, F, 6, C]; modulation [1, 6, C]; weight, bias [C];
+    all bf16 or all fp16. Both results are new arrays.
     """
     _check_rows("x", x)
     _check_same("y", y, x)
     layout = _modulation_layout(x, e, modulation)
     _check_row_index("gate_row", gate_row)
     b, s, c = x.shape
-    _check_vector("weight", weight, c)
-    _check_vector("bias", bias, c)
+    _check_vector("weight", weight, c, x.dtype)
+    _check_vector("bias", bias, c, x.dtype)
     _check_eps(eps)
     z, x_out = _row_kernel("mg4_gate_ln_affine", ("x", "y", "e", "modulation", "weight", "bias"), ("z", "x_out"),
                            _MOD_INDEX + _GATE_LN_AFFINE, (x, y, e, modulation, weight, bias), b * s, c,
@@ -295,29 +313,29 @@ def gate_ln_affine(x: mx.array, y: mx.array, e: mx.array, modulation: mx.array, 
 
 
 def gate_residual(x: mx.array, y: mx.array, e: mx.array, modulation: mx.array, gate_row: int) -> mx.array:
-    """x + y * (modulation + e)[gate_row], with the modulation sum, the product and the sum each rounded to bf16.
+    """x + y * (modulation + e)[gate_row], with the modulation sum, the product and the sum each rounded to the storage dtype.
 
-    x, y [B, S, C]; e [B, F, 6, C]; modulation [1, 6, C]; all bf16. Returns a new [B, S, C] array.
+    x, y [B, S, C]; e [B, F, 6, C]; modulation [1, 6, C]; all bf16 or all fp16. Returns a new [B, S, C] array.
     """
     _check_rows("x", x)
     _check_same("y", y, x)
     layout = _modulation_layout(x, e, modulation)
     _check_row_index("gate_row", gate_row)
     n = x.size
-    kernel = _kernel("mg4_gate_residual", ("x", "y", "e", "modulation"), ("out",), _GATE_RESIDUAL)
+    kernel = _kernel("mg4_gate_residual", ("x", "y", "e", "modulation"), ("out",), _GATE_RESIDUAL, x.dtype)
     return kernel(inputs=[x, y, e, modulation],
                   template=[("C", x.shape[2]), ("N", n), ("GATE", gate_row)] + list(layout.items()),
-                  grid=(n, 1, 1), threadgroup=(256, 1, 1), output_shapes=[x.shape], output_dtypes=[mx.bfloat16])[0]
+                  grid=(n, 1, 1), threadgroup=(256, 1, 1), output_shapes=[x.shape], output_dtypes=[x.dtype])[0]
 
 
 def rms_norm(x: mx.array, weight: mx.array, eps: float) -> mx.array:
-    """`WanRMSNorm`: (x * rsqrt(mean(x * x) + eps)) in fp32, rounded to bf16, times the bf16 weight (rounded).
+    """`WanRMSNorm`: (x * rsqrt(mean(x * x) + eps)) in fp32, rounded to the storage dtype, times the weight (rounded).
 
-    x [B, S, C] bf16; weight [C] bf16.
+    x [B, S, C] bf16 or fp16; weight [C] of the same dtype.
     """
     _check_rows("x", x)
     b, s, c = x.shape
-    _check_vector("weight", weight, c)
+    _check_vector("weight", weight, c, x.dtype)
     _check_eps(eps)
     return _row_kernel("mg4_rms_norm", ("x", "weight"), ("out",), _RMS_NORM, (x, weight), b * s, c,
                        {"EPS": _f32_bits(eps)}, [x.shape])[0]
@@ -325,11 +343,11 @@ def rms_norm(x: mx.array, weight: mx.array, eps: float) -> mx.array:
 
 @mx.compile
 def _gelu_tanh(x):
-    return nn.gelu_approx(x.astype(mx.float32)).astype(mx.bfloat16)
+    return nn.gelu_approx(x.astype(mx.float32)).astype(x.dtype)
 
 
 def gelu_tanh(x: mx.array) -> mx.array:
     """The FFN activation of the native block (`model.gelu_tanh`: fp32 opmath, one cast) as one compiled kernel."""
-    if not isinstance(x, mx.array) or x.dtype != mx.bfloat16:
-        raise ValueError(f"x must be a BF16 array, got {getattr(x, 'dtype', type(x))}")
+    if not isinstance(x, mx.array) or x.dtype not in _DTYPES:
+        raise ValueError(f"x must be a BF16 or FP16 array, got {getattr(x, 'dtype', type(x))}")
     return _gelu_tanh(x)
