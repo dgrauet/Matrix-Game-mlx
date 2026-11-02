@@ -54,7 +54,7 @@ The offline default preset is `quality`, as upstream's offline renderer. Weights
 | `--preset {apple,apple-fast}` | Port-only speed presets: the realtime base (TAEHV, steps `1000`, `--vae-graph` on) with `--dit-runtime` defaulting to the preset's name, as upstream resolves `rtx5090`. They leave upstream exactness (float16 DiT; `apple-fast` also an 11-latent attention window); see "Apple presets" |
 | `--vae-backend {wan,taehv}` | Supported (default from the preset: `taehv` for realtime, `wan` otherwise) |
 | `--dit-runtime {native,ring-fused}` | Supported on every preset; default from the preset as upstream (`ring-fused` for realtime, `native` otherwise). `ring-fused` is the Apple fast path (ring KV cache, GPU RoPE kernel, fused block-glue kernels); see Known deviations |
-| `--dit-runtime {apple,apple-fast}` | Port-only: `ring-fused` with the DiT in float16 (`apple-fast`: self-attention window of 11 latents instead of 21). Accepted on every preset, as upstream accepts `--dit-runtime rtx5090`; the default only under `--preset apple` / `apple-fast`. See "Apple presets" and Known deviations |
+| `--dit-runtime {apple,apple-fast}` | Port-only: `ring-fused` with the DiT in float16 (`apple-fast`: self-attention window of 11 latents instead of 21, sink and current latent included). Accepted on every preset, as upstream accepts `--dit-runtime rtx5090`; the default only under `--preset apple` / `apple-fast`. See "Apple presets" and Known deviations |
 | `--dit-runtime` other values (`kernels`, `cudagraph`, `ring`, `ring-graph`, `rtx5090`, `rtx5090-sage`) | Rejected: CUDA-only; the MLX port runs `native`, `ring-fused`, `apple` or `apple-fast` |
 | `--steps`, `--first-steps` | Supported (comma-separated timesteps, strictly decreasing from 1000) |
 | `--vae-graph`, `--no-vae-graph` | Supported; default on for realtime + TAEHV, as upstream (`VAE graph requires TAEHV` otherwise). The streaming TAEHV encoder/decoder run as `mx.compile`d graphs instead of CUDA graphs, bitwise eager (see Known deviations) |
@@ -720,7 +720,7 @@ preset with `ring-fused`, and `native` stays the reference.
 | Preset / runtime | What it changes from realtime `ring-fused` |
 | --- | --- |
 | `apple` | The DiT runs in float16 instead of bfloat16: weights, activations, modulation, self- and cross-attention K/V caches, the fused kernels (`half` variants), the RoPE kernel output, the compiled steady graph and `prime` |
-| `apple-fast` | `apple` plus a self-attention window of 11 latents (sink included) instead of 21; the KV cache is sized by it, the sink stays one latent |
+| `apple-fast` | `apple` plus a self-attention window of 11 latents instead of 21: the sink, the current latent and the 9 latents before it (the 21 window: 19), so from stream position 11 on it sees less history; the KV cache is sized by it, the sink stays one latent |
 
 ```bash
 matrix-game-mlx serve --scene castle --preset apple-fast --fps 4 $S          # $S as under "Online play on macOS"
@@ -983,9 +983,10 @@ so the gap is the DiT's alone, which is preset-independent and gated per call an
   running, the stream departs from `native` from the first denoised chunk (castle chunk 0: pred rel L2 0.020; racing
   chunk 1: 0.022) and compounds (chunks 21 to 47: castle 0.59, racing 0.47 median). The residual stream's max |x|
   measured 790, against 65504 / 16.
-- `apple-fast` attends over **11 latents** (the sink included) instead of upstream's 21: past stream position 11 the
-  model sees 10 frames of history instead of 20, and the KV caches are sized for 11. It is bitwise `apple` until then
-  and diverges from it afterwards (chunks 21 to 47 pred rel L2 median: castle 0.59, racing 0.49). The window is a
+- `apple-fast` attends over **11 latents** instead of upstream's 21: the sink, the current latent and the 9 latents
+  before it (the 21 window: 19; each realtime latent is 4 video frames), and the KV caches are sized for 11. So from
+  stream position 11 on it sees less history than `apple`. It is bitwise `apple` until then and diverges from it
+  afterwards (chunks 21 to 47 pred rel L2 median: castle 0.59, racing 0.49). The window is a
   fixed property of the runtime; there is no window flag (upstream has none).
 - Casts at the bf16 / fp16 boundaries under the apple runtimes: T5 and TAEHV (and the Wan VAE) stay bf16; the DiT
   casts the bf16 prompt embeddings and control latent to fp16 where it consumes them, the stream casts the bf16 sink
