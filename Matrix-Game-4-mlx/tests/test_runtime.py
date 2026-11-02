@@ -8,7 +8,9 @@ norms, modulation, cross-attention and FFN round exactly as native. Teacher-forc
 native's (ring order via `from_linear`) before every call, so rows the call does not write must match bitwise and only
 the written slot and the output carry the summation-order deviation. Free-running checks bound the drift over a rollout.
 """
+import gc
 import re
+import sys
 import types
 
 import mlx.core as mx
@@ -564,16 +566,24 @@ def test_stream_second_session_matches_fresh_model(mode):
 
 
 @pytest.mark.needs_weights
-def test_compiled_graph_is_bitwise_eager_on_real_weights():
+@pytest.mark.parametrize("mode", ("ring-fused", "apple"))
+def test_compiled_graph_is_bitwise_eager_on_real_weights(mode):
     """Real castle weights, one steady fixed-sink position (denoise then cache-update call) on random full-window
     caches: the compiled steady-window graph equals the eager runtime bit for bit, prediction and every K/V. Guards
-    an MLX upgrade: mx.compile is not bitwise for every op (README, Apple fast path parity)."""
+    an MLX upgrade: mx.compile is not bitwise for every op (README, Apple fast path parity). The DiT is built in
+    `dit_dtype(mode)` (apple: float16); the prompt and control latent stay bf16, as the stream feeds them (the T5
+    and the TAEHV are bf16), the latent and caches are in the DiT dtype."""
     from matrix_game_mlx.inference.loading import build_dit
     from matrix_game_mlx.inference.rollout import set_attention_window
     from matrix_game_mlx.inference.wrappers import init_crossattn_cache, init_kv_cache
     from tests.conftest import weights_dir
-    gen = build_dit(weights_dir(), "dit_castle")
-    install_runtime(gen, "ring-fused")
+    for name in ("last_type", "last_value", "last_traceback", "last_exc"):
+        sys.__dict__.pop(name, None)          # a failed case's postmortem traceback would keep its DiT alive
+    gc.collect()
+    mx.clear_cache()
+    dtype = dit_dtype(mode)
+    gen = build_dit(weights_dir(), "dit_castle", dtype=dtype)
+    install_runtime(gen, mode)
     runtime = gen.model.castle_runtime
     set_attention_window(gen, 21, 1)
     gen.model.set_rope_max_len(8192)
@@ -583,15 +593,15 @@ def test_compiled_graph_is_bitwise_eager_on_real_weights():
         runtime.clear()
         runtime.use_graph = use_graph
         keys = iter(mx.random.split(mx.random.key(0), 200))
-        normal = lambda shape: mx.random.normal(shape, key=next(keys)).astype(mx.bfloat16)
-        kv, xc = init_kv_cache(gen, 1, 21 * fsl, mx.bfloat16), init_crossattn_cache(gen, 1, mx.bfloat16)
+        normal = lambda shape, dt=dtype: mx.random.normal(shape, key=next(keys)).astype(dt)
+        kv, xc = init_kv_cache(gen, 1, 21 * fsl, dtype), init_crossattn_cache(gen, 1, dtype)
         for cache in kv:
             cache.update(k=normal(cache["k"].shape), v=normal(cache["v"].shape),
                          k_sink_raw=normal(cache["k"][:, :fsl].shape), global_end_index=position * fsl,
                          local_end_index=21 * fsl)
-        prompt, preds = normal((1, 512, 4096)), []
+        prompt, preds = normal((1, 512, 4096), mx.bfloat16), []
         for t, control in ((1000.0, True), (0.0, False)):
-            cond = {"prompt_embeds": prompt, "control_latent": normal((1, 1, 48, 30, 54))}
+            cond = {"prompt_embeds": prompt, "control_latent": normal((1, 1, 48, 30, 54), mx.bfloat16)}
             _, pred = gen(noisy_image_or_video=normal((1, 1, 48, 30, 54)), conditional_dict=cond,
                           timestep=mx.full((1, 1), t), kv_cache=kv, crossattn_cache=xc, current_start=position * fsl,
                           sink_rope_mode="fixed", drop_control=not control)
