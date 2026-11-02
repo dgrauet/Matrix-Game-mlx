@@ -71,7 +71,7 @@ def _reject_unsupported(args):
     if args.preset in OPTIMIZED_RUNTIMES:
         raise ValueError(f"--preset {args.preset} is CUDA-only")
     if args.dit_runtime not in (None, "native", "ring-fused") + APPLE_RUNTIMES:
-        raise ValueError(f"--dit-runtime {args.dit_runtime} is CUDA-only; the MLX port runs native or ring-fused")
+        raise ValueError(f"--dit-runtime {args.dit_runtime} is CUDA-only; the MLX port runs native, ring-fused, apple or apple-fast")
 
 
 def resolve_model_arguments(args, require_model=True):

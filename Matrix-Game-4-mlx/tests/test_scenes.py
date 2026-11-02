@@ -56,7 +56,7 @@ def test_cuda_only_rejected(argv):
 def test_cuda_only_runtimes_rejected(preset, runtime):
     with pytest.raises(ValueError) as raised:
         model_args("castle", preset, ["--dit-runtime", runtime])
-    assert str(raised.value) == f"--dit-runtime {runtime} is CUDA-only; the MLX port runs native or ring-fused"
+    assert str(raised.value) == f"--dit-runtime {runtime} is CUDA-only; the MLX port runs native, ring-fused, apple or apple-fast"
 
 
 @pytest.mark.parametrize("scene", list(scenes.SCENES))

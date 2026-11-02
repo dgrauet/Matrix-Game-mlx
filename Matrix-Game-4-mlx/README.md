@@ -415,7 +415,7 @@ would help are memory ones (T5 off the GPU or quantized, fewer distinct captions
 
 A browser keeps an idle `/api/start` request open for a limited time (WebKit about 60 s), while the server waits for
 the first encoded frame. On this Mac quality reached it in 12 to 14 s, well inside that, but a slower Mac may not.
-`serve` allows 300 s for the Wan-VAE presets (45 s for `realtime`, upstream's value). The 15 s silence watchdog
+`serve` allows 300 s for the Wan-VAE presets (45 s for `realtime`, upstream's value, and for `apple` / `apple-fast`, which share its base). The 15 s silence watchdog
 still applies: the browser sends controls continuously, but a client that does not (a script) must send one at
 least every 15 s, as `tests/test_serve_e2e.py` does.
 
@@ -430,7 +430,7 @@ Upstream's server modules are copied with `matrix_game.` renamed to `matrix_game
   `OPENBLAS_NUM_THREADS=1` are set by `serve` after NumPy and MLX are imported, so unlike upstream's `serve.sh` they reach
   only child processes (the game and the sidecar), not the server itself.
 - `validate_renderer` also rejects "Apple Software Renderer" (Apple's software OpenGL) unless `--allow-software-rendering`.
-- The first-frame deadline is 45 s for `--preset realtime` (upstream's value) and 300 s for the Wan-VAE presets, which need
+- The first-frame deadline is 45 s for `--preset realtime` (upstream's value) and for `apple` / `apple-fast` (same base), and 300 s for the Wan-VAE presets, which need
   longer on Apple Silicon; the error text keeps upstream's shape.
 - `Runtime.__init__` no longer resets `attention_backend` (the MLX loader sets `mlx-sdpa`).
 - No torch: the session report drops `profile_torch_threads`; the stream hands an owned `uint8` array to `on_rgb` (no `.numpy()`); profile keys are
@@ -759,7 +759,7 @@ chunks average 2662 ms against 3606 ms for `ring-fused` (−26 %). In `serve` (c
 | castle: chunk median, `model_fps`, `online_fps`, footprint | 3.29 s, 1.24, 1.13, 16.2 GB | 2.98 s, 1.36, 1.25, 16.2 GB | 2.78 s, 1.46, 1.43, 15.2 GB |
 | racing (fixed caption) | 3.35 s, 1.24, 1.15, 16.6 GB | 2.98 s, 1.38, 1.28, 16.6 GB | 2.72 s, 1.49, 1.46, 14.6 GB |
 
-fp16 does not lower the footprint (same MLX peak, 14.86 GB); the shorter window does (smaller KV caches). No session
+fp16 does not lower the footprint (same MLX peak, 14.86 GB); the shorter window does (smaller KV caches). No fixed-caption session
 swapped. Racing with dynamic captions stays memory-bound, as under "Memory": `--preset apple --prompt-mode dynamic`
 (8 chunks, a new caption every chunk) completed with a 15.5 s chunk median, `model_fps` 0.29, footprint 25.5 GB and
 5.5 GB of swap growth.
@@ -813,7 +813,7 @@ Unlike `ring-fused`, which is bitwise `native` until the first ring eviction, fp
 chunk on (castle chunk 0: 0.020, 44.0 dB; chunk 1: 0.096, 35.9 dB; racing chunk 1: 0.022, 49.3 dB, its chunk 0 being
 the sink, bitwise), and each runtime then conditions on its own outputs, so the difference compounds over all 48
 chunks while the perturbation baseline starts at chunk 20 (castle) or 21 (racing). Castle reaches the size of a
-one-level input change on `native` (and of `ring-fused`) within 4 chunks and stays there. Racing, which amplifies small
+one-level input change on `native` (and of `ring-fused`) within 4 chunks and stays somewhat above it (chunks 21 to 47: pred rel L2 median 0.59 vs 0.46, PSNR median / min 17.1 / 16.0 dB vs 19.7 / 17.0 dB). Racing, which amplifies small
 differences much more slowly, ends far above both: over chunks 21 to 47 its pred rel L2 median is 0.47 (`apple`) and
 0.53 (`apple-fast`) against 0.070 for the perturbation. `apple-fast` is bitwise `apple` until its window acts (castle
 chunk 10, racing chunk 11, both stream position 11) and diverges from it afterwards, by as much as fp16 does from

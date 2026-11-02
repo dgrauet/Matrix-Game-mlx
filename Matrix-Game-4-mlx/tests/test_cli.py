@@ -40,4 +40,4 @@ def test_cuda_only_runtime_rejected_by_commands(command, tmp_path, capsys):
     with pytest.raises(SystemExit) as stopped:
         main([command, "--dit-runtime", "ring-graph", *argv])
     assert stopped.value.code == 2
-    assert "--dit-runtime ring-graph is CUDA-only; the MLX port runs native or ring-fused" in capsys.readouterr().err
+    assert "--dit-runtime ring-graph is CUDA-only; the MLX port runs native, ring-fused, apple or apple-fast" in capsys.readouterr().err

@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 
 from aiohttp import web
 from matrix_game_mlx.profiling import ChunkTimer, summarize
-from matrix_game_mlx.scenes import SCENES, add_model_arguments, resolve_model_arguments
+from matrix_game_mlx.scenes import APPLE_RUNTIMES, SCENES, add_model_arguments, resolve_model_arguments
 from matrix_game_mlx.inference.loader import ModelComponents
 
 LOG = logging.getLogger("castle")
@@ -43,9 +43,10 @@ def display_frames(images, rendered, monitor):
 
 
 def first_frame_timeout(args):
-    # macOS port: upstream waits 45 s for the first encoded frame (realtime on CUDA). The quality and baseline
-    # presets (Wan VAE, two denoising steps) take longer to the first chunk on Apple Silicon, so they get 300 s.
-    return 45 if args.preset == "realtime" else 300
+    # macOS port: upstream waits 45 s for the first encoded frame (realtime on CUDA). The apple presets share the
+    # realtime base (TAEHV, one step), so they keep 45 s. The quality and baseline presets (Wan VAE, two denoising
+    # steps) take longer to the first chunk on Apple Silicon, so they get 300 s.
+    return 45 if args.preset in ("realtime",) + APPLE_RUNTIMES else 300
 
 
 class Runtime(ModelComponents):

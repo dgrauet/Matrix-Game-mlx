@@ -526,9 +526,9 @@ class _WanStubVAE:
 
 
 def test_stream_wan_two_steps_with_fp16_dit(monkeypatch):
-    """`--preset quality --dit-runtime apple`: fp16 DiT, Wan VAE (bf16), two denoise steps. The apple runtime raises
-    on any non-fp16 DiT input, so completing proves the add-noise step re-casts to fp16; the Wan decoder receives
-    the VAE dtype (bf16) and the decoded frames are finite."""
+    """`--preset quality --dit-runtime apple`: fp16 DiT, Wan VAE (bf16), two denoise steps. The apple runtime's dtype
+    check sits after patch embedding, so completing shows the embedded input is fp16 (not every DiT input); the
+    Wan decoder receives the VAE dtype (bf16), both denoising steps run and the decoded frames are finite."""
     from matrix_game_mlx.inference import stream as stream_module
     from matrix_game_mlx.inference.wan.modules import vae2_2
     monkeypatch.setattr(vae2_2, "count_conv3d", lambda module: 0)
@@ -540,6 +540,7 @@ def test_stream_wan_two_steps_with_fp16_dit(monkeypatch):
     for count in (1, 4):
         chunk = stream.push(mx.zeros((count, 3, 480, 864)), frame_start=frame)
         frame += count
+        assert chunk.denoising_steps == 2
         assert chunk.latent.dtype == mx.float16 and tuple(chunk.pixels.shape) == (count, 3, 480, 864)
         assert bool(mx.all(mx.isfinite(chunk.pixels))) and bool(mx.all(mx.isfinite(chunk.latent)))
     assert vae.decoder_inputs == [mx.bfloat16, mx.bfloat16]

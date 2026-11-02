@@ -225,8 +225,9 @@ def test_load_installs_dit_runtime(tmp_path, monkeypatch, preset, argv, runtime)
     assert cfg["dit_runtime"] == runtime and cfg["experimental_runtime"] is (runtime != "native")
 
 
-def test_build_dit_converts_one_tensor_at_a_time(tmp_path):
-    """build_dit casts to the requested dtype (default bf16 bitwise the file); the tiny pack uses prefixed keys."""
+def test_build_dit_casts_every_tensor(tmp_path):
+    """build_dit casts every tensor to the requested dtype (default bf16, bitwise the file): checks values and dtypes
+    on a tiny pack with prefixed keys. The two-copy memory bound is shown on real weights, not here."""
     import json
     import mlx.core as mx
     from mlx.utils import tree_flatten
