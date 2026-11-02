@@ -18,7 +18,10 @@ first run (spec "Validation", apple presets):
   past 22) on the scene sink image's pan (tests.compare_runtimes.Pan), stream seed 0, eager blocks (`use_graph`
   off; the compiled graph is bitwise eager, tests/test_runtime.py): every pred, `k`, `v` and `k_sink_raw` finite,
   and the residual stream's max |x| (the residual output of `ln_modulate`, `gate_ln_affine` and `gate_residual`)
-  below 65504 / 16.
+  below 65504 / 16. The fp16 linear outputs that feed a fused kernel (q / k projections into `rms_norm`, the
+  self-attention output into `gate_ln_affine`, the cross-attention output into `ln_modulate`, the FFN hidden
+  pre-activation into `gelu_tanh`, the FFN output into `gate_residual`) stay below 65504 / 4 (two bits of headroom;
+  fixed before the first run). The v projection and the cross-attention K/V are covered only by the finite checks.
 
 One scene's MLX DiT is held at a time (tests/conftest.py groups this module's items by scene); apple-fast reuses the
 loaded DiT through `install_runtime`, so no second DiT is ever built.
@@ -42,6 +45,7 @@ SCENES = tuple(SCENE_SPECS)                    # ancient-egypt, castle, racing
 PRESET = "apple"
 FP16_MAX = 65504.0
 RESIDUAL_LIMIT = FP16_MAX / 16
+BRANCH_LIMIT = FP16_MAX / 4
 SAFETY_CHUNKS = 32
 CONTROL_TOL = 2e-2
 PSNR_MIN = 30.0
@@ -202,6 +206,39 @@ def residual_max(monkeypatch):
     return pending
 
 
+@pytest.fixture
+def branch_max(monkeypatch):
+    """Pending max |y| per kind of the fp16 linear outputs that enter a fused kernel (see the module docstring)."""
+    from matrix_game_mlx.inference import kernels
+    pending = {}
+
+    def wrap(name, kind, branch):
+        original = getattr(kernels, name)
+
+        def wrapped(*args, **kwargs):
+            y = branch(args, kwargs)
+            if y is not None:
+                pending.setdefault(kind, []).append(mx.max(mx.abs(y)))
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(kernels, name, wrapped)
+
+    wrap("rms_norm", "qk", lambda a, k: a[0])
+    wrap("gate_ln_affine", "self_attn", lambda a, k: a[1])
+    wrap("ln_modulate", "cross_attn", lambda a, k: k.get("residual", a[6] if len(a) > 6 else None))
+    wrap("gelu_tanh", "ffn_hidden", lambda a, k: a[0])
+    wrap("gate_residual", "ffn_out", lambda a, k: a[1])
+    return pending
+
+
+def _drain_kinds(pending, require: bool = True) -> dict:
+    """{kind: max} of the pending maxima; `require`: every kind was recorded (a full block pass)."""
+    assert not require or {"qk", "self_attn", "cross_attn", "ffn_hidden", "ffn_out"} <= set(pending), sorted(pending)
+    out = {kind: _drain(values) for kind, values in pending.items()}
+    pending.clear()
+    return out
+
+
 def _drain(pending) -> float:
     assert pending, "no fused kernel call recorded"
     value = float(mx.max(mx.stack(pending)).astype(mx.float32))
@@ -211,8 +248,9 @@ def _drain(pending) -> float:
 
 @pytest.mark.parametrize("runtime", ("apple", "apple-fast"))
 @pytest.mark.parametrize("scene", SCENES)
-def test_apple_fp16_safety(scene, runtime, comps, residual_max):
-    """32 free-running chunks (eager blocks): finite preds and KV, residual stream max |x| < 65504 / 16."""
+def test_apple_fp16_safety(scene, runtime, comps, residual_max, branch_max):
+    """32 free-running chunks (eager blocks): finite preds and KV, residual stream max |x| < 65504 / 16, fp16 linear
+    outputs into the fused kernels < 65504 / 4."""
     from matrix_game_mlx.inference.runtime import install_runtime
     install_runtime(comps.gen, runtime)
     try:
@@ -225,6 +263,7 @@ def test_apple_fp16_safety(scene, runtime, comps, residual_max):
             maxima, positions, frame = [], [], 0
             creation = _drain(residual_max) if residual_max else 0.0   # kv_only sink call at creation
             assert creation < RESIDUAL_LIMIT, ("sink call", creation, RESIDUAL_LIMIT)
+            branches = _drain_kinds(branch_max, require=False)
             for i in range(SAFETY_CHUNKS):
                 count = 1 if i == 0 else 4
                 pixels = mx.array(np.stack([pan.frame(frame + k) for k in range(count)]))
@@ -240,6 +279,9 @@ def test_apple_fp16_safety(scene, runtime, comps, residual_max):
                                 f"{[(j // 3, j % 3) for j in bad]}"
                 maxima.append(_drain(residual_max))
                 assert maxima[-1] < RESIDUAL_LIMIT, (i, maxima[-1], RESIDUAL_LIMIT)
+                for kind, value in _drain_kinds(branch_max).items():
+                    branches[kind] = max(branches.get(kind, 0.0), value)
+                    assert value < BRANCH_LIMIT, (i, kind, value, BRANCH_LIMIT)
                 del c, finite
         finally:
             stream.close()
@@ -249,4 +291,6 @@ def test_apple_fp16_safety(scene, runtime, comps, residual_max):
     print(f"{scene} {runtime} fp16 safety: {SAFETY_CHUNKS} chunks, positions {positions[0]}-{positions[-1]}, "
           f"residual max |x| {max(maxima):.1f} at chunk {worst} (limit {RESIDUAL_LIMIT:.0f}; sink call "
           f"{creation:.1f}); mx peak {mx.get_peak_memory() / 1e9:.2f} GB; per chunk "
-          + " ".join(f"{v:.0f}" for v in maxima))
+          + " ".join(f"{v:.0f}" for v in maxima)
+          + f"; fp16 linear outputs max |y| (limit {BRANCH_LIMIT:.0f}, sink call included): "
+          + ", ".join(f"{kind} {value:.1f}" for kind, value in sorted(branches.items())))

@@ -789,6 +789,9 @@ Control rel L2 is at most 8.3e-3. `apple-fast` equals `apple` bitwise on every f
 from position 11; the fixtures stop at chunk 2), which the test asserts. fp16 safety: 32 free-running chunks per
 scene and per runtime (eager, the parity pan, seed 0) keep every pred and K/V finite, and the residual stream's
 max |x| peaks at 790 (castle's sink pass at stream creation; 728 in a chunk) against a limit of 65504 / 16 = 4094.
+The fp16 linear outputs that enter a fused kernel (q / k projections, self- and cross-attention outputs, FFN
+hidden pre-activation and FFN output) peak at 208 (castle's FFN output; FFN hidden 57) against a limit of
+65504 / 4, also fixed before the run: fp16 overflow is about 300x away.
 The compiled fp16 graph is bitwise its eager run on real castle weights (one steady fixed-sink position, denoise
 and cache update: prediction and every K/V; `tests/test_runtime.py`).
 
