@@ -180,8 +180,9 @@ def test_runtime_prompt_switch_matches_native(weights, runtime):
 @pytest.mark.parametrize("mode", ["absolute", "fixed"])
 def test_apple_fast_window_matches_native(weights, mode):
     """apple-fast's 11-latent window (set from the runtime, as CastleStream does) vs native float16 with the same
-    window, teacher-forced through position 15: past the first eviction (position 11) and into the steady state
-    (positions 12-15, the compiled graph and the fixed-sink re-RoPE)."""
+    window, teacher-forced through position 15: planning, ring eviction (position 11) and the compiled steady graph
+    (positions 12-15) within the per-call tolerance. The tolerance does not resolve a fixed-sink re-RoPE error on
+    the tiny model; the bitwise `test_runtime_linear_layout_is_bitwise_native[...-apple-fast]` pins that."""
     window = RUNTIME_SPECS["apple-fast"].window
     assert window == 11
     MEASURED[f"apple_fast_window[{mode}]"] = _teacher_forced(weights, mode, calls=_schedule(16),
@@ -224,20 +225,25 @@ def test_runtime_free_running_matches_native(weights, mode):
     print("max rel L2 (output, cache):", MEASURED)
 
 
-@pytest.mark.parametrize("runtime", RUNTIMES)
+@pytest.mark.parametrize("runtime", RUNTIMES + ["apple-fast"])
 @pytest.mark.parametrize("fused", [True, False], ids=["fused", "unfused"])
 @pytest.mark.parametrize("mode", ["absolute", "fixed"])
 def test_runtime_linear_layout_is_bitwise_native(weights, mode, fused, runtime):
     """With the ring disabled (native linear slot order) the runtime is bitwise native in its dtype: GPU RoPE, the
     composed block pieces (or the fused kernels, whose row reductions follow MLX's order at these widths),
-    cross-attention and the fixed-sink key set round exactly as native; only the ring order differs."""
+    cross-attention and the fixed-sink key set round exactly as native; only the ring order differs. apple-fast
+    runs with its 11-latent window on both models (set from the runtime, as CastleStream does), so the 60 chunks
+    pass its eviction and pin its fixed-sink re-RoPE (sink at position - 11) bitwise."""
     rng = np.random.default_rng(4)
     ctx = rng.standard_normal((1, 8, 32)).astype(np.float32)
     weights, dtype = _runtime_weights(weights, runtime), RUNTIME_SPECS[runtime].dtype
-    native, castle = _model(weights), _model(weights, runtime=True, mode=runtime)
+    window = RUNTIME_SPECS[runtime].window if runtime == "apple-fast" else None
+    native = _model(weights, window=window)
+    castle = _model(weights, runtime=True, mode=runtime, window=window)
+    window = castle.blocks[0].self_attn.local_attn_size
     castle.castle_runtime.ring = False
     castle.castle_runtime.fused = fused
-    (kv_n, xc_n), (kv_r, xc_r) = _caches(dtype=dtype), _caches(dtype=dtype)
+    (kv_n, xc_n), (kv_r, xc_r) = _caches(window=window, dtype=dtype), _caches(window=window, dtype=dtype)
     calls = _schedule(CHUNKS, clean_first=True)
     for index, ((position, t), x) in enumerate(zip(calls, _inputs(rng, len(calls)))):
         out = _call(castle, x, t, ctx, kv_r, xc_r, position, mode)
