@@ -18,8 +18,16 @@ and the float32 bits to bf16 with MLX's RNE bit trick. The rotation tables carry
 [S, D/2, 2] = (cos, sin) as upstream's view_as_real layout), built on the host once per DiT call and shared by
 every layer and by q and k; applying them is a single GPU kernel.
 
+float16 x (the apple presets' fp16 DiT) gets the same kernel compiled with fp16 lanes: an fp16 significand (11
+bits, exponent field 0 = subnormal) times a float64 significand is an exact 64-bit product, and the float64 result is
+rounded as MLX's CPU float64 -> float16 cast, which, unlike the bf16 one, rounds once (RNE to fp16 with fp16
+subnormals and overflow to inf; e.g. 1 + 2^-11 + 2^-40 -> 0x3C01, a cast through float32 would give 0x3C00, and
+65520 - 2^-30 -> 65504, through float32 inf). fp16 NaN results are not canonicalised: the CPU's float64 ops return
+the first NaN operand (an fp16 NaN input, quieted, with its sign and payload) or the default NaN (inf * 0,
+inf - inf), and the cast keeps the payload, so the kernel does the same.
+
 Deviation from upstream: `freqs` is the port's `(cos, sin)` float64 pair (not a complex tensor), the rotations are
-a `RopeRotations` dataclass (not a raw tensor), and `apply_causal_rope` takes bfloat16 only.
+a `RopeRotations` dataclass (not a raw tensor), and `apply_causal_rope` takes bfloat16 or float16 only.
 """
 from __future__ import annotations
 
@@ -157,14 +165,11 @@ inline F64 f64_decode(ulong bits) {
   return r;
 }
 
-// fl64(bf16 a * c), a finite.
-inline F64 f64_mul(uint a, F64 c) {
-  bool neg = (((a >> 15) & 1u) != 0u) != c.neg;
-  uint ea = (a >> 7) & 0xFFu, fa = a & 0x7Fu;
-  if ((ea == 0u && fa == 0u) || c.zero) return f64_zero(neg);
-  ulong ma = ulong(ea == 0u ? fa : (fa | 0x80u));
-  int e = (ea == 0u ? -133 : int(ea) - 134) + c.e;
-  return f64_round(ma * c.m, e, neg);  // <= 61-bit exact product
+// fl64(x * c) for a finite input lane x = (-1)^neg * ma * 2^ea, ma < 2^11: the product is exact in 64 bits.
+inline F64 f64_mul_sig(ulong ma, int ea, bool neg, F64 c) {
+  neg = neg != c.neg;
+  if (ma == 0ul || c.zero) return f64_zero(neg);
+  return f64_round(ma * c.m, ea + c.e, neg);
 }
 
 // fl64(x + y), IEEE round-to-nearest-even (exact cancellation gives +0).
@@ -201,29 +206,92 @@ inline uint f64_to_bf16(F64 v) {
   return sign | ((f + 0x7FFFu + ((f >> 16) & 1u)) >> 16);
 }
 
-// Non-finite lanes: class of bf16 a * c (a non-finite): 1 +inf, 2 -inf, 3 NaN; 0 when a is finite.
-inline uint mul_class(uint a, F64 c) {
-  if (((a >> 7) & 0xFFu) != 0xFFu) return 0u;
-  if ((a & 0x7Fu) != 0u || c.zero) return 3u;
-  return ((((a >> 15) & 1u) != 0u) != c.neg) ? 2u : 1u;
+// float64 -> fp16 in one rounding (RNE, fp16 subnormals, overflow to inf); returns fp16 bits.
+inline uint f64_to_half(F64 v) {
+  uint sign = v.neg ? 0x8000u : 0u;
+  if (v.zero) return sign;
+  int E = v.e + 52;
+  if (E > 15) return sign | 0x7C00u;
+  if (E >= -14) {
+    ulong q = rne_shift(v.m, 42u);
+    if (q == (1ul << 11)) { q >>= 1; E += 1; }
+    return sign | (E > 15 ? 0x7C00u : ((uint(E + 15) << 10) | (uint(q) & 0x3FFu)));
+  }
+  int sh = -24 - v.e;                  // fp16 subnormal: k * 2^-24, k = m * 2^-sh; sh > 42 here
+  return sign | (sh > 63 ? 0u : uint(rne_shift(v.m, uint(sh))));  // k == 2^10 is the smallest normal's pattern
 }
 
-// p + (q or -q) where at least one class is non-finite (the other product is finite): bf16 bits.
-inline uint nonfinite_lane(uint p, uint q, bool subtract) {
-  if (subtract && (q == 1u || q == 2u)) q = 3u - q;
-  if (p == 3u || q == 3u) return 0x7FC0u;
-  if (p != 0u && q != 0u && p != q) return 0x7FC0u;
-  uint k = p != 0u ? p : q;
-  return k == 1u ? 0x7F80u : 0xFF80u;
-}
-
-// float64 bits of an F64 (test hook: exposes the emulated float64 lanes before the bf16 cast).
+// float64 bits of an F64 (test hook: exposes the emulated float64 lanes before the 16-bit cast).
 inline ulong f64_encode(F64 v) {
   ulong sign = v.neg ? (1ul << 63) : 0ul;
   if (v.zero) return sign;
   return sign | (ulong(v.e + 1075) << 52) | (v.m & 0xFFFFFFFFFFFFFul);
 }
 """
+
+# Per-dtype lane functions used by the kernel bodies: lane_finite(a), lane_mul(a, c) = fl64(a * c) for a finite,
+# lane_out(v) the float64 -> storage cast, lane_special(a, c) the non-finite product (0 when a is finite) and
+# lane_nonfinite(p, q, subtract) the lane p + (q or -q) when at least one product is non-finite.
+_LANES_BF16 = r"""
+inline bool lane_finite(uint a) { return ((a >> 7) & 0xFFu) != 0xFFu; }
+
+inline F64 lane_mul(uint a, F64 c) {
+  uint ea = (a >> 7) & 0xFFu, fa = a & 0x7Fu;
+  bool neg = ((a >> 15) & 1u) != 0u;
+  return f64_mul_sig(ulong(ea == 0u ? fa : (fa | 0x80u)), ea == 0u ? -133 : int(ea) - 134, neg, c);  // <= 61 bits
+}
+
+inline uint lane_out(F64 v) { return f64_to_bf16(v); }
+
+// Class of bf16 a * c (a non-finite): 1 +inf, 2 -inf, 3 NaN; 0 when a is finite.
+inline uint lane_special(uint a, F64 c) {
+  if (((a >> 7) & 0xFFu) != 0xFFu) return 0u;
+  if ((a & 0x7Fu) != 0u || c.zero) return 3u;
+  return ((((a >> 15) & 1u) != 0u) != c.neg) ? 2u : 1u;
+}
+
+// Classes -> bf16 bits; every NaN is MLX's canonical bf16 NaN 0x7FC0.
+inline uint lane_nonfinite(uint p, uint q, bool subtract) {
+  if (subtract && (q == 1u || q == 2u)) q = 3u - q;
+  if (p == 3u || q == 3u) return 0x7FC0u;
+  if (p != 0u && q != 0u && p != q) return 0x7FC0u;
+  uint k = p != 0u ? p : q;
+  return k == 1u ? 0x7F80u : 0xFF80u;
+}
+"""
+
+_LANES_HALF = r"""
+inline bool lane_finite(uint a) { return ((a >> 10) & 0x1Fu) != 0x1Fu; }
+
+inline F64 lane_mul(uint a, F64 c) {
+  uint ea = (a >> 10) & 0x1Fu, fa = a & 0x3FFu;
+  bool neg = ((a >> 15) & 1u) != 0u;
+  return f64_mul_sig(ulong(ea == 0u ? fa : (fa | 0x400u)), ea == 0u ? -24 : int(ea) - 25, neg, c);  // <= 64 bits
+}
+
+inline uint lane_out(F64 v) { return f64_to_half(v); }
+
+// fp16 a * c (a non-finite) as fp16 bits: a NaN a quieted (sign and payload kept), inf * 0 the default NaN
+// 0x7E00, otherwise a signed inf; 0 when a is finite.
+inline uint lane_special(uint a, F64 c) {
+  if (((a >> 10) & 0x1Fu) != 0x1Fu) return 0u;
+  if ((a & 0x3FFu) != 0u) return a | 0x200u;
+  if (c.zero) return 0x7E00u;
+  return ((((a >> 15) & 1u) != 0u) != c.neg) ? 0xFC00u : 0x7C00u;
+}
+
+// The CPU's float64 p + (q or -q): the first NaN operand as is (subtraction does not flip a NaN's sign), then
+// inf - inf the default NaN 0x7E00, otherwise the infinity.
+inline uint lane_nonfinite(uint p, uint q, bool subtract) {
+  if ((p & 0x7FFFu) > 0x7C00u) return p;
+  if ((q & 0x7FFFu) > 0x7C00u) return q;
+  if (subtract && q != 0u) q ^= 0x8000u;
+  if (p != 0u && q != 0u && p != q) return 0x7E00u;
+  return p != 0u ? p : q;
+}
+"""
+
+_LANES = {mx.bfloat16: ("", _LANES_BF16), mx.float16: ("_half", _LANES_HALF)}
 
 _SOURCE_PROLOGUE = r"""
   uint gid = thread_position_in_grid.x;
@@ -238,32 +306,36 @@ _SOURCE_PROLOGUE = r"""
 
 _SOURCE = _SOURCE_PROLOGUE + r"""
   uint re, im;
-  if (((a >> 7) & 0xFFu) != 0xFFu && ((b >> 7) & 0xFFu) != 0xFFu) {
-    F64 bs = f64_mul(b, s); bs.neg = !bs.neg;
-    re = f64_to_bf16(f64_add(f64_mul(a, c), bs));
-    im = f64_to_bf16(f64_add(f64_mul(a, s), f64_mul(b, c)));
+  if (lane_finite(a) && lane_finite(b)) {
+    F64 bs = lane_mul(b, s); bs.neg = !bs.neg;
+    re = lane_out(f64_add(lane_mul(a, c), bs));
+    im = lane_out(f64_add(lane_mul(a, s), lane_mul(b, c)));
   } else {
-    re = nonfinite_lane(mul_class(a, c), mul_class(b, s), true);
-    im = nonfinite_lane(mul_class(a, s), mul_class(b, c), false);
+    re = lane_nonfinite(lane_special(a, c), lane_special(b, s), true);
+    im = lane_nonfinite(lane_special(a, s), lane_special(b, c), false);
   }
   out[gid] = re | (im << 16);
 """
 
 _SOURCE_F64 = _SOURCE_PROLOGUE + r"""
-  F64 bs = f64_mul(b, s); bs.neg = !bs.neg;   // finite inputs only
-  out[2u * gid] = f64_encode(f64_add(f64_mul(a, c), bs));
-  out[2u * gid + 1u] = f64_encode(f64_add(f64_mul(a, s), f64_mul(b, c)));
+  F64 bs = lane_mul(b, s); bs.neg = !bs.neg;   // finite inputs only
+  out[2u * gid] = f64_encode(f64_add(lane_mul(a, c), bs));
+  out[2u * gid + 1u] = f64_encode(f64_add(lane_mul(a, s), lane_mul(b, c)));
 """
 
 _kernels: dict = {}
 
 
-def _get_kernel(f64_lanes: bool):
-    if f64_lanes not in _kernels:
-        _kernels[f64_lanes] = mx.fast.metal_kernel(
-            name="mg4_causal_rope_f64_lanes" if f64_lanes else "mg4_causal_rope_f64", input_names=["x", "rot"],
-            output_names=["out"], source=_SOURCE_F64 if f64_lanes else _SOURCE, header=_HEADER)
-    return _kernels[f64_lanes]
+def _get_kernel(dtype, f64_lanes: bool):
+    """The kernel for bf16 or fp16 lanes (fp16: `_half` name suffix and lane functions)."""
+    key = (dtype, f64_lanes)
+    if key not in _kernels:
+        suffix, lanes = _LANES[dtype]
+        _kernels[key] = mx.fast.metal_kernel(
+            name=("mg4_causal_rope_f64_lanes" if f64_lanes else "mg4_causal_rope_f64") + suffix,
+            input_names=["x", "rot"], output_names=["out"], source=_SOURCE_F64 if f64_lanes else _SOURCE,
+            header=_HEADER + lanes)
+    return _kernels[key]
 
 
 def _launch(x: mx.array, rotations: RopeRotations, f64_lanes: bool) -> mx.array:
@@ -273,26 +345,31 @@ def _launch(x: mx.array, rotations: RopeRotations, f64_lanes: bool) -> mx.array:
         raise ValueError("head dimension and rotation pairs must be even")
     if x.shape[1] != rotations.seq_len or x.shape[-1] // 2 != rotations.pairs:
         raise ValueError("rotation shape does not match x")
-    if x.dtype != mx.bfloat16:
-        raise TypeError(f"x must be bfloat16 (the kernel emulates float64 products of bf16 inputs), got {x.dtype}")
+    if x.dtype not in _LANES:
+        raise TypeError("x must be bfloat16 or float16 (the kernel emulates float64 products of 16-bit inputs), "
+                        f"got {x.dtype}")
     b, s, n, d = x.shape
-    pairs = x.view(mx.uint32)  # [B, S, N, D/2]: one (real, imag) bf16 pair per word
+    pairs = x.view(mx.uint32)  # [B, S, N, D/2]: one (real, imag) 16-bit pair per word
     shape, dtype = ((b, s, n, d), mx.uint64) if f64_lanes else (pairs.shape, mx.uint32)
-    (out,) = _get_kernel(f64_lanes)(inputs=[pairs, rotations.table], template=[("S", s), ("N", n), ("P", d // 2)],
-                                    grid=(b * s * n * (d // 2), 1, 1), threadgroup=(256, 1, 1),
-                                    output_shapes=[shape], output_dtypes=[dtype])
+    (out,) = _get_kernel(x.dtype, f64_lanes)(inputs=[pairs, rotations.table],
+                                             template=[("S", s), ("N", n), ("P", d // 2)],
+                                             grid=(b * s * n * (d // 2), 1, 1), threadgroup=(256, 1, 1),
+                                             output_shapes=[shape], output_dtypes=[dtype])
     return out
 
 
 def apply_causal_rope(x: mx.array, rotations: RopeRotations) -> mx.array:
-    """Apply causal RoPE to bf16 `x` [B, S, N, D]; bitwise equal to the float64 CPU path. GPU only, lazy."""
-    return _launch(x, rotations, f64_lanes=False).view(mx.bfloat16)
+    """Apply causal RoPE to bf16 or fp16 `x` [B, S, N, D]; returns x.dtype, bitwise equal to the float64 CPU path.
+
+    GPU only, lazy.
+    """
+    return _launch(x, rotations, f64_lanes=False).view(x.dtype)
 
 
 def _float64_lanes_bits(x: mx.array, rotations: RopeRotations) -> mx.array:
-    """Test hook: the kernel's emulated float64 results (uint64 bits [B, S, N, D]) before the float32/bf16 cast.
+    """Test hook: the kernel's emulated float64 results (uint64 bits [B, S, N, D]) before the 16-bit cast.
 
     Finite inputs only. Lets tests check the float64 emulation itself (all 53 bits, so product rounding is
-    visible), which the bf16 output hides almost always.
+    visible), which the 16-bit output hides almost always.
     """
     return _launch(x, rotations, f64_lanes=True)
