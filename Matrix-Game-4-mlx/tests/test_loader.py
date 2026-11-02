@@ -188,7 +188,9 @@ def test_dynamic_keeps_caption_encoder(tmp_path, monkeypatch, mode, scene):
 
 @pytest.mark.parametrize("preset,argv,runtime", [("realtime", [], "ring-fused"), ("quality", [], "native"),
                                                 ("realtime", ["--dit-runtime", "native"], "native"),
-                                                ("quality", ["--dit-runtime", "ring-fused"], "ring-fused")])
+                                                ("quality", ["--dit-runtime", "ring-fused"], "ring-fused"),
+                                                ("apple", [], "apple"), ("apple-fast", [], "apple-fast"),
+                                                ("quality", ["--dit-runtime", "apple"], "apple")])
 def test_load_installs_dit_runtime(tmp_path, monkeypatch, preset, argv, runtime):
     """load() installs the resolved runtime on the DiT and config() (render.json, session report) reports it."""
     import mlx.core as mx
@@ -199,7 +201,13 @@ def test_load_installs_dit_runtime(tmp_path, monkeypatch, preset, argv, runtime)
     embeds = mx.ones((1, 512, 4096), dtype=mx.bfloat16)
     monkeypatch.setattr(wrappers, "WanTextEncoder", lambda *a: (lambda prompts: {"prompt_embeds": embeds}))
     gen = types.SimpleNamespace(model=types.SimpleNamespace())
-    monkeypatch.setattr(loading, "build_dit", lambda *a, **k: gen)
+    built = {}
+
+    def fake_build_dit(*a, **k):
+        built.update(k)
+        return gen
+
+    monkeypatch.setattr(loading, "build_dit", fake_build_dit)
     monkeypatch.setattr(wrappers, "WanVAE22Wrapper", lambda *a, **k: object())
     monkeypatch.setattr(taehv.TAEHV, "from_pack", staticmethod(lambda *a, **k: object()))
     monkeypatch.setattr(stream, "encode_sink_image", lambda *a, **k: mx.zeros((1, 48, 1, 4, 4)))
@@ -211,9 +219,33 @@ def test_load_installs_dit_runtime(tmp_path, monkeypatch, preset, argv, runtime)
     assert m.config()["dit_runtime"] == runtime
     m.load()
     installed = gen.model.castle_runtime
+    assert built["dtype"] == (mx.float16 if runtime.startswith("apple") else mx.bfloat16)
     assert (installed is None) if runtime == "native" else (isinstance(installed, CastleRuntime) and installed.mode == runtime)
     cfg = m.config()
     assert cfg["dit_runtime"] == runtime and cfg["experimental_runtime"] is (runtime != "native")
+
+
+def test_build_dit_converts_one_tensor_at_a_time(tmp_path):
+    """build_dit casts to the requested dtype (default bf16 bitwise the file); the tiny pack uses prefixed keys."""
+    import json
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+    from matrix_game_mlx.inference import loading
+    from matrix_game_mlx.inference.wan.modules.causal_model import CausalWanModel
+    cfg = dict(model_type="t2v", patch_size=(1, 2, 2), text_len=8, in_dim=16, dim=32, ffn_dim=64, freq_dim=16,
+               text_dim=24, out_dim=16, num_heads=2, num_layers=2, qk_norm=True, cross_attn_norm=True, eps=1e-6)
+    (tmp_path / "config.json").write_text(json.dumps(cfg))
+    mx.random.seed(0)
+    model = CausalWanModel(**cfg)
+    source = {"dit_x." + k: (mx.random.normal(v.shape) * 0.1).astype(mx.bfloat16)
+              for k, v in tree_flatten(model.parameters())}
+    mx.save_safetensors(str(tmp_path / "dit_x.safetensors"), source)
+    for dtype, kwargs in ((mx.float16, {"dtype": mx.float16}), (mx.bfloat16, {})):
+        loaded = dict(tree_flatten(loading.build_dit(tmp_path, "dit_x", **kwargs).model.parameters()))
+        assert set(loaded) == {k[len("dit_x."):] for k in source}
+        for key, value in source.items():
+            got = loaded[key[len("dit_x."):]]
+            assert got.dtype == dtype and mx.array_equal(got, value.astype(dtype))
 
 
 def test_pack_dir_from_env(tmp_path, monkeypatch):

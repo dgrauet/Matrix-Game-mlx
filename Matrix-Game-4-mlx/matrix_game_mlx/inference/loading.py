@@ -17,7 +17,15 @@ def build_dit(pack_dir: Path, component: str, dtype=mx.bfloat16, timestep_shift:
     model = CausalWanModel(**{k: cfg[k] for k in _ARCH_KEYS})
     weights = mx.load(str(Path(pack_dir) / f"{component}.safetensors"))
     prefix = component + "."
-    clean = {k[len(prefix):] if k.startswith(prefix) else k: v.astype(dtype) for k, v in weights.items()}
+    clean = {}
+    while weights:                                        # one tensor at a time: two DiT copies never coexist
+        key, value = weights.popitem()
+        if value.dtype != dtype:
+            value = value.astype(dtype)
+            mx.eval(value)
+        clean[key[len(prefix):] if key.startswith(prefix) else key] = value
+        del value
     model.load_weights(list(clean.items()), strict=True)
+    del clean
     mx.eval(model.parameters())
     return WanDiffusionWrapper(model, timestep_shift=timestep_shift)

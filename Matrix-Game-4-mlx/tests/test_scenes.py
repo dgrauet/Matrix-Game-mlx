@@ -24,10 +24,11 @@ def fake_pack(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("preset,backend,steps,runtime", [
     ("quality", "wan", (1000, 500), "native"), ("baseline", "wan", (1000, 500), "native"),
-    ("realtime", "taehv", (1000,), "ring-fused")])
+    ("realtime", "taehv", (1000,), "ring-fused"), ("apple", "taehv", (1000,), "apple"),
+    ("apple-fast", "taehv", (1000,), "apple-fast")])
 def test_preset_resolution_matches_upstream(preset, backend, steps, runtime):
     a = model_args("castle", preset)
-    graph = preset == "realtime"                         # upstream: realtime + TAEHV defaults to the VAE graph
+    graph = preset in ("realtime", "apple", "apple-fast")  # upstream: realtime + TAEHV defaults to the VAE graph
     assert (a.vae_backend, a.steps, a.first_steps, a.dit_runtime, a.vae_graph) == (backend, steps, steps, runtime, graph)
 
 
@@ -59,10 +60,18 @@ def test_cuda_only_runtimes_rejected(preset, runtime):
 
 
 @pytest.mark.parametrize("scene", list(scenes.SCENES))
-@pytest.mark.parametrize("preset", ["quality", "baseline", "realtime"])
-@pytest.mark.parametrize("runtime", ["native", "ring-fused"])
+@pytest.mark.parametrize("preset", ["quality", "baseline", "realtime", "apple"])
+@pytest.mark.parametrize("runtime", ["native", "ring-fused", "apple", "apple-fast"])
 def test_mlx_runtimes_pass(scene, preset, runtime):
     assert model_args(scene, preset, ["--dit-runtime", runtime]).dit_runtime == runtime
+
+
+def test_apple_runtime_on_other_presets():
+    a = model_args("castle", "quality", ["--dit-runtime", "apple"])
+    assert (a.vae_backend, a.steps, a.dit_runtime, a.vae_graph) == ("wan", (1000, 500), "apple", False)
+    a = model_args("castle", "apple", ["--dit-runtime", "native"])
+    assert (a.vae_backend, a.steps, a.dit_runtime, a.vae_graph) == ("taehv", (1000,), "native", True)
+    assert model_args("castle", "apple-fast", ["--dit-runtime", "ring-fused"]).dit_runtime == "ring-fused"
 
 
 @pytest.mark.parametrize("flag", ["--model-dir", "--checkpoint", "--taehv-path"])

@@ -107,10 +107,14 @@ class ModelComponents:
         del text
         gc.collect()
         mx.clear_cache()
-        self.gen = build_dit(self.pack, self.component, timestep_shift=inference["scheduler_shift"])
-        from matrix_game_mlx.inference.runtime import install_runtime
+        from matrix_game_mlx.inference.runtime import dit_dtype, install_runtime
+        self.gen = build_dit(self.pack, self.component, dtype=dit_dtype(args.dit_runtime),
+                             timestep_shift=inference["scheduler_shift"])
         if args.dit_runtime.startswith("ring"):
             LOG.warning("Ring/fused runtime changes floating-point reduction order; use native for baseline comparisons")
+        if args.dit_runtime.startswith("apple"):
+            LOG.warning("apple runtimes run the DiT in float16 (apple-fast: 11-latent attention window); "
+                        "use native for baseline comparisons")
         install_runtime(self.gen, args.dit_runtime)
         if taehv:
             from matrix_game_mlx.inference.taehv import TAEHV
@@ -157,5 +161,5 @@ class ModelComponents:
                     early_publish=getattr(a, "early_publish", False),
                     profile_chunks=getattr(a, "profile_chunks", False),
                     reference_pipeline=getattr(a, "reference_pipeline", "stream"),
-                    experimental_runtime=self.dit_runtime().startswith("ring"),
+                    experimental_runtime=self.dit_runtime().startswith(("ring", "apple")),
                     preset=a.preset, component=self.component)

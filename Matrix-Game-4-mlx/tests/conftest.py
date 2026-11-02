@@ -19,7 +19,7 @@ for p in (MLX_ROOT, UPSTREAM_ROOT):
 
 
 def pytest_addoption(parser):
-    parser.addoption("--dit-runtime", choices=("native", "ring-fused"), default=None,
+    parser.addoption("--dit-runtime", choices=("native", "ring-fused", "apple", "apple-fast"), default=None,
                      help="DiT runtime of the real-weight parity tests (default: the preset's default)")
 
 

@@ -473,15 +473,16 @@ class _PoolVAE:
         return mx.broadcast_to(frame[None, :, None], (1, 3, count, 480, 864)).astype(self.dtype)
 
 
-def _stream_model(seed=0):
-    """The tiny bf16 DiT at the stream's latent geometry (48 latent + 48 control channels, 30 x 54 latents) behind
-    the generator wrapper, with ring-fused installed."""
+def _stream_model(seed=0, mode="ring-fused"):
+    """The tiny DiT at the stream's latent geometry (48 latent + 48 control channels, 30 x 54 latents) behind the
+    generator wrapper, in `mode`'s dtype (bf16 weights cast, as the loader does) with `mode` installed."""
     from matrix_game_mlx.inference.wrappers import WanDiffusionWrapper
     mx.random.seed(seed)
     model = CausalWanModel(**{**CFG, "in_dim": 96, "out_dim": 48})
     model.update(tree_map(lambda a: (0.05 * mx.random.normal(a.shape)).astype(mx.bfloat16), model.parameters()))
+    model.update(tree_map(lambda a: a.astype(RUNTIME_SPECS[mode].dtype), model.parameters()))
     gen = WanDiffusionWrapper(model)
-    install_runtime(gen, "ring-fused")
+    install_runtime(gen, mode)
     return gen
 
 
@@ -502,11 +503,14 @@ def _stream_chunks(gen, chunks, seed=3):
     return out
 
 
-def test_stream_second_session_matches_fresh_model():
-    """Stop -> Play on one model: a CastleStream pushed past the 21-latent window (compiled graph replayed) and
-    closed leaves nothing behind; the next stream on the same model is bitwise a stream on a fresh model."""
-    chunks = 24                                                   # positions 22 and 23 run the compiled graph
-    used, fresh = _stream_model(), _stream_model()
+@pytest.mark.parametrize("mode", ["ring-fused", "apple-fast"])
+def test_stream_second_session_matches_fresh_model(mode):
+    """Stop -> Play on one model: a CastleStream pushed past the attention window (compiled graph replayed) and
+    closed leaves nothing behind; the next stream on the same model is bitwise a stream on a fresh model. The
+    stream sets the window from the runtime, so apple-fast's graph starts at position 12 instead of 22."""
+    window = RUNTIME_SPECS[mode].window
+    chunks = window + 3                                           # the last two positions run the compiled graph
+    used, fresh = _stream_model(mode=mode), _stream_model(mode=mode)
     _stream_chunks(used, chunks, seed=5)
     runtime = used.model.castle_runtime
     assert runtime.replays == 2 * 2 + 1 and runtime.captures == 1   # prime + 2 steady chunks x (denoise, clean)
