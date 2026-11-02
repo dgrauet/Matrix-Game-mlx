@@ -503,6 +503,47 @@ def _stream_chunks(gen, chunks, seed=3):
     return out
 
 
+class _WanStubVAE:
+    """Wan-backend stand-in (bf16): records the dtype of what the stream's incremental decoder feeds the decoder."""
+
+    dtype = mx.bfloat16
+
+    def __init__(self):
+        self.decoder_inputs, self.model = [], types.SimpleNamespace(encoder=None, conv2=lambda z: z)
+        self.model.decoder = self._decode
+
+    def _scale(self, dtype):
+        return [mx.zeros((48,), dtype), mx.ones((48,), dtype)]
+
+    def encode_stream(self, x, feat_cache):                        # [1, T, 480, 864, 3] -> [1, 1, 48, 30, 54]
+        return mx.zeros((1, 1, 48, 30, 54), self.dtype)
+
+    def _decode(self, x, feat_cache, feat_idx, first_chunk):       # one latent -> 1 then 4 frames, patch-2 layout
+        self.decoder_inputs.append(x.dtype)
+        return mx.zeros((1, 1 if first_chunk else 4, 240, 432, 12), self.dtype)
+
+
+def test_stream_wan_two_steps_with_fp16_dit(monkeypatch):
+    """`--preset quality --dit-runtime apple`: fp16 DiT, Wan VAE (bf16), two denoise steps. The apple runtime raises
+    on any non-fp16 DiT input, so completing proves the add-noise step re-casts to fp16; the Wan decoder receives
+    the VAE dtype (bf16) and the decoded frames are finite."""
+    from matrix_game_mlx.inference import stream as stream_module
+    from matrix_game_mlx.inference.wan.modules import vae2_2
+    monkeypatch.setattr(vae2_2, "count_conv3d", lambda module: 0)
+    gen, vae = _stream_model(mode="apple"), _WanStubVAE()
+    prompt = mx.zeros((1, 8, 32), mx.bfloat16)
+    stream = stream_module.CastleStream(gen, vae, prompt, vae_backend="wan", steps=(1000, 500), first_steps=(1000, 500))
+    assert stream.dtype == mx.float16
+    frame = 0
+    for count in (1, 4):
+        chunk = stream.push(mx.zeros((count, 3, 480, 864)), frame_start=frame)
+        frame += count
+        assert chunk.latent.dtype == mx.float16 and tuple(chunk.pixels.shape) == (count, 3, 480, 864)
+        assert bool(mx.all(mx.isfinite(chunk.pixels))) and bool(mx.all(mx.isfinite(chunk.latent)))
+    assert vae.decoder_inputs == [mx.bfloat16, mx.bfloat16]
+    stream.close()
+
+
 @pytest.mark.parametrize("mode", ["ring-fused", "apple-fast"])
 def test_stream_second_session_matches_fresh_model(mode):
     """Stop -> Play on one model: a CastleStream pushed past the attention window (compiled graph replayed) and
