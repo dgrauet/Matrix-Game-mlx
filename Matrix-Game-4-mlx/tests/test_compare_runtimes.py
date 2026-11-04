@@ -59,3 +59,34 @@ def test_compare_refuses_runs_with_other_inputs(tmp_path):
     (tmp_path / "b" / "meta.json").write_text(json.dumps(meta))
     with pytest.raises(SystemExit, match="seed"):
         compare(tmp_path / "a", tmp_path / "b", window_chunk=21)
+
+
+@pytest.mark.parametrize("mode, dtype, window", [("native", "bfloat16", 21), ("ring-fused", "bfloat16", 21),
+                                                ("apple", "float16", 21), ("apple-fast", "float16", 11)])
+def test_run_meta_records_dtype_and_window(mode, dtype, window):
+    """A run's meta names the DiT dtype and the attention window the stream set (tiny DiT, stand-in codec)."""
+    import mlx.core as mx
+    from matrix_game_mlx.inference.stream import CastleStream
+    from tests.compare_runtimes import dit_meta
+    from tests.test_runtime import _PoolVAE, _stream_model
+    stream = CastleStream(_stream_model(mode=mode), _PoolVAE(), mx.zeros((1, 8, 32), mx.bfloat16),
+                          vae_backend="taehv", steps=(1000,), first_steps=(1000,))
+    assert dit_meta(stream) == {"dit_dtype": dtype, "window": window}
+    stream.close()
+
+
+def test_compare_reports_dtype_and_window(tmp_path, capsys):
+    """Runs that differ only in the runtime (dtype, window) compare; the result and the header name both."""
+    preds = [np.ones((1, 1, 48, 30, 54), np.float32)]
+    decoded = [np.zeros((1, 3, 8, 8), np.float32)]
+    _dump(tmp_path / "a", "native", preds, decoded)
+    _dump(tmp_path / "b", "apple-fast", preds, decoded)
+    for name, dtype, window in (("a", "bfloat16", 21), ("b", "float16", 11)):
+        meta = json.loads((tmp_path / name / "meta.json").read_text())
+        meta.update(dit_dtype=dtype, window=window)
+        (tmp_path / name / "meta.json").write_text(json.dumps(meta))
+    result = compare(tmp_path / "a", tmp_path / "b", window_chunk=21)
+    assert result["dit_dtype"] == {"reference": "bfloat16", "other": "float16"}
+    assert result["window"] == {"reference": 21, "other": 11}
+    header = capsys.readouterr().out.splitlines()[0]
+    assert "native bfloat16 window 21" in header and "apple-fast float16 window 11" in header

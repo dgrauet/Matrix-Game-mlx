@@ -91,10 +91,12 @@ class CastleStream:
         self.scheduler = generator.get_scheduler()
         self.steps = warp_steps(self.scheduler, list(steps))
         self.steps_first = warp_steps(self.scheduler, list(first_steps))
-        set_attention_window(generator, 21, 1)
+        runtime = getattr(getattr(generator, "model", None), "castle_runtime", None)
+        window = runtime.window if runtime is not None else 21
+        set_attention_window(generator, window, 1)
         generator.model.set_rope_max_len(max(8192, max_latents + self.sink_offset))
         self.fsl = frame_seq_length_of(generator, self.shape[3], self.shape[4])
-        self.kv = init_kv_cache(generator, 1, 21 * self.fsl, self.dtype)
+        self.kv = init_kv_cache(generator, 1, window * self.fsl, self.dtype)
         self.xc = init_crossattn_cache(generator, 1, self.dtype)
         for cache in self.kv:
             cache["k_sink_raw"] = mx.zeros_like(cache["k"][:, :self.fsl])
@@ -108,7 +110,6 @@ class CastleStream:
             vae.clear_cache()
             if hasattr(vae, "prime"):
                 vae.prime()
-        runtime = getattr(getattr(generator, "model", None), "castle_runtime", None)
         if runtime is not None:
             runtime.prime(generator, self.prompt, self.shape, self.kv, self.xc, self.fsl, sink_rope_mode)
         if self.sink_offset:
@@ -222,7 +223,8 @@ class CastleStream:
                 if self.vae_backend == "wan":
                     decoded = self.decoder.push(pred)
                 else:
-                    decoded = self.vae.decode_stream(pred.transpose(0, 2, 1, 3, 4))[0].transpose(1, 0, 2, 3)
+                    latent = pred.astype(self.vae.dtype).transpose(0, 2, 1, 3, 4)
+                    decoded = self.vae.decode_stream(latent)[0].transpose(1, 0, 2, 3)
                 mx.eval(decoded)
             if tuple(decoded.shape) != (count, 3, *FRAME_SIZE):
                 raise RuntimeError("VAE decoder output cadence changed")

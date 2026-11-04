@@ -167,6 +167,8 @@ def test_profile_timing_keys():
 class _FakeRuntime:
     """Records the stream's runtime hooks (upstream: prime before gameplay, clear on close)."""
 
+    window = 21
+
     def __init__(self):
         self.events = []
 
@@ -321,3 +323,43 @@ def test_model_components_realtime_stream_smoke():
         assert np.isfinite(np.array(chunk.pixels.astype(mx.float32))).all()
         frame += count
     stream.close()
+
+
+class _WindowRuntime(_FakeRuntime):
+    def __init__(self, window):
+        super().__init__()
+        self.window = window
+
+
+@pytest.mark.parametrize("mode,window", [("apple-fast", 11), ("ring-fused", 21), (None, 21)])
+def test_stream_window_follows_runtime(mode, window):
+    """The blocks' attention window and the KV cache size come from the installed runtime (21 without one)."""
+    gen = _FakeGenerator()
+    block = SimpleNamespace(self_attn=SimpleNamespace())
+    gen.model.blocks = [block]
+    if mode is not None:
+        gen.model.castle_runtime = _WindowRuntime(window)
+    stream = _taehv_stream(gen)
+    assert block.self_attn.local_attn_size == gen.model.local_attn_size == window
+    assert block.self_attn.sink_size == 1
+    assert stream.kv[0]["k"].shape[1] == window * stream.fsl
+
+
+def test_taehv_decode_receives_vae_dtype_from_fp16_stream():
+    class Half(_FakeGenerator):
+        def __init__(self):
+            super().__init__()
+            self.model.patch_embedding.weight = mx.zeros((1,), mx.float16)
+
+        def __call__(self, **kw):
+            _, pred = super().__call__(**kw)
+            return None, pred.astype(mx.float16)
+
+    vae, seen = _taehv(), []
+    decode = vae.decode_stream
+    vae.decode_stream = lambda z: (seen.append(z.dtype), decode(z))[1]
+    from matrix_game_mlx.inference.stream import CastleStream
+    stream = CastleStream(Half(), vae, mx.zeros((1, 2, 4)), vae_backend="taehv", steps=(1000,), first_steps=(1000,))
+    assert stream.dtype == mx.float16
+    _run_pushes(stream, (1,))
+    assert seen == [mx.bfloat16]

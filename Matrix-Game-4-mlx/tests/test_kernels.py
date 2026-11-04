@@ -6,6 +6,7 @@ The references below are the native expressions: `WanLayerNorm` / `WanRMSNorm` m
 kernel too, reductions accumulate in fp32, and only the summation order inside a row reduction may differ. So the
 purely elementwise kernels (`gate_residual`, `gelu_tanh`) must be bitwise; the row-reduction kernels must be within
 1 bf16 ulp everywhere and bitwise on at least 99 % of the elements (measured share printed with -s).
+The `*_fp16` tests hold the fp16 variants to the same contract, measured in fp16 ulps.
 """
 import mlx.core as mx
 import numpy as np
@@ -22,18 +23,18 @@ MIN_SHARE = 0.99
 
 
 def _bits(a):
-    assert a.dtype == mx.bfloat16
+    assert a.dtype in (mx.bfloat16, mx.float16)
     return np.array(a.view(mx.uint16)).astype(np.int32)
 
 
 def _ordered(bits):
-    # bf16 bit patterns -> integers whose difference counts ulps (sign-magnitude to two's-complement ordering).
+    # bf16 / fp16 bit patterns -> integers whose difference counts ulps (sign-magnitude to two's-complement ordering).
     return np.where(bits & 0x8000, -(bits & 0x7FFF), bits)
 
 
 def _check_close(name, out, ref):
     """Within 1 bf16 ulp elementwise and bitwise on >= MIN_SHARE of the elements; records the share."""
-    assert out.dtype == mx.bfloat16 and out.shape == ref.shape and ref.dtype == mx.bfloat16
+    assert out.dtype == ref.dtype and out.dtype in (mx.bfloat16, mx.float16) and out.shape == ref.shape
     a, b = _bits(out), _bits(ref)
     ulps = np.abs(_ordered(a) - _ordered(b))
     share = float(np.mean(a == b))
@@ -44,7 +45,7 @@ def _check_close(name, out, ref):
 
 
 def _check_bitwise(name, out, ref):
-    assert out.dtype == mx.bfloat16 and out.shape == ref.shape
+    assert out.dtype == ref.dtype and out.dtype in (mx.bfloat16, mx.float16) and out.shape == ref.shape
     a, b = _bits(out), _bits(ref)
     BITWISE_SHARE[name] = float(np.mean(a == b))
     assert np.array_equal(a, b), f"{name}: {int(np.sum(a != b))} mismatches"
@@ -62,6 +63,19 @@ def _mod(rng, frames, c):
     e = mx.array(rng.standard_normal((1, frames, 6, c)).astype(np.float32) * 0.5).astype(mx.bfloat16)
     modulation = mx.array(rng.standard_normal((1, 6, c)).astype(np.float32) * 0.1).astype(mx.bfloat16)
     return e, modulation
+
+
+def _rows16(rng, s, c, scale=1.0):
+    return _rows(rng, s, c, scale).astype(mx.float16)  # same values; fp16 holds the 1e3 row
+
+
+def _mod16(rng, frames, c):
+    e, modulation = _mod(rng, frames, c)
+    return e.astype(mx.float16), modulation.astype(mx.float16)
+
+
+def _f16(rng, shape, scale=1.0, offset=0.0):
+    return mx.array(offset + rng.standard_normal(shape).astype(np.float32) * scale).astype(mx.float16)
 
 
 # --- native compositions (CausalWanAttentionBlock.__call__) -------------------------------------------------------
@@ -195,6 +209,94 @@ def test_row_kernels_bitwise_at_model_widths(c, scale):
         _check_bitwise("rms_norm" + tag, rms_norm(x, w, EPS), _native_rms_norm(x, w, EPS))
 
 
+# --- fp16 variants (same contract, fp16 ulps) -----------------------------------------------------------------
+
+@pytest.mark.parametrize("s,c,frames", SHAPES)
+@pytest.mark.parametrize("rows", [(0, 1), (3, 4)])
+def test_ln_modulate_matches_native_fp16(s, c, frames, rows):
+    rng = np.random.default_rng(s * 31 + c + rows[0])
+    x = _rows16(rng, s, c)
+    e, modulation = _mod16(rng, frames, c)
+    z, x_out = ln_modulate(x, e, modulation, EPS, *rows)
+    z_ref, _ = _native_ln_modulate(x, e, modulation, EPS, *rows)
+    assert x_out is x
+    _check_close(f"ln_modulate.fp16{rows}[{s}x{c}x{frames}]", z, z_ref)
+
+
+@pytest.mark.parametrize("s,c,frames", SHAPES)
+def test_ln_modulate_residual_matches_native_fp16(s, c, frames):
+    rng = np.random.default_rng(s * 37 + c)
+    x = _rows16(rng, s, c)
+    residual = _f16(rng, (1, s, c), 0.3)
+    residual[0, 0] = 0
+    e, modulation = _mod16(rng, frames, c)
+    z, x_out = ln_modulate(x, e, modulation, EPS, 3, 4, residual=residual)
+    z_ref, x_ref = _native_ln_modulate(x, e, modulation, EPS, 3, 4, residual=residual)
+    _check_bitwise(f"ln_modulate.residual_sum.fp16[{s}x{c}x{frames}]", x_out, x_ref)
+    _check_close(f"ln_modulate.residual.fp16[{s}x{c}x{frames}]", z, z_ref)
+
+
+@pytest.mark.parametrize("s,c,frames", SHAPES)
+def test_gate_ln_affine_matches_native_fp16(s, c, frames):
+    rng = np.random.default_rng(s * 41 + c)
+    x = _rows16(rng, s, c)
+    y = _f16(rng, (1, s, c))
+    y[0, 0] = 0
+    e, modulation = _mod16(rng, frames, c)
+    weight, bias = _f16(rng, (c,), 0.1, 1.0), _f16(rng, (c,), 0.1)
+    z, x_out = gate_ln_affine(x, y, e, modulation, 2, weight, bias, EPS)
+    z_ref, x_ref = _native_gate_ln_affine(x, y, e, modulation, 2, weight, bias, EPS)
+    _check_bitwise(f"gate_ln_affine.residual_sum.fp16[{s}x{c}x{frames}]", x_out, x_ref)
+    _check_close(f"gate_ln_affine.fp16[{s}x{c}x{frames}]", z, z_ref)
+
+
+@pytest.mark.parametrize("s,c,frames", SHAPES)
+@pytest.mark.parametrize("row", [2, 5])
+def test_gate_residual_is_bitwise_native_fp16(s, c, frames, row):
+    rng = np.random.default_rng(s * 43 + c + row)
+    x = _rows16(rng, s, c)
+    y = _f16(rng, (1, s, c), 4.0)
+    e, modulation = _mod16(rng, frames, c)
+    _check_bitwise(f"gate_residual.fp16[{s}x{c}x{frames}]", gate_residual(x, y, e, modulation, row),
+                   _native_gate_residual(x, y, e, modulation, row))
+
+
+@pytest.mark.parametrize("s,c,frames", SHAPES)
+def test_rms_norm_matches_native_fp16(s, c, frames):
+    rng = np.random.default_rng(s * 47 + c)
+    x = _rows16(rng, s, c, scale=3.0)
+    x[0, 0] = 0
+    weight = _f16(rng, (c,), 0.2, 1.0)
+    _check_close(f"rms_norm.fp16[{s}x{c}]", rms_norm(x, weight, EPS), _native_rms_norm(x, weight, EPS))
+
+
+@pytest.mark.parametrize("s,c", [(405, 14336), (7, 256)])
+def test_gelu_tanh_is_bitwise_native_fp16(s, c):
+    rng = np.random.default_rng(c)
+    x = _f16(rng, (1, s, c), 3.0)
+    x[0, 0, :4] = mx.array([0.0, -0.0, 20.0, -20.0]).astype(mx.float16)
+    _check_bitwise(f"gelu_tanh.fp16[{s}x{c}]", gelu_tanh(x), native_gelu_tanh(x))
+
+
+@pytest.mark.parametrize("c", [3072, 128])
+@pytest.mark.parametrize("scale", [0.01, 1.0, 100.0])
+def test_row_kernels_bitwise_at_model_widths_fp16(c, scale):
+    for seed in range(3):
+        rng = np.random.default_rng(1000 + seed)
+        x = _rows16(rng, 405, c, scale)
+        y = _f16(rng, (1, 405, c), scale)
+        e, modulation = _mod16(rng, 1, c)
+        w, bias = _f16(rng, (c,), 0.1, 1.0), _f16(rng, (c,), 0.1)
+        tag = f".fp16[{c} scale {scale} seed {seed}]"
+        _check_bitwise("ln_modulate" + tag, ln_modulate(x, e, modulation, EPS, 0, 1)[0],
+                       _native_ln_modulate(x, e, modulation, EPS, 0, 1)[0])
+        _check_bitwise("ln_modulate.residual" + tag, ln_modulate(x, e, modulation, EPS, 3, 4, residual=y)[0],
+                       _native_ln_modulate(x, e, modulation, EPS, 3, 4, residual=y)[0])
+        _check_bitwise("gate_ln_affine" + tag, gate_ln_affine(x, y, e, modulation, 2, w, bias, EPS)[0],
+                       _native_gate_ln_affine(x, y, e, modulation, 2, w, bias, EPS)[0])
+        _check_bitwise("rms_norm" + tag, rms_norm(x, w, EPS), _native_rms_norm(x, w, EPS))
+
+
 def test_bitwise_shares_reported():
     """Ledger line (run with -s): measured bitwise share per kernel and shape."""
     print({k: round(v, 6) for k, v in sorted(BITWISE_SHARE.items())})
@@ -227,7 +329,7 @@ def test_ln_modulate_rejects_bad_inputs():
 
 def test_gate_kernels_reject_bad_inputs():
     x, y, e, mod, w, b = _good()
-    for override in (dict(y=y[:, :5]), dict(y=y.astype(mx.float32)), dict(x=x.astype(mx.float16)),
+    for override in (dict(y=y[:, :5]), dict(y=y.astype(mx.float32)), dict(x=x.astype(mx.float32)),
                      dict(e=e[:, :, :5]), dict(gate_row=6)):
         kw = dict(x=x, y=y, e=e, modulation=mod, gate_row=5) | override
         with pytest.raises(ValueError):
@@ -244,6 +346,37 @@ def test_norm_and_gelu_reject_bad_inputs():
     for args in ((x.astype(mx.float32), w), (x[0], w), (x, w[:5]), (x, w.astype(mx.float32))):
         with pytest.raises(ValueError):
             rms_norm(*args, EPS)
-    for bad in (x.astype(mx.float32), x.astype(mx.float16)):
+    with pytest.raises(ValueError):
+        gelu_tanh(x.astype(mx.float32))
+    assert gelu_tanh(x.astype(mx.float16)).dtype == mx.float16
+
+
+def test_kernels_reject_mixed_dtypes():
+    """All arrays of one call share one dtype: an fp16 x with any bf16 companion (and the reverse) is rejected."""
+    x, y, e, mod, w, b = _good()
+    x, y, e, mod, w, b = (a.astype(mx.float16) for a in (x, y, e, mod, w, b))
+    bf = lambda a: a.astype(mx.bfloat16)  # noqa: E731
+    good = dict(x=x, e=e, modulation=mod, eps=EPS, shift_row=0, scale_row=1, residual=None)
+    ln_modulate(**good)
+    for override in (dict(e=bf(e)), dict(modulation=bf(mod)), dict(residual=bf(y))):
         with pytest.raises(ValueError):
-            gelu_tanh(bad)
+            ln_modulate(**(good | override))
+    with pytest.raises(ValueError):
+        ln_modulate(**(good | dict(x=bf(x), residual=y)))
+    good = dict(x=x, y=y, e=e, modulation=mod, gate_row=2, weight=w, bias=b, eps=EPS)
+    gate_ln_affine(**good)
+    for override in (dict(e=bf(e)), dict(modulation=bf(mod)), dict(y=bf(y)), dict(weight=bf(w)), dict(bias=bf(b))):
+        with pytest.raises(ValueError):
+            gate_ln_affine(**(good | override))
+    good = dict(x=x, y=y, e=e, modulation=mod, gate_row=5)
+    gate_residual(**good)
+    for override in (dict(e=bf(e)), dict(modulation=bf(mod)), dict(y=bf(y))):
+        with pytest.raises(ValueError):
+            gate_residual(**(good | override))
+    rms_norm(x, w, EPS)
+    with pytest.raises(ValueError):
+        rms_norm(x, bf(w), EPS)
+    with pytest.raises(ValueError):
+        rms_norm(bf(x), w, EPS)
+    with pytest.raises(ValueError):
+        ln_modulate(**(dict(x=x.astype(mx.float32), e=e, modulation=mod, eps=EPS, shift_row=0, scale_row=1)))

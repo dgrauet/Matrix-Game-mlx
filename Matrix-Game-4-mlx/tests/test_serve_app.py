@@ -169,6 +169,8 @@ def test_apple_software_renderer_rejected():
 
 def test_first_frame_timeout():
     assert first_frame_timeout(SimpleNamespace(preset="realtime")) == 45
+    assert first_frame_timeout(SimpleNamespace(preset="apple")) == 45
+    assert first_frame_timeout(SimpleNamespace(preset="apple-fast")) == 45
     assert first_frame_timeout(SimpleNamespace(preset="quality")) == 300
     assert first_frame_timeout(SimpleNamespace(preset="baseline")) == 300
 

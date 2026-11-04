@@ -1,11 +1,16 @@
-"""Ring-fused runtime (`CastleRuntime`, unfused blocks) vs the native MLX block loop on a bf16 tiny model.
+"""Castle runtimes (`CastleRuntime`) vs the native MLX block loop on the tiny model.
+
+`ring-fused` runs the tiny model in bf16; `apple` and `apple-fast` run it in float16 (the bf16 weights cast, as the
+loader builds the DiT), against the native loop in the same dtype; `apple-fast` also with its 11-latent window.
 
 The runtime may differ from native only through the attention key order (ring KV -> SDPA summation order); RoPE,
 norms, modulation, cross-attention and FFN round exactly as native. Teacher-forced checks reset the runtime's cache to
 native's (ring order via `from_linear`) before every call, so rows the call does not write must match bitwise and only
 the written slot and the output carry the summation-order deviation. Free-running checks bound the drift over a rollout.
 """
+import gc
 import re
+import sys
 import types
 
 import mlx.core as mx
@@ -14,7 +19,9 @@ import numpy as np
 import pytest
 from mlx.utils import tree_flatten, tree_map
 
-from matrix_game_mlx.inference.runtime import CastleRuntime, from_linear, install_runtime, to_linear
+from matrix_game_mlx.inference.rollout import set_attention_window
+from matrix_game_mlx.inference.runtime import (RUNTIME_SPECS, CastleRuntime, RuntimeSpec, dit_dtype, from_linear,
+                                               install_runtime, to_linear)
 from matrix_game_mlx.inference.wan.modules.causal_model import CausalWanModel
 from matrix_game_mlx.inference.wan.modules.model import WanT2VCrossAttention
 from tests.conftest import rel_l2
@@ -38,12 +45,21 @@ def weights():
     return tree_flatten(_bf16_model().parameters())
 
 
-def _model(weights, runtime=False):
+def _runtime_weights(weights, runtime):
+    """The tiny model's bf16 weights cast to `runtime`'s DiT dtype (float16 for apple / apple-fast)."""
+    dtype = RUNTIME_SPECS[runtime].dtype
+    return [(name, a.astype(dtype)) for name, a in weights]
+
+
+def _model(weights, runtime=False, mode="ring-fused", window=None):
+    """Tiny DiT from `weights`; `runtime` installs `mode`; `window` sets the attention window (one sink frame)."""
     model = CausalWanModel(**CFG)
     model.load_weights(weights, strict=True)
     model.set_rope_max_len(8192)
+    if window is not None:
+        set_attention_window(types.SimpleNamespace(model=model), window, 1)
     if runtime:
-        install_runtime(types.SimpleNamespace(model=model), "ring-fused")
+        install_runtime(types.SimpleNamespace(model=model), mode)
         installed, run = model.castle_runtime, model.castle_runtime.run
         installed.calls = 0
 
@@ -87,21 +103,31 @@ def _inputs(rng, n):
     return [rng.standard_normal((1, 1, 2, 4, 12)).astype(np.float32) for _ in range(n)]
 
 
-def _teacher_forced(weights, mode, *, calls, switch_at=None, compiled=True):
-    """Run native and runtime per call from the same (native) cache state; assert per-call equivalence."""
+def _teacher_forced(weights, mode, *, calls, switch_at=None, compiled=True, dit_runtime="ring-fused", window=None,
+                    context_dtype=None):
+    """Run native and runtime per call from the same (native) cache state; assert per-call equivalence.
+
+    Both models run in `dit_runtime`'s dtype; `window` (default: the tiny model's) is set on both and sizes the
+    caches; `context_dtype` casts the text context before the call (bf16: what T5 produces)."""
     rng = np.random.default_rng(0)
     contexts = [rng.standard_normal((1, 8, 32)).astype(np.float32) for _ in range(2)]
-    native, runtime = _model(weights), _model(weights, runtime=True)
+    if context_dtype is not None:
+        contexts = [mx.array(c).astype(context_dtype) for c in contexts]
+    weights, dtype = _runtime_weights(weights, dit_runtime), RUNTIME_SPECS[dit_runtime].dtype
+    native = _model(weights, window=window)
+    runtime = _model(weights, runtime=True, mode=dit_runtime, window=window)
+    assert window is None or window == runtime.castle_runtime.window   # the runtime's window, as CastleStream sets
+    window = window or WINDOW
     runtime.castle_runtime.use_graph = compiled
-    kv_n, xc_n = _caches()
-    _, xc_r = _caches()
+    kv_n, xc_n = _caches(window=window, dtype=dtype)
+    _, xc_r = _caches(window=window, dtype=dtype)
     worst = [0.0, 0.0]
     for index, ((position, t), x) in enumerate(zip(calls, _inputs(rng, len(calls)))):
         ctx = contexts[int(switch_at is not None and position >= switch_at)]
         if switch_at is not None and position == switch_at and t != 0.0:
             for cross in xc_n + xc_r:           # as CastleStream.set_prompt
                 cross["is_init"] = False
-        kv_r = [from_linear(_clone(c), FSL, WINDOW) for c in kv_n]
+        kv_r = [from_linear(_clone(c), FSL, window) for c in kv_n]
         out_r = _call(runtime, x, t, ctx, kv_r, xc_r, position, mode)
         out_n = _call(native, x, t, ctx, kv_n, xc_n, position, mode)
         msg = f"call {index} position {position} t={t}"
@@ -109,7 +135,7 @@ def _teacher_forced(weights, mode, *, calls, switch_at=None, compiled=True):
         assert err < TOL, msg
         worst[0] = max(worst[0], err)
         for layer, (cr, cn) in enumerate(zip(kv_r, kv_n)):
-            lin = to_linear(cr, FSL, WINDOW)
+            lin = to_linear(cr, FSL, window)
             assert (lin["global_end_index"], lin["local_end_index"]) == (cn["global_end_index"], cn["local_end_index"])
             end = cn["local_end_index"]
             for name in ("k", "v"):
@@ -128,19 +154,41 @@ def _teacher_forced(weights, mode, *, calls, switch_at=None, compiled=True):
             for name in ("k", "v"):
                 assert mx.array_equal(cr[name], cn[name]), f"{msg} layer {layer} cross {name}"
     assert runtime.castle_runtime.calls == len(calls) and getattr(native, "castle_runtime", None) is None
-    steady = sum(position > WINDOW for position, _ in calls)
+    assert out_r.dtype == out_n.dtype == dtype
+    steady = sum(position > window for position, _ in calls)
     assert runtime.castle_runtime.replays == (steady if compiled else 0)
     return worst
 
 
+RUNTIMES = ["ring-fused", "apple"]
+
+
+@pytest.mark.parametrize("runtime", RUNTIMES)
 @pytest.mark.parametrize("mode", ["absolute", "fixed"])
-def test_runtime_matches_native(weights, mode):
-    MEASURED[f"teacher_forced[{mode}]"] = _teacher_forced(weights, mode, calls=_schedule(CHUNKS))
+def test_runtime_matches_native(weights, mode, runtime):
+    MEASURED[f"teacher_forced[{runtime},{mode}]"] = _teacher_forced(weights, mode, calls=_schedule(CHUNKS),
+                                                                    dit_runtime=runtime)
     print("max rel L2 (output, written slot):", MEASURED)
 
 
-def test_runtime_prompt_switch_matches_native(weights):
-    MEASURED["prompt_switch"] = _teacher_forced(weights, "fixed", calls=_schedule(CHUNKS), switch_at=10)
+@pytest.mark.parametrize("runtime", RUNTIMES)
+def test_runtime_prompt_switch_matches_native(weights, runtime):
+    """Dynamic captions: bf16 prompt embeddings (T5 stays bf16) switched mid-stream, into a bf16 or float16 DiT."""
+    MEASURED[f"prompt_switch[{runtime}]"] = _teacher_forced(weights, "fixed", calls=_schedule(CHUNKS), switch_at=10,
+                                                            dit_runtime=runtime, context_dtype=mx.bfloat16)
+    print("max rel L2 (output, written slot):", MEASURED)
+
+
+@pytest.mark.parametrize("mode", ["absolute", "fixed"])
+def test_apple_fast_window_matches_native(weights, mode):
+    """apple-fast's 11-latent window (set from the runtime, as CastleStream does) vs native float16 with the same
+    window, teacher-forced through position 15: planning, ring eviction (position 11) and the compiled steady graph
+    (positions 12-15) within the per-call tolerance. The tolerance does not resolve a fixed-sink re-RoPE error on
+    the tiny model; the bitwise `test_runtime_linear_layout_is_bitwise_native[...-apple-fast]` pins that."""
+    window = RUNTIME_SPECS["apple-fast"].window
+    assert window == 11
+    MEASURED[f"apple_fast_window[{mode}]"] = _teacher_forced(weights, mode, calls=_schedule(16),
+                                                             dit_runtime="apple-fast", window=window)
     print("max rel L2 (output, written slot):", MEASURED)
 
 
@@ -179,32 +227,41 @@ def test_runtime_free_running_matches_native(weights, mode):
     print("max rel L2 (output, cache):", MEASURED)
 
 
+@pytest.mark.parametrize("runtime", RUNTIMES + ["apple-fast"])
 @pytest.mark.parametrize("fused", [True, False], ids=["fused", "unfused"])
 @pytest.mark.parametrize("mode", ["absolute", "fixed"])
-def test_runtime_linear_layout_is_bitwise_native(weights, mode, fused):
-    """With the ring disabled (native linear slot order) the runtime is bitwise native: GPU RoPE, the composed
-    block pieces (or the fused kernels, whose row reductions follow MLX's order at these widths), cross-attention
-    and the fixed-sink key set round exactly as native; only the ring order differs."""
+def test_runtime_linear_layout_is_bitwise_native(weights, mode, fused, runtime):
+    """With the ring disabled (native linear slot order) the runtime is bitwise native in its dtype: GPU RoPE, the
+    composed block pieces (or the fused kernels, whose row reductions follow MLX's order at these widths),
+    cross-attention and the fixed-sink key set round exactly as native; only the ring order differs. apple-fast
+    runs with its 11-latent window on both models (set from the runtime, as CastleStream does), so the 60 chunks
+    pass its eviction and pin its fixed-sink re-RoPE (sink at position - 11) bitwise."""
     rng = np.random.default_rng(4)
     ctx = rng.standard_normal((1, 8, 32)).astype(np.float32)
-    native, runtime = _model(weights), _model(weights, runtime=True)
-    runtime.castle_runtime.ring = False
-    runtime.castle_runtime.fused = fused
-    (kv_n, xc_n), (kv_r, xc_r) = _caches(), _caches()
+    weights, dtype = _runtime_weights(weights, runtime), RUNTIME_SPECS[runtime].dtype
+    window = RUNTIME_SPECS[runtime].window if runtime == "apple-fast" else None
+    native = _model(weights, window=window)
+    castle = _model(weights, runtime=True, mode=runtime, window=window)
+    window = castle.blocks[0].self_attn.local_attn_size
+    castle.castle_runtime.ring = False
+    castle.castle_runtime.fused = fused
+    (kv_n, xc_n), (kv_r, xc_r) = _caches(window=window, dtype=dtype), _caches(window=window, dtype=dtype)
     calls = _schedule(CHUNKS, clean_first=True)
     for index, ((position, t), x) in enumerate(zip(calls, _inputs(rng, len(calls)))):
-        assert mx.array_equal(_call(runtime, x, t, ctx, kv_r, xc_r, position, mode),
-                              _call(native, x, t, ctx, kv_n, xc_n, position, mode)), f"call {index}"
+        out = _call(castle, x, t, ctx, kv_r, xc_r, position, mode)
+        assert out.dtype == dtype and mx.array_equal(out, _call(native, x, t, ctx, kv_n, xc_n, position, mode)), \
+            f"call {index}"
         for cr, cn in zip(kv_r, kv_n):
             for name in ("k", "v", "k_sink_raw"):
                 assert mx.array_equal(cr[name], cn[name]), f"call {index} {name}"
-    assert runtime.castle_runtime.calls == len(calls)
+    assert castle.castle_runtime.calls == len(calls)
 
 
+@pytest.mark.parametrize("runtime", RUNTIMES)
 @pytest.mark.parametrize("mode", ["absolute", "fixed"])
-def test_runtime_fused_is_bitwise_unfused(weights, mode, monkeypatch):
-    """ring-fused runs the fused kernels by default, and they round exactly as the composed native pieces: a
-    60-chunk free-running rollout (clean-first, ring layout) is bitwise equal with fused on and off."""
+def test_runtime_fused_is_bitwise_unfused(weights, mode, runtime, monkeypatch):
+    """The runtime runs the fused kernels by default, and they round exactly as the composed native pieces in its
+    dtype: a 60-chunk free-running rollout (clean-first, ring layout) is bitwise equal with fused on and off."""
     from matrix_game_mlx.inference import kernels
     counts = {}
     for name in ("ln_modulate", "gate_ln_affine", "gate_residual", "rms_norm", "gelu_tanh"):
@@ -214,12 +271,13 @@ def test_runtime_fused_is_bitwise_unfused(weights, mode, monkeypatch):
         monkeypatch.setattr(kernels, name, counted)
     rng = np.random.default_rng(5)
     ctx = rng.standard_normal((1, 8, 32)).astype(np.float32)
-    fused, unfused = _model(weights, runtime=True), _model(weights, runtime=True)
+    weights, dtype = _runtime_weights(weights, runtime), RUNTIME_SPECS[runtime].dtype
+    fused, unfused = _model(weights, runtime=True, mode=runtime), _model(weights, runtime=True, mode=runtime)
     assert fused.castle_runtime.fused
     unfused.castle_runtime.fused = False
     for model in (fused, unfused):  # eager: the Python call counters below see every call (compiled: the trace only)
         model.castle_runtime.use_graph = False
-    (kv_f, xc_f), (kv_u, xc_u) = _caches(), _caches()
+    (kv_f, xc_f), (kv_u, xc_u) = _caches(dtype=dtype), _caches(dtype=dtype)
     calls = _schedule(CHUNKS, clean_first=True)
     for index, ((position, t), x) in enumerate(zip(calls, _inputs(rng, len(calls)))):
         assert mx.array_equal(_call(fused, x, t, ctx, kv_f, xc_f, position, mode),
@@ -233,9 +291,9 @@ def test_runtime_fused_is_bitwise_unfused(weights, mode, monkeypatch):
                       "gelu_tanh": n}
 
 
-def _rollout(model, mode, calls, inputs, ctx, contexts_at=None):
+def _rollout(model, mode, calls, inputs, ctx, contexts_at=None, dtype=mx.bfloat16):
     """Free-running rollout on fresh caches; returns per-call outputs and the caches after every call."""
-    kv, xc = _caches()
+    kv, xc = _caches(dtype=dtype)
     outs, states = [], []
     for index, ((position, t), x) in enumerate(zip(calls, inputs)):
         if contexts_at is not None and index == contexts_at[0]:
@@ -248,22 +306,24 @@ def _rollout(model, mode, calls, inputs, ctx, contexts_at=None):
     return outs, states
 
 
+@pytest.mark.parametrize("runtime", RUNTIMES)
 @pytest.mark.parametrize("mode", ["absolute", "fixed"])
-def test_compiled_matches_uncompiled(weights, mode):
+def test_compiled_matches_uncompiled(weights, mode, runtime):
     """The compiled steady-window graph against the eager runtime: the eager path (use_graph off) passes the
     teacher-forced per-call assertions of test_runtime_matches_native (which runs the compiled one), and a 60-chunk
     free-running rollout is bitwise equal (outputs and every cache tensor after every call) with the graph on and
     off; the compiled run traces its graph once."""
-    MEASURED[f"eager_teacher_forced[{mode}]"] = _teacher_forced(weights, mode, calls=_schedule(CHUNKS),
-                                                                compiled=False)
+    MEASURED[f"eager_teacher_forced[{runtime},{mode}]"] = _teacher_forced(weights, mode, calls=_schedule(CHUNKS),
+                                                                          compiled=False, dit_runtime=runtime)
     rng = np.random.default_rng(6)
     ctx = rng.standard_normal((1, 8, 32)).astype(np.float32)
     calls = _schedule(CHUNKS, clean_first=True)
     inputs = _inputs(rng, len(calls))
-    compiled, eager = _model(weights, runtime=True), _model(weights, runtime=True)
+    weights, dtype = _runtime_weights(weights, runtime), RUNTIME_SPECS[runtime].dtype
+    compiled, eager = _model(weights, runtime=True, mode=runtime), _model(weights, runtime=True, mode=runtime)
     assert compiled.castle_runtime.use_graph
     eager.castle_runtime.use_graph = False
-    (out_c, st_c), (out_e, st_e) = (_rollout(m, mode, calls, inputs, ctx) for m in (compiled, eager))
+    (out_c, st_c), (out_e, st_e) = (_rollout(m, mode, calls, inputs, ctx, dtype=dtype) for m in (compiled, eager))
     for index, (a, b, sa, sb) in enumerate(zip(out_c, out_e, st_c, st_e)):
         assert mx.array_equal(a, b), f"call {index}"
         for layer, (ca, cb) in enumerate(zip(sa, sb)):
@@ -315,16 +375,18 @@ def test_time_embedding_memo_is_bitwise(weights):
     assert not runtime.time_memo
 
 
-def test_prime_compiles_and_leaves_clean_caches(weights):
+@pytest.mark.parametrize("runtime", RUNTIMES)
+def test_prime_compiles_and_leaves_clean_caches(weights, runtime):
     """prime (upstream's warm-up before gameplay) runs one steady-window call, so the graph is compiled before the
     first chunk, then erases every KV cache; a rollout from the primed caches is bitwise a rollout on fresh ones and
     compiles nothing more."""
     from matrix_game_mlx.inference.wrappers import WanDiffusionWrapper
     rng = np.random.default_rng(8)
     prompt = mx.array(rng.standard_normal((1, 8, 32)).astype(np.float32))
-    primed, fresh = _model(weights, runtime=True), _model(weights, runtime=True)
+    weights, dtype = _runtime_weights(weights, runtime), RUNTIME_SPECS[runtime].dtype
+    primed, fresh = _model(weights, runtime=True, mode=runtime), _model(weights, runtime=True, mode=runtime)
     gen = WanDiffusionWrapper(primed)
-    kv, xc = _caches()
+    kv, xc = _caches(dtype=dtype)
     primed.castle_runtime.prime(gen, prompt, (1, 1, 4, 2, 4), kv, xc, FSL, "fixed")
     assert primed.castle_runtime.captures == 1 and primed.castle_runtime.replays == 1
     for c in kv:
@@ -333,7 +395,7 @@ def test_prime_compiles_and_leaves_clean_caches(weights):
     assert all(c["is_init"] for c in xc)                       # the real prompt's text K/V is reused, as upstream
     calls = _schedule(CHUNKS // 4)
     inputs = _inputs(rng, len(calls))
-    kv_f, xc_f = _caches()
+    kv_f, xc_f = _caches(dtype=dtype)
     for (position, t), x in zip(calls, inputs):
         a = _call(primed, x, t, prompt, kv, xc, position, "fixed")
         b = _call(fresh, x, t, prompt, kv_f, xc_f, position, "fixed")
@@ -360,18 +422,25 @@ def test_prime_keeps_the_runtime_error(weights):
         assert not bool(mx.any(cache["k"])) and not bool(mx.any(cache["v"]))
 
 
-def test_runtime_second_stream_matches_fresh(weights):
+@pytest.mark.parametrize("runtime", ["ring-fused", "apple-fast"])
+def test_runtime_second_stream_matches_fresh(weights, runtime):
+    """A second stream on a used model (serve restarting a session) is bitwise a stream on a fresh model; apple-fast
+    runs in float16 with its own window, set from the runtime as CastleStream does."""
+    window = RUNTIME_SPECS[runtime].window if runtime == "apple-fast" else None
     rng = np.random.default_rng(2)
     ctx = rng.standard_normal((1, 8, 32)).astype(np.float32)
-    first, calls = _inputs(rng, 12), _schedule(10)
+    weights, dtype = _runtime_weights(weights, runtime), RUNTIME_SPECS[runtime].dtype
+    used = _model(weights, runtime=True, mode=runtime, window=window)
+    window = used.blocks[0].self_attn.local_attn_size
+    first_calls, calls = _schedule(window + 2), _schedule(window + 6)  # both reach the steady (compiled) state
+    first = _inputs(rng, len(first_calls))
     inputs = _inputs(rng, len(calls))
-    used = _model(weights, runtime=True)
-    kv, xc = _caches()
-    for (position, t), x in zip(_schedule(6), first):
+    kv, xc = _caches(window=window, dtype=dtype)
+    for (position, t), x in zip(first_calls, first):
         _call(used, x, t, ctx, kv, xc, position, "fixed")
     assert used.castle_runtime.captures == 1 and used.castle_runtime.replays > 0   # the compiled graph ran
-    fresh = _model(weights, runtime=True)
-    (kv_u, xc_u), (kv_f, xc_f) = _caches(), _caches()
+    fresh = _model(weights, runtime=True, mode=runtime, window=window)
+    (kv_u, xc_u), (kv_f, xc_f) = _caches(window=window, dtype=dtype), _caches(window=window, dtype=dtype)
     for (position, t), x in zip(calls, inputs):
         a = _call(used, x, t, ctx, kv_u, xc_u, position, "fixed")
         b = _call(fresh, x, t, ctx, kv_f, xc_f, position, "fixed")
@@ -406,15 +475,16 @@ class _PoolVAE:
         return mx.broadcast_to(frame[None, :, None], (1, 3, count, 480, 864)).astype(self.dtype)
 
 
-def _stream_model(seed=0):
-    """The tiny bf16 DiT at the stream's latent geometry (48 latent + 48 control channels, 30 x 54 latents) behind
-    the generator wrapper, with ring-fused installed."""
+def _stream_model(seed=0, mode="ring-fused"):
+    """The tiny DiT at the stream's latent geometry (48 latent + 48 control channels, 30 x 54 latents) behind the
+    generator wrapper, in `mode`'s dtype (bf16 weights cast, as the loader does) with `mode` installed."""
     from matrix_game_mlx.inference.wrappers import WanDiffusionWrapper
     mx.random.seed(seed)
     model = CausalWanModel(**{**CFG, "in_dim": 96, "out_dim": 48})
     model.update(tree_map(lambda a: (0.05 * mx.random.normal(a.shape)).astype(mx.bfloat16), model.parameters()))
+    model.update(tree_map(lambda a: a.astype(dit_dtype(mode)), model.parameters()))
     gen = WanDiffusionWrapper(model)
-    install_runtime(gen, "ring-fused")
+    install_runtime(gen, mode)
     return gen
 
 
@@ -435,11 +505,56 @@ def _stream_chunks(gen, chunks, seed=3):
     return out
 
 
-def test_stream_second_session_matches_fresh_model():
-    """Stop -> Play on one model: a CastleStream pushed past the 21-latent window (compiled graph replayed) and
-    closed leaves nothing behind; the next stream on the same model is bitwise a stream on a fresh model."""
-    chunks = 24                                                   # positions 22 and 23 run the compiled graph
-    used, fresh = _stream_model(), _stream_model()
+class _WanStubVAE:
+    """Wan-backend stand-in (bf16): records the dtype of what the stream's incremental decoder feeds the decoder."""
+
+    dtype = mx.bfloat16
+
+    def __init__(self):
+        self.decoder_inputs, self.model = [], types.SimpleNamespace(encoder=None, conv2=lambda z: z)
+        self.model.decoder = self._decode
+
+    def _scale(self, dtype):
+        return [mx.zeros((48,), dtype), mx.ones((48,), dtype)]
+
+    def encode_stream(self, x, feat_cache):                        # [1, T, 480, 864, 3] -> [1, 1, 48, 30, 54]
+        return mx.zeros((1, 1, 48, 30, 54), self.dtype)
+
+    def _decode(self, x, feat_cache, feat_idx, first_chunk):       # one latent -> 1 then 4 frames, patch-2 layout
+        self.decoder_inputs.append(x.dtype)
+        return mx.zeros((1, 1 if first_chunk else 4, 240, 432, 12), self.dtype)
+
+
+def test_stream_wan_two_steps_with_fp16_dit(monkeypatch):
+    """`--preset quality --dit-runtime apple`: fp16 DiT, Wan VAE (bf16), two denoise steps. The apple runtime's dtype
+    check sits after patch embedding, so completing shows the embedded input is fp16 (not every DiT input); the
+    Wan decoder receives the VAE dtype (bf16), both denoising steps run and the decoded frames are finite."""
+    from matrix_game_mlx.inference import stream as stream_module
+    from matrix_game_mlx.inference.wan.modules import vae2_2
+    monkeypatch.setattr(vae2_2, "count_conv3d", lambda module: 0)
+    gen, vae = _stream_model(mode="apple"), _WanStubVAE()
+    prompt = mx.zeros((1, 8, 32), mx.bfloat16)
+    stream = stream_module.CastleStream(gen, vae, prompt, vae_backend="wan", steps=(1000, 500), first_steps=(1000, 500))
+    assert stream.dtype == mx.float16
+    frame = 0
+    for count in (1, 4):
+        chunk = stream.push(mx.zeros((count, 3, 480, 864)), frame_start=frame)
+        frame += count
+        assert chunk.denoising_steps == 2
+        assert chunk.latent.dtype == mx.float16 and tuple(chunk.pixels.shape) == (count, 3, 480, 864)
+        assert bool(mx.all(mx.isfinite(chunk.pixels))) and bool(mx.all(mx.isfinite(chunk.latent)))
+    assert vae.decoder_inputs == [mx.bfloat16, mx.bfloat16]
+    stream.close()
+
+
+@pytest.mark.parametrize("mode", ["ring-fused", "apple-fast"])
+def test_stream_second_session_matches_fresh_model(mode):
+    """Stop -> Play on one model: a CastleStream pushed past the attention window (compiled graph replayed) and
+    closed leaves nothing behind; the next stream on the same model is bitwise a stream on a fresh model. The
+    stream sets the window from the runtime, so apple-fast's graph starts at position 12 instead of 22."""
+    window = RUNTIME_SPECS[mode].window
+    chunks = window + 3                                           # the last two positions run the compiled graph
+    used, fresh = _stream_model(mode=mode), _stream_model(mode=mode)
     _stream_chunks(used, chunks, seed=5)
     runtime = used.model.castle_runtime
     assert runtime.replays == 2 * 2 + 1 and runtime.captures == 1   # prime + 2 steady chunks x (denoise, clean)
@@ -452,16 +567,24 @@ def test_stream_second_session_matches_fresh_model():
 
 
 @pytest.mark.needs_weights
-def test_compiled_graph_is_bitwise_eager_on_real_weights():
+@pytest.mark.parametrize("mode", ("ring-fused", "apple"))
+def test_compiled_graph_is_bitwise_eager_on_real_weights(mode):
     """Real castle weights, one steady fixed-sink position (denoise then cache-update call) on random full-window
     caches: the compiled steady-window graph equals the eager runtime bit for bit, prediction and every K/V. Guards
-    an MLX upgrade: mx.compile is not bitwise for every op (README, Apple fast path parity)."""
+    an MLX upgrade: mx.compile is not bitwise for every op (README, Apple fast path parity). The DiT is built in
+    `dit_dtype(mode)` (apple: float16); the prompt and control latent stay bf16, as the stream feeds them (the T5
+    and the TAEHV are bf16), the latent and caches are in the DiT dtype."""
     from matrix_game_mlx.inference.loading import build_dit
     from matrix_game_mlx.inference.rollout import set_attention_window
     from matrix_game_mlx.inference.wrappers import init_crossattn_cache, init_kv_cache
     from tests.conftest import weights_dir
-    gen = build_dit(weights_dir(), "dit_castle")
-    install_runtime(gen, "ring-fused")
+    for name in ("last_type", "last_value", "last_traceback", "last_exc"):
+        sys.__dict__.pop(name, None)          # a failed case's postmortem traceback would keep its DiT alive
+    gc.collect()
+    mx.clear_cache()
+    dtype = dit_dtype(mode)
+    gen = build_dit(weights_dir(), "dit_castle", dtype=dtype)
+    install_runtime(gen, mode)
     runtime = gen.model.castle_runtime
     set_attention_window(gen, 21, 1)
     gen.model.set_rope_max_len(8192)
@@ -471,15 +594,15 @@ def test_compiled_graph_is_bitwise_eager_on_real_weights():
         runtime.clear()
         runtime.use_graph = use_graph
         keys = iter(mx.random.split(mx.random.key(0), 200))
-        normal = lambda shape: mx.random.normal(shape, key=next(keys)).astype(mx.bfloat16)
-        kv, xc = init_kv_cache(gen, 1, 21 * fsl, mx.bfloat16), init_crossattn_cache(gen, 1, mx.bfloat16)
+        normal = lambda shape, dt=dtype: mx.random.normal(shape, key=next(keys)).astype(dt)
+        kv, xc = init_kv_cache(gen, 1, 21 * fsl, dtype), init_crossattn_cache(gen, 1, dtype)
         for cache in kv:
             cache.update(k=normal(cache["k"].shape), v=normal(cache["v"].shape),
                          k_sink_raw=normal(cache["k"][:, :fsl].shape), global_end_index=position * fsl,
                          local_end_index=21 * fsl)
-        prompt, preds = normal((1, 512, 4096)), []
+        prompt, preds = normal((1, 512, 4096), mx.bfloat16), []
         for t, control in ((1000.0, True), (0.0, False)):
-            cond = {"prompt_embeds": prompt, "control_latent": normal((1, 1, 48, 30, 54))}
+            cond = {"prompt_embeds": prompt, "control_latent": normal((1, 1, 48, 30, 54), mx.bfloat16)}
             _, pred = gen(noisy_image_or_video=normal((1, 1, 48, 30, 54)), conditional_dict=cond,
                           timestep=mx.full((1, 1), t), kv_cache=kv, crossattn_cache=xc, current_start=position * fsl,
                           sink_rope_mode="fixed", drop_control=not control)
@@ -496,18 +619,28 @@ def test_compiled_graph_is_bitwise_eager_on_real_weights():
 
 
 def test_install_runtime_modes(weights):
+    assert RUNTIME_SPECS == {"ring-fused": RuntimeSpec(mx.bfloat16, 21), "apple": RuntimeSpec(mx.float16, 21),
+                             "apple-fast": RuntimeSpec(mx.float16, 11)}
     model = _model(weights)
     gen = types.SimpleNamespace(model=model)
-    install_runtime(gen, "ring-fused")
-    assert isinstance(model.castle_runtime, CastleRuntime) and model.castle_runtime.mode == "ring-fused"
-    assert model.castle_runtime.ring
+    for mode, spec in RUNTIME_SPECS.items():
+        install_runtime(gen, mode)
+        installed = model.castle_runtime
+        assert isinstance(installed, CastleRuntime) and installed.mode == mode
+        assert (installed.dtype, installed.window) == (spec.dtype, spec.window)
+        assert installed.ring and installed.fused and installed.use_graph
     install_runtime(gen, "native")
     assert model.castle_runtime is None
+    assert [dit_dtype(m) for m in ("native", "ring-fused", "apple", "apple-fast")] == [
+        mx.bfloat16, mx.bfloat16, mx.float16, mx.float16]
     for mode in ("kernels", "cudagraph", "ring", "ring-graph", "rtx5090", "bogus"):
         with pytest.raises(ValueError, match="Unknown DiT runtime"):
             install_runtime(gen, mode)
-    with pytest.raises(ValueError, match="Unknown castle runtime"):
-        CastleRuntime("ring")
+        with pytest.raises(ValueError, match="Unknown DiT runtime"):
+            dit_dtype(mode)
+    for mode in ("ring", "native"):
+        with pytest.raises(ValueError, match="Unknown castle runtime"):
+            CastleRuntime(mode)
 
 
 UNSUPPORTED = "Unsupported runtime: "
@@ -582,3 +715,29 @@ def test_runtime_rejects_unsupported_messages(weights):
     with pytest.raises(ValueError) as raised:
         _call(model, kw["x"], kw["t"], kw["ctx"], kv, xc, 0, "other")
     assert str(raised.value) == "Unsupported runtime: extra=False, sink=other, dtype=mlx.core.bfloat16, device=Device(gpu, 0)"
+
+
+@pytest.mark.parametrize("runtime,model_dtype,cache_dtype,message", [
+    ("apple", mx.bfloat16, mx.bfloat16,
+     "Unsupported runtime: extra=False, sink=fixed, dtype=mlx.core.bfloat16, device=Device(gpu, 0)"),
+    ("ring-fused", mx.float16, mx.float16,
+     "Unsupported runtime: extra=False, sink=fixed, dtype=mlx.core.float16, device=Device(gpu, 0)"),
+    ("apple", mx.float16, mx.bfloat16, "Expected float16 KV caches"),
+    ("apple", "modulation_bf16", mx.float16,
+     "Fused kernels expect float16 modulation, an affine cross-attention LayerNorm and RMS q/k norms")],
+    ids=["apple-bf16-model", "ring-fused-fp16-model", "apple-bf16-caches", "apple-bf16-modulation"])
+def test_runtime_rejects_dtype_mismatch(weights, runtime, model_dtype, cache_dtype, message):
+    """Mixed dtypes are a ValueError on the first call (no silent fallback, no promoted float32 path), before any
+    cache is planned or any text K/V initialised."""
+    rng = np.random.default_rng(3)
+    dtype = mx.float16 if model_dtype == "modulation_bf16" else model_dtype
+    model = _model([(name, a.astype(dtype)) for name, a in weights], runtime=True, mode=runtime)
+    if model_dtype == "modulation_bf16":
+        model.blocks[-1].modulation = model.blocks[-1].modulation.astype(mx.bfloat16)
+    kv, xc = _caches(dtype=cache_dtype)
+    x = rng.standard_normal((1, 1, 2, 4, 12)).astype(np.float32)
+    with pytest.raises(ValueError) as raised:
+        _call(model, x, 937.5, rng.standard_normal((1, 8, 32)).astype(np.float32), kv, xc, 0, "fixed")
+    assert str(raised.value) == message
+    assert all(c["global_end_index"] == 0 and c["local_end_index"] == 0 for c in kv)
+    assert not any(c["is_init"] for c in xc)

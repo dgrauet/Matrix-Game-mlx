@@ -10,14 +10,16 @@ A run streams `--chunks` chunks through `CastleStream.push` (the scene's sink, s
 preset; stream seed `--seed`, so the same noise on every runtime) on a deterministic input: the parity fixtures'
 pan (`tests/parity/gen_fixtures.pan_frames`: 480x864 crops of the scene sink image, 8 px per frame, ping-pong),
 extended to any length. Each chunk's generated latent and decoded frames are saved (`chunks.npz`: `pred_<i>`
-float32, `decoded_<i>` float16 [-1, 1]) with `meta.json`. The stream is free running: each runtime conditions on
-its own past outputs, so any per-call difference (here the ring's attention key order) compounds over chunks.
+float32, `decoded_<i>` float16 [-1, 1]) with `meta.json` (which also records the DiT dtype and the attention window
+the stream ran with). The stream is free running: each runtime conditions on its own past outputs, so any per-call
+difference (the ring's attention key order, the fp16 DiT, the shorter window) compounds over chunks.
 
 `--perturb-frame F` raises input frame F by one 8-bit level (2/255, clipped to 1): a run with it against one
 without, on the same runtime, measures how far the free-running stream carries an input change of that size (a
 sensitivity baseline for the runtime comparison).
 
-The comparison takes the first directory as the reference and reports per chunk the pred rel L2, the decoded rel L2
+The comparison takes the first directory as the reference (runs may differ in runtime, DiT dtype and window, which
+it prints, but not in scene, preset, seed, steps or input) and reports per chunk the pred rel L2, the decoded rel L2
 and PSNR (peak-to-peak 2, as the parity tests), whether the pred is bitwise equal, and summaries over the chunks
 before and from `--window-chunk` (default 21) on.
 """
@@ -67,6 +69,13 @@ class Pan:
         return np.minimum(out + np.float32(2.0 / 255.0), np.float32(1.0)) if perturb else out
 
 
+def dit_meta(stream) -> dict:
+    """The DiT dtype and the self-attention window (latents) `stream` runs with (the window is set at stream
+    creation from the installed runtime)."""
+    return {"dit_dtype": str(stream.dtype).rsplit(".", 1)[-1],
+            "window": stream.gen.model.blocks[0].self_attn.local_attn_size}
+
+
 def run(args) -> dict:
     import mlx.core as mx
     from matrix_game_mlx.inference.loader import ModelComponents
@@ -83,7 +92,7 @@ def run(args) -> dict:
     pan = Pan(args.sink_image)
     t0 = time.perf_counter()
     stream = comp.stream(seed=args.seed)
-    window = comp.gen.model.blocks[0].self_attn.local_attn_size
+    dit = dit_meta(stream)
     arrays, chunks, frame = {}, [], 0
     for i in range(args.chunks):
         count = 1 if i == 0 else 4
@@ -107,7 +116,7 @@ def run(args) -> dict:
         commit = None
     meta = {"scene": args.scene, "preset": args.preset, "dit_runtime": comp.dit_runtime(), "chunks": args.chunks,
             "seed": args.seed, "sink_mode": args.sink_mode, "sink_rope_mode": args.sink_rope_mode,
-            "sink_offset": stream.sink_offset, "window": window, "steps": list(args.steps),
+            "sink_offset": stream.sink_offset, **dit, "steps": list(args.steps),
             "first_steps": list(args.first_steps), "vae_backend": args.vae_backend,
             "vae_graph": getattr(args, "vae_graph", None), "input": f"pan of {args.sink_image.name}, {PAN_STEP} px/frame",
             "perturb_frame": args.perturb_frame,
@@ -145,8 +154,11 @@ def compare(reference: Path, other: Path, window_chunk: int, json_path=None) -> 
         da, db = a[f"decoded_{i}"].astype(np.float32), b[f"decoded_{i}"].astype(np.float32)
         rows.append({"index": i, "position": chunk["position"], "pred_bitwise": bool(np.array_equal(pa, pb)),
                      "pred_rel_l2": rel_l2(pb, pa), "decoded_rel_l2": rel_l2(db, da), "decoded_psnr": psnr(db, da)})
+    runs = {"reference": meta_a, "other": meta_b}
     result = {"reference": meta_a["dit_runtime"], "other": meta_b["dit_runtime"], "scene": meta_a["scene"],
-              "preset": meta_a["preset"], "chunks": meta_a["chunks"], "window": meta_a["window"],
+              "preset": meta_a["preset"], "chunks": meta_a["chunks"],
+              "dit_dtype": {name: meta.get("dit_dtype") for name, meta in runs.items()},
+              "window": {name: meta["window"] for name, meta in runs.items()},
               "sink_offset": meta_a["sink_offset"], "window_chunk": window_chunk,
               "first_non_bitwise_chunk": next((r["index"] for r in rows if not r["pred_bitwise"]), None),
               "before_window": _summary([r for r in rows if r["index"] < window_chunk]),
@@ -156,8 +168,9 @@ def compare(reference: Path, other: Path, window_chunk: int, json_path=None) -> 
     perturbed = {name: meta.get("perturb_frame") for name, meta in (("reference", meta_a), ("other", meta_b))}
     result["perturb_frame"] = perturbed
     label = "".join(f" ({name} input frame {f} +1 level)" for name, f in perturbed.items() if f is not None)
-    print(f"{result['scene']} {result['preset']}: {result['other']} vs {result['reference']}{label} "
-          f"(window {result['window']}, sink offset {result['sink_offset']})")
+    run_label = {name: f"{result[name]} {result['dit_dtype'][name]} window {result['window'][name]}" for name in runs}
+    print(f"{result['scene']} {result['preset']}: {run_label['other']} vs {run_label['reference']}{label} "
+          f"(sink offset {result['sink_offset']})")
     print("| chunk | position | pred bitwise | pred rel L2 | decoded rel L2 | decoded PSNR (dB) |")
     print("| --- | --- | --- | --- | --- | --- |")
     for r in rows:

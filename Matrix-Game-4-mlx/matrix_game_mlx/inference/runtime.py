@@ -7,8 +7,13 @@ them with the GPU kernel (`rope_kernel.apply_causal_rope`, bitwise equal to the 
 Once the KV window is full (steady state) the blocks run through one `mx.compile`d graph per session, the
 counterpart of upstream's CUDA graph replay (`prime` compiles it before gameplay, `clear` drops it); compilation keeps
 the traced arithmetic, so the only numeric difference from `native` is the attention key order (ring slots -> SDPA
-summation order). Only the bounded, batch-1, chunk-1, bf16 inference path is supported; anything else is a ValueError
-(never a silent fallback to the native loop).
+summation order). Only the bounded, batch-1, chunk-1 inference path in the runtime's dtype is supported; anything else
+is a ValueError (never a silent fallback to the native loop).
+
+Modes (`RUNTIME_SPECS`): `ring-fused` runs the bfloat16 DiT (upstream's dtype); the port-only `apple` is the same
+runtime on a float16 DiT (same kernels, RoPE and graph in float16), and `apple-fast` is `apple` with an 11-latent
+self-attention window instead of 21. A spec's window is what the stream sets on the blocks and sizes the caches with;
+`run` reads the window from the blocks and requires the input, the KV caches and the modulation in the spec's dtype.
 
 Planner part: `plan_cache` (upstream semantics on MLX caches whose end indices are Python ints, a documented
 deviation from upstream's 1-element tensors) plus `to_linear` / `from_linear`, which convert between the ring slot
@@ -16,9 +21,10 @@ order and the native linear order (sink frame, then the rolling window oldest to
 compare against torch fixtures.
 
 Deviations from upstream: `mx.compile` instead of CUDA graphs (a compiled function keyed on shapes and spans, not a
-graph bound to buffer addresses) and no varlen `cu_seqlens` in `Plan`; the only mode is `ring-fused`; caches are also
-required to be bfloat16; every layer is validated before any cache is planned (upstream plans layer by layer and can
-leave earlier layers planned when a later one fails); the timestep-embedding MLP is memoized per timestep value
+graph bound to buffer addresses) and no varlen `cu_seqlens` in `Plan`; the modes are `ring-fused` and the port-only
+`apple` / `apple-fast` (float16, the latter with an 11-latent window); caches are also required to be in the runtime's
+dtype; every layer is validated before any cache is planned (upstream plans layer by layer and can leave earlier
+layers planned when a later one fails); the timestep-embedding MLP is memoized per timestep value
 (`CastleRuntime.time_embedding` / `time_memo`, port-only).
 """
 from dataclasses import dataclass
@@ -27,6 +33,26 @@ import mlx.core as mx
 import numpy as np
 
 from matrix_game_mlx.inference.rope_kernel import RopeRotations
+
+
+@dataclass(frozen=True)
+class RuntimeSpec:
+    """A castle runtime's DiT dtype and self-attention window (latent frames, the sink frame included)."""
+    dtype: mx.Dtype
+    window: int
+
+
+RUNTIME_SPECS = {"ring-fused": RuntimeSpec(mx.bfloat16, 21), "apple": RuntimeSpec(mx.float16, 21),
+                 "apple-fast": RuntimeSpec(mx.float16, 11)}
+
+
+def dit_dtype(mode: str) -> mx.Dtype:
+    """The DiT dtype `--dit-runtime mode` runs in: bfloat16 for native (upstream's), else the runtime's."""
+    if mode == "native":
+        return mx.bfloat16
+    if mode not in RUNTIME_SPECS:
+        raise ValueError("Unknown DiT runtime")
+    return RUNTIME_SPECS[mode].dtype
 
 
 def plan_cache(cache: dict, current_start: int, tokens: int, window: int, ring: bool = False) -> tuple:
@@ -184,22 +210,28 @@ def run_blocks(plans, x, e, rotations, sink_rotations, fused=False):
     return x
 
 
-def _fusable(block, e) -> bool:
-    """Whether the fused kernels can run `block` (checked for every layer before any cache is planned)."""
+def _dtype_name(dtype) -> str:
+    return str(dtype).rsplit(".", 1)[-1]                          # mlx.core.bfloat16 -> bfloat16
+
+
+def _fusable(block, e, dtype) -> bool:
+    """Whether the fused kernels can run `block` in `dtype` (checked for every layer before any cache is planned)."""
     from matrix_game_mlx.inference.wan.modules.model import WanLayerNorm, WanRMSNorm
     norms = (block.self_attn.norm_q, block.self_attn.norm_k, block.cross_attn.norm_q)
     if not (isinstance(block.norm3, WanLayerNorm) and block.norm3.elementwise_affine
             and all(isinstance(norm, WanRMSNorm) for norm in norms)):
         return False
     tensors = [e, block.modulation, block.norm3.weight, block.norm3.bias] + [norm.weight for norm in norms]
-    return all(t.dtype == mx.bfloat16 for t in tensors)
+    return all(t.dtype == dtype for t in tensors)
 
 
 class CastleRuntime:
     """Ring KV + GPU RoPE + fused-kernel DiT runtime with one compiled steady-window graph (upstream: CUDA graph).
 
+    `mode` is `ring-fused`, `apple` or `apple-fast`; `dtype` and `window` come from its `RUNTIME_SPECS` entry (the
+    DiT dtype every call must use, and the window the stream sets on the blocks; `run` reads it from the blocks).
     Upstream's CUDA modes (kernels, cudagraph, ring, ring-graph) do not exist. `use_graph` (upstream's name; always
-    on for ring-fused, the tests turn it off for the eager reference) selects the compiled steady-window graph.
+    on, the tests turn it off for the eager reference) selects the compiled steady-window graph.
     `captures` counts graph compilations (traces) and `replays` the calls that ran the compiled graph, the tracing
     call included, as upstream's counters (upstream's capture call also replays). `time_memo` (port-only, see
     `time_embedding`) holds the memoized timestep embeddings.
@@ -208,9 +240,10 @@ class CastleRuntime:
     TIME_MEMO_MAX = 8
 
     def __init__(self, mode):
-        if mode != "ring-fused":
+        if mode not in RUNTIME_SPECS:
             raise ValueError("Unknown castle runtime")
         self.mode = mode
+        self.dtype, self.window = RUNTIME_SPECS[mode].dtype, RUNTIME_SPECS[mode].window
         self.ring = True
         self.fused = True
         self.use_graph = True
@@ -272,7 +305,7 @@ class CastleRuntime:
         from matrix_game_mlx.inference.rope_kernel import build_causal_rope_rotations
         from matrix_game_mlx.inference.wan.modules.causal_model import _check_rope_len
         device = mx.default_device()
-        if (unsupported or sink_rope_mode not in (None, "absolute", "fixed") or x.dtype != mx.bfloat16
+        if (unsupported or sink_rope_mode not in (None, "absolute", "fixed") or x.dtype != self.dtype
                 or device.type != mx.gpu):
             raise ValueError(f"Unsupported runtime: extra={unsupported}, sink={sink_rope_mode}, "
                              f"dtype={x.dtype}, device={device}")
@@ -293,11 +326,11 @@ class CastleRuntime:
                     or "k_sink_raw" not in cache or cache["k_sink_raw"].shape[1] != tokens
                     or type(block.cross_attn).__name__ != "WanT2VCrossAttention"):
                 raise ValueError("Expected identical bounded windows, one sink, and T2V cross attention")
-            if any(cache[name].dtype != mx.bfloat16 for name in ("k", "v", "k_sink_raw")):
-                raise ValueError("Expected bfloat16 KV caches")
-            if self.fused and not _fusable(block, e):
-                raise ValueError("Fused kernels expect bfloat16 modulation, an affine cross-attention LayerNorm "
-                                 "and RMS q/k norms")
+            if any(cache[name].dtype != self.dtype for name in ("k", "v", "k_sink_raw")):
+                raise ValueError(f"Expected {_dtype_name(self.dtype)} KV caches")
+            if self.fused and not _fusable(block, e, self.dtype):
+                raise ValueError(f"Fused kernels expect {_dtype_name(self.dtype)} modulation, an affine "
+                                 "cross-attention LayerNorm and RMS q/k norms")
         _check_rope_len(model.freqs, position + 1)  # native's message for an exhausted RoPE table
         rotations = build_causal_rope_rotations(model.freqs, 1, h, w, position)
         steady = position > window
@@ -360,8 +393,11 @@ class CastleRuntime:
 
 
 def install_runtime(generator, mode):
-    """Install the DiT runtime for `mode` on `generator.model` ("native" removes it)."""
-    if mode not in ("native", "ring-fused"):
+    """Install the DiT runtime for `mode` on `generator.model` ("native" removes it).
+
+    The model is not inspected: building the DiT in `dit_dtype(mode)` is the loader's job, and the first call
+    (`prime` at stream creation) raises a ValueError on a dtype mismatch."""
+    if mode != "native" and mode not in RUNTIME_SPECS:
         raise ValueError("Unknown DiT runtime")
     old = getattr(generator.model, "castle_runtime", None)
     if old is not None:

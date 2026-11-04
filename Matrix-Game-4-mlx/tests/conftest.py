@@ -20,7 +20,8 @@ for p in (MLX_ROOT, UPSTREAM_ROOT):
 
 def pytest_addoption(parser):
     parser.addoption("--dit-runtime", choices=("native", "ring-fused"), default=None,
-                     help="DiT runtime of the real-weight parity tests (default: the preset's default)")
+                     help="DiT runtime of the upstream-exact real-weight parity tests (default: the preset's default); "
+                          "the apple runtimes are validated by tests/parity/test_real_weights_apple.py instead")
 
 
 def select_runtime(args, config):

@@ -9,7 +9,7 @@ from tests.conftest import import_upstream
 
 upstream = import_upstream("matrix_game.inference.runtime")
 
-CASES = [(3, 2), (4, 2), (21, 2), (21, 405)]
+CASES = [(3, 2), (4, 2), (11, 2), (11, 405), (21, 2), (21, 405)]
 HEADS, DIM = 1, 2
 
 
