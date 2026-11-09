@@ -236,12 +236,14 @@ def _ring_block(model, i, cache, cross, x, e0, context, start, sink_rope_mode):
     fused or not as the installed runtime."""
     from matrix_game_mlx.inference.rope_kernel import build_causal_rope_rotations
     from matrix_game_mlx.inference.runtime import Plan, plan_cache, run_blocks
+    from matrix_game_mlx.inference.sink_policy import rotated_sink_position
     block, (h, w) = model.blocks[i], (15, 27)
     window, tokens = _window_of(model), h * w
     position = start // tokens
-    fixed = position > window and sink_rope_mode == "fixed"
+    sink_position = rotated_sink_position(sink_rope_mode, position, window)
     rotations = build_causal_rope_rotations(model.freqs, 1, h, w, position)
-    sink_rotations = build_causal_rope_rotations(model.freqs, 1, h, w, position - window) if fixed else None
+    sink_rotations = (build_causal_rope_rotations(model.freqs, 1, h, w, sink_position)
+                      if sink_position is not None else None)
     s, end = plan_cache(cache, start, tokens, window, True)
     a = block.cross_attn
     cross["k"] = a.norm_k(a.k(context)).reshape(1, -1, a.num_heads, a.head_dim)

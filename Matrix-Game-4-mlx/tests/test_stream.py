@@ -363,3 +363,16 @@ def test_taehv_decode_receives_vae_dtype_from_fp16_stream():
     assert stream.dtype == mx.float16
     _run_pushes(stream, (1,))
     assert seen == [mx.bfloat16]
+
+
+@pytest.mark.parametrize("mode, rows", [("fixed", 9000), ("absolute", 9000), ("future", 9011)])
+def test_stream_rope_table_covers_the_future_sink(mode, rows):
+    gen, requested = _FakeGenerator(), []
+    gen.model.set_rope_max_len = requested.append
+    _taehv_stream(gen, sink_rope_mode=mode, max_latents=9000)
+    assert requested == [rows]
+
+
+def test_stream_rejects_unknown_sink_rope_mode():
+    with pytest.raises(ValueError, match="Invalid sink policy"):
+        _taehv_stream(sink_rope_mode="dual")

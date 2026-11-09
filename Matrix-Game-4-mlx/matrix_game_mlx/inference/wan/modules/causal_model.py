@@ -9,6 +9,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from matrix_game_mlx.inference.sink_policy import check_sink_rope_mode, rotated_sink_position
 from matrix_game_mlx.inference.wan.modules.attention import attention
 from matrix_game_mlx.inference.wan.modules.model import (
     WAN_CROSSATTENTION_CLASSES, WanLayerNorm, WanRMSNorm, _apply_rope_rotation, _on_cpu, gelu_tanh, rope_freqs, silu,
@@ -161,13 +162,13 @@ class CausalWanSelfAttention(nn.Module):
         max_attention_size = local_end_index if self.local_attn_size == -1 else self.local_attn_size * frame_seqlen
         recent_start = local_end_index - (max_attention_size - sink_tokens)
         W_att = self.local_attn_size
-        if sink_rope_mode not in (None, "absolute", "fixed"):
-            raise ValueError(f"sink_rope_mode must be absolute or fixed, got {sink_rope_mode}")
-        if sink_rope_mode == "fixed" and W_att != -1 and sink_tokens > 0 and rope_frame > W_att:
-            assert "k_sink_raw" in kv_cache, "sink_rope_mode=fixed needs kv_cache['k_sink_raw']"
+        check_sink_rope_mode(sink_rope_mode)
+        sink_base = rotated_sink_position(sink_rope_mode, rope_frame, W_att) if W_att != -1 and sink_tokens > 0 else None
+        if sink_base is not None:
+            assert "k_sink_raw" in kv_cache, "sink_rope_mode=fixed/future needs kv_cache['k_sink_raw']"
             assert recent_start >= sink_tokens, (recent_start, sink_tokens)
             sink_grid = [[self.sink_size, *grid_sizes[0][1:]]]
-            sink_pos = [p + (rope_frame - W_att) for p in range(self.sink_size)]
+            sink_pos = [p + sink_base for p in range(self.sink_size)]
             k_sink = rope_apply_frames(kv_cache["k_sink_raw"][:, :sink_tokens], sink_grid, freqs, sink_pos).astype(v.dtype)
             k_att = mx.concatenate([k_sink, kv_cache["k"][:, recent_start:local_end_index]], axis=1)
             v_att = mx.concatenate([kv_cache["v"][:, :sink_tokens], kv_cache["v"][:, recent_start:local_end_index]], axis=1)

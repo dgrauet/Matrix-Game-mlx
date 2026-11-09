@@ -64,7 +64,7 @@ SRC = Path("/Users/dgrauet/Work/mlx/tools/mlx-forge/models/matrix-game-4.0-mlx-s
 CONFIG_DIR = SRC / "wan2.2-fun-5b-control"
 VAE_REPO, VAE_FILE, VAE_REVISION = "alibaba-pai/Wan2.2-Fun-5B-Control", "Wan2.2_VAE.pth", \
     "b8bc1a65ab71d054ba4636dc0dac104aa4df2686"
-UPSTREAM_COMMIT = "5446525"
+UPSTREAM_COMMIT = "51913b2"
 LATENT_SHAPE = (1, 1, 48, 30, 54)
 STEPS = (1000, 500)
 PAN_STEP = 8

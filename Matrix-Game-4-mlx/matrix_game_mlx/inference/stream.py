@@ -7,6 +7,7 @@ import mlx.core as mx
 import numpy as np
 
 from matrix_game_mlx.inference.scopes import scope
+from matrix_game_mlx.inference.sink_policy import SINK_ROPE_MODES, rope_positions_needed
 
 LATENT_SHAPE = (1, 1, 48, 30, 54)
 FRAME_SIZE = (480, 864)
@@ -60,7 +61,7 @@ class CastleStream:
         from matrix_game_mlx.inference.wrappers import frame_seq_length_of, init_crossattn_cache, init_kv_cache
 
         self.gen, self.vae, self.prompt = generator, vae, prompt_embeds
-        if sink_mode not in ("kv_only", "first_frame") or sink_rope_mode not in ("absolute", "fixed"):
+        if sink_mode not in ("kv_only", "first_frame") or sink_rope_mode not in SINK_ROPE_MODES:
             raise ValueError("Invalid sink policy")
         self.sink_mode, self.sink_rope_mode = sink_mode, sink_rope_mode
         self.profile = profile
@@ -94,7 +95,7 @@ class CastleStream:
         runtime = getattr(getattr(generator, "model", None), "castle_runtime", None)
         window = runtime.window if runtime is not None else 21
         set_attention_window(generator, window, 1)
-        generator.model.set_rope_max_len(max(8192, max_latents + self.sink_offset))
+        generator.model.set_rope_max_len(rope_positions_needed(sink_rope_mode, max(8192, max_latents + self.sink_offset)))
         self.fsl = frame_seq_length_of(generator, self.shape[3], self.shape[4])
         self.kv = init_kv_cache(generator, 1, window * self.fsl, self.dtype)
         self.xc = init_crossattn_cache(generator, 1, self.dtype)

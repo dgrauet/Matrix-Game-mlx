@@ -23,7 +23,7 @@ from matrix_game_mlx.inference.rollout import set_attention_window
 from matrix_game_mlx.inference.runtime import (RUNTIME_SPECS, CastleRuntime, RuntimeSpec, dit_dtype, from_linear,
                                                install_runtime, to_linear)
 from matrix_game_mlx.inference.wan.modules.causal_model import CausalWanModel
-from matrix_game_mlx.inference.wan.modules.model import WanT2VCrossAttention
+from matrix_game_mlx.inference.wan.modules.model import WanT2VCrossAttention, rope_freqs
 from tests.conftest import rel_l2
 from tests.test_causal_model import CFG, build_pair
 
@@ -164,7 +164,7 @@ RUNTIMES = ["ring-fused", "apple"]
 
 
 @pytest.mark.parametrize("runtime", RUNTIMES)
-@pytest.mark.parametrize("mode", ["absolute", "fixed"])
+@pytest.mark.parametrize("mode", ["absolute", "fixed", "future"])
 def test_runtime_matches_native(weights, mode, runtime):
     MEASURED[f"teacher_forced[{runtime},{mode}]"] = _teacher_forced(weights, mode, calls=_schedule(CHUNKS),
                                                                     dit_runtime=runtime)
@@ -172,14 +172,15 @@ def test_runtime_matches_native(weights, mode, runtime):
 
 
 @pytest.mark.parametrize("runtime", RUNTIMES)
-def test_runtime_prompt_switch_matches_native(weights, runtime):
+@pytest.mark.parametrize("mode", ["fixed", "future"])
+def test_runtime_prompt_switch_matches_native(weights, runtime, mode):
     """Dynamic captions: bf16 prompt embeddings (T5 stays bf16) switched mid-stream, into a bf16 or float16 DiT."""
-    MEASURED[f"prompt_switch[{runtime}]"] = _teacher_forced(weights, "fixed", calls=_schedule(CHUNKS), switch_at=10,
+    MEASURED[f"prompt_switch[{runtime},{mode}]"] = _teacher_forced(weights, mode, calls=_schedule(CHUNKS), switch_at=10,
                                                             dit_runtime=runtime, context_dtype=mx.bfloat16)
     print("max rel L2 (output, written slot):", MEASURED)
 
 
-@pytest.mark.parametrize("mode", ["absolute", "fixed"])
+@pytest.mark.parametrize("mode", ["absolute", "fixed", "future"])
 def test_apple_fast_window_matches_native(weights, mode):
     """apple-fast's 11-latent window (set from the runtime, as CastleStream does) vs native float16 with the same
     window, teacher-forced through position 15: planning, ring eviction (position 11) and the compiled steady graph
@@ -192,13 +193,13 @@ def test_apple_fast_window_matches_native(weights, mode):
     print("max rel L2 (output, written slot):", MEASURED)
 
 
-@pytest.mark.parametrize("mode", ["absolute", "fixed"])
+@pytest.mark.parametrize("mode", ["absolute", "fixed", "future"])
 def test_runtime_clean_first_call_empty_cache(weights, mode):
     MEASURED[f"clean_first[{mode}]"] = _teacher_forced(weights, mode, calls=_schedule(CHUNKS, clean_first=True))
     print("max rel L2 (output, written slot):", MEASURED)
 
 
-@pytest.mark.parametrize("mode", ["absolute", "fixed"])
+@pytest.mark.parametrize("mode", ["absolute", "fixed", "future"])
 def test_runtime_free_running_matches_native(weights, mode):
     """Each model keeps its own cache for the whole rollout (the runtime's ring state evolves on its own)."""
     rng = np.random.default_rng(1)
@@ -229,7 +230,7 @@ def test_runtime_free_running_matches_native(weights, mode):
 
 @pytest.mark.parametrize("runtime", RUNTIMES + ["apple-fast"])
 @pytest.mark.parametrize("fused", [True, False], ids=["fused", "unfused"])
-@pytest.mark.parametrize("mode", ["absolute", "fixed"])
+@pytest.mark.parametrize("mode", ["absolute", "fixed", "future"])
 def test_runtime_linear_layout_is_bitwise_native(weights, mode, fused, runtime):
     """With the ring disabled (native linear slot order) the runtime is bitwise native in its dtype: GPU RoPE, the
     composed block pieces (or the fused kernels, whose row reductions follow MLX's order at these widths),
@@ -258,7 +259,7 @@ def test_runtime_linear_layout_is_bitwise_native(weights, mode, fused, runtime):
 
 
 @pytest.mark.parametrize("runtime", RUNTIMES)
-@pytest.mark.parametrize("mode", ["absolute", "fixed"])
+@pytest.mark.parametrize("mode", ["absolute", "fixed", "future"])
 def test_runtime_fused_is_bitwise_unfused(weights, mode, runtime, monkeypatch):
     """The runtime runs the fused kernels by default, and they round exactly as the composed native pieces in its
     dtype: a 60-chunk free-running rollout (clean-first, ring layout) is bitwise equal with fused on and off."""
@@ -307,7 +308,7 @@ def _rollout(model, mode, calls, inputs, ctx, contexts_at=None, dtype=mx.bfloat1
 
 
 @pytest.mark.parametrize("runtime", RUNTIMES)
-@pytest.mark.parametrize("mode", ["absolute", "fixed"])
+@pytest.mark.parametrize("mode", ["absolute", "fixed", "future"])
 def test_compiled_matches_uncompiled(weights, mode, runtime):
     """The compiled steady-window graph against the eager runtime: the eager path (use_graph off) passes the
     teacher-forced per-call assertions of test_runtime_matches_native (which runs the compiled one), and a 60-chunk
@@ -741,3 +742,108 @@ def test_runtime_rejects_dtype_mismatch(weights, runtime, model_dtype, cache_dty
     assert str(raised.value) == message
     assert all(c["global_end_index"] == 0 and c["local_end_index"] == 0 for c in kv)
     assert not any(c["is_init"] for c in xc)
+
+
+def _spy_rotations(monkeypatch):
+    """Record the start frame of every build_causal_rope_rotations call the runtime makes."""
+    from matrix_game_mlx.inference import rope_kernel
+    starts, real = [], rope_kernel.build_causal_rope_rotations
+
+    def spy(freqs, frames, h, w, start):
+        starts.append(start)
+        return real(freqs, frames, h, w, start)
+    monkeypatch.setattr(rope_kernel, "build_causal_rope_rotations", spy)
+    return starts
+
+
+def _filled_caches(position, window, dtype=mx.bfloat16):
+    """Caches as after `position` frames: a full window (position >= window) at the end of the ring layout."""
+    kv, xc = _caches(window=window, dtype=dtype)
+    for cache in kv:
+        cache["global_end_index"] = position * FSL
+        cache["local_end_index"] = min(position, window) * FSL
+    return kv, xc
+
+
+@pytest.mark.parametrize("runtime, window, position, sink", [("ring-fused", 21, 22, 33), ("apple-fast", 11, 12, 23)])
+def test_future_sink_keys_land_at_position_plus_offset(weights, monkeypatch, runtime, window, position, sink):
+    """Past the window the future sink's keys are rotated at position + 11 (the current block stays at position)."""
+    starts = _spy_rotations(monkeypatch)
+    weights, dtype = _runtime_weights(weights, runtime), RUNTIME_SPECS[runtime].dtype
+    model = _model(weights, runtime=True, mode=runtime, window=window)
+    assert model.castle_runtime.window == window or runtime == "ring-fused"
+    kv, xc = _filled_caches(position, window, dtype)
+    rng = np.random.default_rng(0)
+    _call(model, _inputs(rng, 1)[0], 937.5, rng.standard_normal((1, 8, 32)).astype(np.float32), kv, xc, position,
+          "future")
+    assert starts == [position, sink]
+
+
+@pytest.mark.parametrize("position", [0, 21])  # position <= window
+def test_future_sink_keeps_cached_keys_before_the_window_is_full(weights, monkeypatch, position):
+    starts = _spy_rotations(monkeypatch)
+    model = _model(weights, runtime=True, window=21)
+    kv, xc = _filled_caches(position, 21)
+    rng = np.random.default_rng(0)
+    _call(model, _inputs(rng, 1)[0], 937.5, rng.standard_normal((1, 8, 32)).astype(np.float32), kv, xc, position,
+          "future")
+    assert starts == [position]
+
+
+@pytest.mark.parametrize("runtime", ["native", "ring-fused", "apple", "apple-fast"])
+def test_future_sink_exhausted_rope_table_raises(weights, runtime):
+    """A table of R rows: position R - 5 fits (position + 1 <= R) but the sink at position + 11 does not."""
+    rows = 100
+    window = RUNTIME_SPECS[runtime].window if runtime == "apple-fast" else 21
+    model = _model(_runtime_weights(weights, runtime) if runtime != "native" else weights,
+                   runtime=runtime != "native", mode=runtime if runtime != "native" else "ring-fused", window=window)
+    model._freqs, model._rope_rows = rope_freqs(rows, model.dim // model.num_heads), rows
+    position = rows - 5
+    assert position > window
+    dtype = RUNTIME_SPECS[runtime].dtype if runtime != "native" else mx.bfloat16
+    kv, xc = _filled_caches(position, window, dtype)
+    rng = np.random.default_rng(0)
+    for mode in ("absolute", "fixed"):   # no sink past the table: these still run
+        _call(model, _inputs(rng, 1)[0], 937.5, rng.standard_normal((1, 8, 32)).astype(np.float32), kv, xc, position,
+              mode)
+    with pytest.raises(ValueError, match="RoPE table has"):
+        _call(model, _inputs(rng, 1)[0], 937.5, rng.standard_normal((1, 8, 32)).astype(np.float32), kv, xc, position,
+              "future")
+
+
+def test_graph_compiled_under_fixed_replays_bitwise_under_future(weights):
+    """The compiled graph is shared across sink modes: the sink rotations are graph inputs, so a graph traced under
+    `fixed` replays under `future` bitwise equal to the eager `future` run, and nothing is re-traced."""
+    rng = np.random.default_rng(9)
+    ctx = rng.standard_normal((1, 8, 32)).astype(np.float32)
+    position = WINDOW + 3
+    x, x2 = _inputs(rng, 2)
+
+    def state(model, mode, kv, xc):
+        out = _call(model, x, 937.5, ctx, kv, xc, position, mode)
+        return out, [{n: mx.array(c[n]) for n in ("k", "v", "k_sink_raw")} for c in kv]
+
+    def filled(model):
+        kv, xc = _caches()
+        for i, cache in enumerate(kv):
+            cache["k"] = mx.array(np.random.default_rng(i).standard_normal(cache["k"].shape)).astype(mx.bfloat16)
+            cache["v"] = mx.array(np.random.default_rng(10 + i).standard_normal(cache["v"].shape)).astype(mx.bfloat16)
+            cache["k_sink_raw"] = mx.array(np.random.default_rng(20 + i).standard_normal(cache["k_sink_raw"].shape)
+                                           ).astype(mx.bfloat16)
+            cache["global_end_index"], cache["local_end_index"] = position * FSL, WINDOW * FSL
+        return kv, xc
+
+    compiled, eager = _model(weights, runtime=True), _model(weights, runtime=True)
+    eager.castle_runtime.use_graph = False
+    kv, xc = filled(compiled)
+    _call(compiled, x2, 937.5, ctx, kv, xc, position, "fixed")        # traces the graph under fixed
+    assert compiled.castle_runtime.captures == 1
+    kv_c, xc_c = filled(compiled)
+    kv_e, xc_e = filled(eager)
+    out_c, st_c = state(compiled, "future", kv_c, xc_c)
+    out_e, st_e = state(eager, "future", kv_e, xc_e)
+    assert compiled.castle_runtime.captures == 1 and compiled.castle_runtime.replays == 2
+    assert mx.array_equal(out_c, out_e)
+    for ca, cb in zip(st_c, st_e):
+        for name in ("k", "v", "k_sink_raw"):
+            assert mx.array_equal(ca[name], cb[name])
