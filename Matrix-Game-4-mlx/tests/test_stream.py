@@ -365,12 +365,20 @@ def test_taehv_decode_receives_vae_dtype_from_fp16_stream():
     assert seen == [mx.bfloat16]
 
 
+@pytest.mark.parametrize("sink", [False, True], ids=["no-sink", "kv_only-sink"])
 @pytest.mark.parametrize("mode, rows", [("fixed", 9000), ("absolute", 9000), ("future", 9011)])
-def test_stream_rope_table_covers_the_future_sink(mode, rows):
-    gen, requested = _FakeGenerator(), []
-    gen.model.set_rope_max_len = requested.append
-    _taehv_stream(gen, sink_rope_mode=mode, max_latents=9000)
-    assert requested == [rows]
+def test_stream_rope_table_covers_the_future_sink(mode, rows, sink):
+    """A fresh tiny model's RoPE table after CastleStream: max_latents + sink_offset = 9000 positions, plus the
+    sink's reach (11) under the future policy. With a kv_only sink latent the offset is 1."""
+    from tests.test_runtime import _stream_model
+    gen = _stream_model()
+    sink_latent = mx.zeros(LATENT_SHAPE, mx.bfloat16) if sink else None
+    stream = CastleStream(gen, _taehv(), mx.zeros((1, 8, 32), mx.bfloat16), vae_backend="taehv", steps=(1000,),
+                          first_steps=(1000,), sink_rope_mode=mode, max_latents=9000 - int(sink),
+                          sink_latent=sink_latent)
+    assert stream.sink_offset == int(sink)
+    assert gen.model.freqs[0].shape[0] == rows
+    stream.close()
 
 
 def test_stream_rejects_unknown_sink_rope_mode():
