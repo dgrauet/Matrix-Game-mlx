@@ -1,5 +1,7 @@
 import argparse
+import contextlib
 import hashlib
+import io
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -8,7 +10,7 @@ import json
 from types import SimpleNamespace
 
 from matrix_game.resources import checked_path, digest, files_for, install_file, matches, main
-from matrix_game.scenes import add_model_arguments, resolve_model_arguments, parse_steps
+from matrix_game.scenes import FIXED_PROMPT_RUNTIMES, OPTIMIZED_RUNTIMES, add_model_arguments, resolve_model_arguments, parse_steps
 from matrix_game.inference.offline import frame_blocks
 
 
@@ -93,6 +95,61 @@ class ResourceTests(unittest.TestCase):
             self.assertTrue(matches(root / "resources" / entry["path"], entry))
 
 
+class ReleaseManifestTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(__file__).resolve().parents[1]
+        self.config_path = self.root / "releases/config.json"
+        self.config = json.loads(self.config_path.read_text())
+        self.models = json.loads((self.root / "releases/models.json").read_text())
+        self.assets = json.loads((self.root / "releases/game-assets.json").read_text())
+
+    def test_model_downloads_include_release_config_once(self):
+        for scene in ("castle", "ancient-egypt", "racing", "all"):
+            with self.subTest(scene=scene):
+                entries = files_for(self.models, scene)
+                configs = [e for e in entries if e.get("repo_path", e["path"]) == "config.json"]
+                self.assertEqual(len(configs), 1)
+                self.assertEqual(configs[0]["path"], "release-config.json")
+                self.assertNotIn("repo_id", configs[0])
+                self.assertTrue(matches(self.config_path, configs[0]))
+                self.assertNotIn("base/config.json", [e["path"] for e in entries])
+                self.assertFalse(any(e.get("repo_path", e["path"]) == "config.json"
+                                     for e in files_for(self.assets, scene)))
+
+    def test_release_config_matches_manifest(self):
+        self.assertEqual(self.config["schema"], 1)
+        self.assertEqual(self.config["version"], self.models["version"])
+        self.assertEqual(set(self.config["scenes"]), set(self.models["bundles"]) - {"shared"})
+        for scene, paths in self.config["scenes"].items():
+            self.assertEqual(set(paths), {"weights", "metadata", "inference", "sink_image"})
+            self.assertEqual(set(paths.values()),
+                             {e.get("repo_path", e["path"]) for e in self.models["bundles"][scene]})
+        upstream = [e for e in self.models["bundles"]["shared"] if "repo_id" in e]
+        self.assertTrue(upstream)
+        for entry in upstream:
+            self.assertEqual(entry["repo_id"], self.config["base_model"]["repo_id"])
+            self.assertEqual(entry["revision"], self.config["base_model"]["revision"])
+
+    def test_release_config_download_verify_and_reuse(self):
+        entry = next(e for e in self.models["bundles"]["shared"] if e["path"] == "release-config.json")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "models.json"
+            manifest.write_text(json.dumps(dict(schema=1, bundles={"shared": [entry]})))
+            args = ["--manifest", str(manifest), "--scene", "castle",
+                    "--resources", str(root / "resources"), "--repo-id", self.config["repo_id"],
+                    "--repo-type", "model", "--revision", "a" * 40]
+            download = Mock(return_value=str(self.config_path))
+            with patch.dict("sys.modules", {"huggingface_hub": SimpleNamespace(hf_hub_download=download)}):
+                main(["download"] + args)
+                main(["verify"] + args)
+                main(["download"] + args)
+            download.assert_called_once_with(self.config["repo_id"], "config.json",
+                                             repo_type="model", revision="a" * 40)
+            self.assertTrue(matches(root / "resources/release-config.json", entry))
+            self.assertFalse((root / "resources/base/config.json").exists())
+
+
 class ConfigTests(unittest.TestCase):
     def config(self, *argv):
         parser = argparse.ArgumentParser()
@@ -105,10 +162,21 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual((quality.steps,quality.first_steps,quality.vae_backend,quality.dit_runtime,quality.vae_graph), ((1000,500),(1000,500),"wan","native",False))
         self.assertIsNotNone(fast.sink_image)
 
+    def test_optimized_runtime_presets(self):
+        for preset in OPTIMIZED_RUNTIMES:
+            args = self.config("--scene", "racing", "--preset", preset)
+            self.assertEqual((args.steps, args.vae_backend, args.dit_runtime, args.vae_graph), ((1000,), "taehv", preset, True))
+            if preset in FIXED_PROMPT_RUNTIMES:
+                with self.assertRaises(ValueError):
+                    self.config("--scene", "racing", "--preset", preset, "--prompt-mode", "dynamic")
+            else:
+                self.config("--scene", "racing", "--preset", preset, "--prompt-mode", "dynamic")
+
     def test_override_and_invalid_config(self):
-        args=self.config("--preset","quality","--steps","1000","--no-sink-image")
+        args=self.config("--preset","quality","--steps","1000")
         self.assertEqual(args.first_steps,(1000,))
-        self.assertIsNone(args.sink_image)
+        self.assertEqual(args.sink_image.name, "sink.png")
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()): self.config("--no-sink-image")
         with self.assertRaises(ValueError): self.config("--vae-backend","wan","--vae-graph")
         for bad in ("", "500", "1000,0", "1000,500,750", "1000,1000", "a"):
             with self.assertRaises(argparse.ArgumentTypeError):parse_steps(bad)
