@@ -37,7 +37,7 @@ def test_realtime_render_of_take_finalizes(tmp_path):
     report, session, take, out = _render_and_finalize(tmp_path)
     assert report["status"] == "complete" and report["frames"] == session["frames"]
     assert report["scene"] == "racing" and report["scene_name"] == SCENES["racing"]["name"]
-    assert report["sink_source"] != "generated_first_frame"
+    assert report["sink_source"] == "image"
     # Upstream's optional HUD/input composition (README "Finalize and compose"), on the first 48 frames only
     composed = tmp_path / "composed.mp4"
     compose = subprocess.run([sys.executable, str(racing_game.compose_tool()), str(take), "--rendered",

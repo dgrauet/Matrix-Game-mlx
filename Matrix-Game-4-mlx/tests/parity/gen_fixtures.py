@@ -17,19 +17,22 @@ control_i, pred_i, decoded_i, kv_k_layer0_i, kv_k_layer29_i, n_denoising_i), tae
 streaming-encoded control_i and teacher-forced decoded_i, decode_stream of the end-to-end preds), taehv_floor.npz
 (the same TAEHV sequence with the torch fp32 CPU and bf16 MPS variants), floor_chunk_{i}.npz (end-to-end floor:
 native bf16 CPU SDPA, as quality) and meta.json (taehv_floors, floor). The DiT is preset-independent and already
-gated per block / per call by the quality fixtures, so realtime has no per-call or per-block fixtures and no long
-run. `--taehv-only` regenerates taehv_calls.npz / taehv_floor.npz / meta taehv_floors from inputs.npz and chunks.npz
+gated per block / per call by the quality fixtures, so realtime has no per-call or per-block fixtures at chunks 0-2.
+`--long` (both presets) adds 25 chunks (long_inputs.npz, long_chunk_{i}.npz, meta long_chunks) and calls_long22.npz,
+the torch state and both calls (denoise, clean pass) of chunk 22, past the 21-latent window where the sink
+re-rotation acts, with its kernel-variant floors in meta call_floors. Racing: `--scene racing --preset realtime --long`.
+`--taehv-only` regenerates taehv_calls.npz / taehv_floor.npz / meta taehv_floors from inputs.npz and chunks.npz
 (seconds); `--floor-only` the end-to-end floor. Commands (one scene at a time, ~10-15 min each, mostly the CPU DiT):
     python -m tests.parity.gen_fixtures --scene ancient-egypt --preset realtime
     python -m tests.parity.gen_fixtures --scene castle --preset realtime
     python -m tests.parity.gen_fixtures --scene racing --preset realtime
 (`--print-commands [--preset P]` prints them.)
 
-Variants (`--variant NAME`, VARIANT_SPECS: prompt switch, no sink, free codec / step composition) write
+Variants (`--variant NAME`, VARIANT_SPECS: prompt switch, free codec / step composition) write
 `$MG4_FIXTURES_DIR/<NAME>/` in the realtime layout, 3 chunks: inputs.npz (pan pixels, initial noises, renoise_{i}_{k}
-draws, prompt_embeds and, for switch variants, prompt_b_embeds from upstream umT5 bf16 CPU, the torch sink_latent
-when the variant has a sink), chunks.npz, floor_chunk_{i}.npz (native bf16 CPU SDPA DiT floor, plus the Wan control)
-and meta.json (variant, vae_backend, steps, first_steps, sink, switch_chunk, prompt_b, floor with control_rel_l2).
+draws, prompt_embeds and, for switch variants, prompt_b_embeds from upstream umT5 bf16 CPU, the torch sink_latent),
+chunks.npz, floor_chunk_{i}.npz (native bf16 CPU SDPA DiT floor, plus the Wan control)
+and meta.json (variant, vae_backend, steps, first_steps, switch_chunk, prompt_b, floor with control_rel_l2).
 The racing_take_* variants take their pixels from the scripted racing take (take_frames: first 9 frames of
 reference.mkv, preprocessed as offline.py does; sink = the scene sink image) and record take_session and
 take_reference_sha256 in meta.json. Switch variants call the upstream CastleStream.set_prompt(prompt B) before switch_chunk.
@@ -51,6 +54,7 @@ import hashlib
 import json
 import subprocess
 import time
+import types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -64,11 +68,12 @@ SRC = Path("/Users/dgrauet/Work/mlx/tools/mlx-forge/models/matrix-game-4.0-mlx-s
 CONFIG_DIR = SRC / "wan2.2-fun-5b-control"
 VAE_REPO, VAE_FILE, VAE_REVISION = "alibaba-pai/Wan2.2-Fun-5B-Control", "Wan2.2_VAE.pth", \
     "b8bc1a65ab71d054ba4636dc0dac104aa4df2686"
-UPSTREAM_COMMIT = "5446525"
+UPSTREAM_COMMIT = "51913b2"
 LATENT_SHAPE = (1, 1, 48, 30, 54)
 STEPS = (1000, 500)
 PAN_STEP = 8
-LONG_CALL_CHUNK = 22    # position 23 > 21-frame window: rolling eviction (and fixed-sink re-RoPE for kv_only/fixed) run
+LONG_CHUNKS = 25
+LONG_CALL_CHUNK = 22    # cache position 22 (racing, first_frame) or 23 (castle, kv_only: sink at position 0) > 21-frame window: rolling eviction and sink re-RoPE run
 KV_LAYERS = (0, 29)
 
 
@@ -437,8 +442,7 @@ def ensure_accelerate(torch) -> None:
 
 
 def make_stream(spec: SceneSpec, gen, vae, prompt, sink, preset: str = "quality", variant=None):
-    """Upstream CastleStream of a preset (first_steps == steps), or of a VariantSpec (its codec, steps, first steps;
-    `sink` None for the no-sink variants)."""
+    """Upstream CastleStream of a preset (first_steps == steps), or of a VariantSpec (its codec, steps, first steps)."""
     from matrix_game.inference.stream import CastleStream
     if variant is None:
         p = PRESET_SPECS[preset]
@@ -500,8 +504,8 @@ def load_stream(torch, spec: SceneSpec, device_pref: str, vae, prompt_np: np.nda
     ensure_accelerate(torch)
     gen = build_dit(str(CONFIG_DIR), str(spec.checkpoint), is_causal=True, dtype="bfloat16", timestep_shift=5)
     gen = gen.eval().requires_grad_(False)
-    if spec.sink_mode == "first_frame" or sink is None:
-        # No sink-priming forward at construction (first_frame sink mode, or no sink), so there is no MPS smoke call:
+    if spec.sink_mode == "first_frame":
+        # No sink-priming forward at construction (first_frame sink mode), so there is no MPS smoke call:
         # stay on CPU (as the egypt fixtures)
         if device_pref == "mps":
             raise RuntimeError(f"--device mps is unsupported for {spec.scene} without a kv_only sink: no sink-priming "
@@ -619,13 +623,17 @@ class CallRecorder:
         return self.gen.parameters()
 
 
-def record_push(torch, spec, stream, index, pixels, frame_start, noise, renoise):
-    """One upstream push with every generator call recorded; returns (chunk, state before, control, calls)."""
+def record_push(torch, spec, stream, index, pixels, frame_start, noise, renoise, steps=STEPS):
+    """One upstream push with every generator call recorded; returns (chunk, state before, control, calls).
+    `renoise` may be None when `steps` (one denoising step: realtime) draw none."""
+    need = n_renoise(spec, index, steps)
+    if need and renoise is None:
+        raise ValueError(f"Chunk {index} draws {need} renoise tensor(s) with steps {steps}: no renoise given")
     state = kv_state(stream.kv)
     real, recorder = stream.gen, CallRecorder(stream.gen, stream.kv)
     stream.gen = recorder
     try:
-        with injected_renoise(torch, [torch.from_numpy(renoise)][:n_renoise(spec, index)]) as left:
+        with injected_renoise(torch, [torch.from_numpy(renoise)] if need else []) as left:
             chunk = stream.push(torch.from_numpy(pixels), frame_start=frame_start, initial_noise=torch.from_numpy(noise))
     finally:
         stream.gen = real
@@ -687,50 +695,131 @@ def call_floor(torch, spec: SceneSpec, gen, prompt, fixture) -> list:
     return out
 
 
+def write_long_inputs(spec: SceneSpec, out: Path, with_renoise: bool) -> dict:
+    """Write long_inputs.npz (LONG_CHUNKS chunks of pan pixels, initial noises and, for quality, renoise draws) and
+    return it. The draws are the same for both presets (initial noise i is draw 2i of seed 4321); a one-step preset
+    simply never draws a renoise."""
+    long_pixels = pan_frames(spec, 1 + 4 * (LONG_CHUNKS - 1))
+    long_rng = np.random.default_rng(4321)
+    long_noise = [long_rng.standard_normal(LATENT_SHAPE, dtype=np.float32) for _ in range(2 * LONG_CHUNKS)]
+    long_inputs = {}
+    for i, (a, b) in enumerate(chunk_slices(LONG_CHUNKS)):
+        long_inputs[f"pixels_{i}"], long_inputs[f"initial_noise_{i}"] = long_pixels[a:b], long_noise[2 * i]
+        if with_renoise:
+            long_inputs[f"renoise_{i}"] = long_noise[2 * i + 1]
+    np.savez(out / "long_inputs.npz", **long_inputs)
+    return long_inputs
+
+
+def long_reference(torch, spec: SceneSpec, out: Path, meta: dict, stream, codec, sink, preset: PresetSpec) -> None:
+    """LONG_CHUNKS chunks (pred and decoded: long_chunk_{i}.npz) of a fresh stream of `preset` on the DiT of `stream`
+    (its `gen` is the run_chunks recorder); long_inputs.npz as write_long_inputs."""
+    quality = preset.vae_backend == "wan"
+    long_inputs = write_long_inputs(spec, out, with_renoise=quality)
+    stream = make_stream(spec, stream.gen.gen, codec, stream.prompt, sink, preset.name)
+
+    def save_long(i, chunk, preds, seconds):
+        np.savez_compressed(out / f"long_chunk_{i}.npz", pred=to_np(chunk.latent), decoded=to_np(chunk.pixels))
+        log(f"long chunk {i}: {seconds:.1f}s")
+
+    t0 = time.perf_counter()
+    run_chunks(torch, spec, stream, np.concatenate([long_inputs[f"pixels_{i}"] for i in range(LONG_CHUNKS)]),
+               [long_inputs[f"initial_noise_{i}"] for i in range(LONG_CHUNKS)],
+               [long_inputs[f"renoise_{i}"] for i in range(LONG_CHUNKS)] if quality else None, LONG_CHUNKS, save_long,
+               preset.steps)
+    meta["long_chunks"], meta["long_seconds"] = LONG_CHUNKS, time.perf_counter() - t0
+
+
+def advance_encoder(torch, stream, pixels: np.ndarray) -> None:
+    """Advance the stream's streaming encoder history on one chunk's pixels, as CastleStream.push does (Wan feature
+    cache or TAEHV encode_stream), without running the DiT."""
+    if stream.vae_backend == "wan":
+        stream_encode(torch, stream.vae, pixels, stream.encoder_features)
+        return
+    p = next(stream.vae.parameters())
+    stream.vae.encode_stream(torch.from_numpy(pixels).permute(1, 0, 2, 3).unsqueeze(0).to(p.device, p.dtype))
+
+
+def stub_decoder(torch, stream) -> None:
+    """Replace the stream's decoder by zeros of the right cadence (decoding is not under test and its state does
+    not feed the DiT)."""
+    if stream.vae_backend == "wan":
+        stream.decoder = types.SimpleNamespace(push=lambda z: torch.zeros(4, 3, 480, 864))
+        return
+
+    class NoDecode:
+        def __init__(self, vae):
+            self.vae = vae
+
+        def parameters(self):
+            return self.vae.parameters()
+
+        def encode_stream(self, x, *args, **kw):
+            return self.vae.encode_stream(x, *args, **kw)
+
+        def decode_stream(self, z, *args, **kw):
+            return types.SimpleNamespace(sample=torch.zeros(1, 3, 4, 480, 864))
+
+        def clear_cache(self):
+            self.vae.clear_cache()
+
+    stream.vae = NoDecode(stream.vae)
+
+
 def call_fixtures(out: Path) -> None:
-    """Per-call fixtures: torch state at each chunk boundary (chunks 0-2 and long chunk LONG_CALL_CHUNK), every
-    generator call's inputs and outputs, and the torch kernel-variant floor of each call (meta.json)."""
-    import types
+    """Per-call fixtures: torch state at each chunk boundary (quality: chunks 0-2; both presets: long chunk
+    LONG_CALL_CHUNK), every generator call's inputs and outputs, and the torch kernel-variant floor of each call
+    (meta.json). Realtime records the long chunk only: its DiT is gated per call at chunks 0-2 by the quality
+    fixtures, and only the long chunk runs past the window (sink re-rotation of the racing `future` mode)."""
     import torch
-    from huggingface_hub import hf_hub_download
-    from matrix_game.inference.wrappers import WanVAE22Wrapper
     torch.set_grad_enabled(False)
     meta = json.loads((out / "meta.json").read_text())
-    spec = spec_of(meta)
+    spec, preset = spec_of(meta), PRESET_SPECS[meta.get("preset", "quality")]
     inputs = np.load(out / "inputs.npz")
     t0 = time.perf_counter()
-    vae = WanVAE22Wrapper(vae_path=hf_hub_download(VAE_REPO, VAE_FILE, revision=VAE_REVISION)).eval()
-    vae = vae.requires_grad_(False).to(meta["device_vae"], torch.bfloat16)
+    if preset.vae_backend == "wan":
+        from huggingface_hub import hf_hub_download
+        from matrix_game.inference.wrappers import WanVAE22Wrapper
+        vae = WanVAE22Wrapper(vae_path=hf_hub_download(VAE_REPO, VAE_FILE, revision=VAE_REVISION)).eval()
+        codec = vae.requires_grad_(False).to(meta["device_vae"], torch.bfloat16)
+    else:
+        codec = DeviceBridge(load_taehv(torch, meta["device_taehv"]))
     sink = torch.from_numpy(inputs["sink_latent"])
     names = []
     with cpu_bf16_emulation(torch):
-        stream, _ = load_stream(torch, spec, meta["device_dit"], vae, inputs["prompt_embeds"], sink)
-        for i, (a, b) in enumerate(chunk_slices(meta["chunks"])):
-            chunk, state, control, calls = record_push(torch, spec, stream, i, inputs[f"pixels_{i}"], a,
-                                                       inputs[f"initial_noise_{i}"], inputs[f"renoise_{i}"])
-            if not np.array_equal(to_np(chunk.latent), np.load(out / f"chunk_{i}.npz")["pred"]):
-                raise RuntimeError(f"Recorded chunk {i} does not reproduce the fixture bitwise")
-            save_calls(out / f"calls_chunk{i}.npz", state, control, calls)
-            names.append(f"calls_chunk{i}")
-            log(f"per-call fixture chunk {i}: {len(calls)} calls")
+        stream, _ = load_stream(torch, spec, meta["device_dit"], codec, inputs["prompt_embeds"], sink, preset.name)
+        if preset.vae_backend == "wan":
+            for i, (a, b) in enumerate(chunk_slices(meta["chunks"])):
+                chunk, state, control, calls = record_push(torch, spec, stream, i, inputs[f"pixels_{i}"], a,
+                                                           inputs[f"initial_noise_{i}"], inputs[f"renoise_{i}"])
+                if not np.array_equal(to_np(chunk.latent), np.load(out / f"chunk_{i}.npz")["pred"]):
+                    raise RuntimeError(f"Recorded chunk {i} does not reproduce the fixture bitwise")
+                save_calls(out / f"calls_chunk{i}.npz", state, control, calls)
+                names.append(f"calls_chunk{i}")
+                log(f"per-call fixture chunk {i}: {len(calls)} calls")
+        elif not (out / "long_inputs.npz").exists():
+            raise FileNotFoundError(f"{out / 'long_inputs.npz'}: the realtime per-call fixture is the long chunk "
+                                    "only; generate the set with --long")
         if (out / "long_inputs.npz").exists():
             # For first_frame scenes chunk 0 is the clean pass on the stored sink pred at current_start=0.
             # The KV state at a chunk boundary only depends on the sink priming and each chunk's clean pass (the
             # denoising writes land in the slot that pass overwrites), so replaying the stored long preds through
-            # the clean pass rebuilds it; the encoder cache advances on the same pixels.
+            # the clean pass rebuilds it; the encoder history advances on the same pixels (Wan feature cache or
+            # TAEHV streaming encoder, as the preset's stream does).
             long_inputs = np.load(out / "long_inputs.npz")
-            stream = make_stream(spec, stream.gen, vae, stream.prompt, sink)
+            stream = make_stream(spec, stream.gen, codec, stream.prompt, sink, preset.name)
             for i, (a, b) in enumerate(chunk_slices(LONG_CALL_CHUNK)):
-                stream_encode(torch, vae, long_inputs[f"pixels_{i}"], stream.encoder_features)
+                advance_encoder(torch, stream, long_inputs[f"pixels_{i}"])
                 pred = torch.from_numpy(np.load(out / f"long_chunk_{i}.npz")["pred"]).to(stream.dtype)
                 stream.gen(noisy_image_or_video=pred, conditional_dict={"prompt_embeds": stream.prompt},
                            timestep=torch.zeros(1, 1), drop_control=True, kv_cache=stream.kv, crossattn_cache=stream.xc,
                            current_start=(i + stream.sink_offset) * stream.fsl, sink_rope_mode=stream.sink_rope_mode)
                 stream.index, stream.frame = i + 1, b
-            stream.decoder = types.SimpleNamespace(push=lambda z: torch.zeros(4, 3, 480, 864))   # not under test
+            stub_decoder(torch, stream)                                       # not under test
             i = LONG_CALL_CHUNK
+            renoise = long_inputs[f"renoise_{i}"] if f"renoise_{i}" in long_inputs.files else None
             chunk, state, control, calls = record_push(torch, spec, stream, i, long_inputs[f"pixels_{i}"], stream.frame,
-                                                       long_inputs[f"initial_noise_{i}"], long_inputs[f"renoise_{i}"])
+                                                       long_inputs[f"initial_noise_{i}"], renoise, preset.steps)
             if not np.array_equal(to_np(chunk.latent), np.load(out / f"long_chunk_{i}.npz")["pred"]):
                 raise RuntimeError(f"Rebuilt long state does not reproduce long chunk {i} bitwise")
             save_calls(out / f"calls_long{i}.npz", state, control, calls)
@@ -875,24 +964,7 @@ def _torch_run(args, spec, out, meta, prompt, pixels, noises, renoises):
     meta["run_seconds"] = time.perf_counter() - t0
 
     if args.long:
-        n_long = 25
-        long_pixels = pan_frames(spec, 1 + 4 * (n_long - 1))
-        long_rng = np.random.default_rng(4321)
-        long_noise = [long_rng.standard_normal(LATENT_SHAPE, dtype=np.float32) for _ in range(2 * n_long)]
-        long_inputs = {}
-        for i, (a, b) in enumerate(chunk_slices(n_long)):
-            long_inputs[f"pixels_{i}"] = long_pixels[a:b]
-            long_inputs[f"initial_noise_{i}"], long_inputs[f"renoise_{i}"] = long_noise[2 * i], long_noise[2 * i + 1]
-        np.savez(out / "long_inputs.npz", **long_inputs)
-        stream = make_stream(spec, stream.gen.gen, vae, stream.prompt, sink)
-
-        def save_long(i, chunk, preds, seconds):
-            np.savez_compressed(out / f"long_chunk_{i}.npz", pred=to_np(chunk.latent), decoded=to_np(chunk.pixels))
-            log(f"long chunk {i}: {seconds:.1f}s")
-
-        t0 = time.perf_counter()
-        run_chunks(torch, spec, stream, long_pixels, long_noise[0::2], long_noise[1::2], n_long, save_long)
-        meta["long_chunks"], meta["long_seconds"] = n_long, time.perf_counter() - t0
+        long_reference(torch, spec, out, meta, stream, vae, sink, PRESET_SPECS["quality"])
 
     return sink
 
@@ -1091,6 +1163,8 @@ def realtime_reference(args, spec: SceneSpec, out: Path, meta: dict, prompt, pix
         meta["forward_seconds"] = run_chunks(torch, spec, stream, pixels, noises, None, args.chunks, save_chunk,
                                              preset.steps)
         meta["run_seconds"] = time.perf_counter() - t0
+        if args.long:
+            long_reference(torch, spec, out, meta, stream, DeviceBridge(taehv), sink, preset)
     np.savez_compressed(out / "chunks.npz", **record)
 
 
@@ -1115,10 +1189,13 @@ def realtime_main(args, spec: SceneSpec, out: Path) -> None:
     gc.collect()                                 # one torch DiT alive at a time
     taehv_fixtures(out)
     floor_reference(out)
+    if args.long:
+        gc.collect()
+        call_fixtures(out)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Variants: prompt switch, no sink, free codec / step composition (realtime layout, 3 chunks), and captions.
+# Variants: prompt switch, free codec / step composition (realtime layout, 3 chunks), and captions.
 
 PROMPT_B = ("a racing game on a rainy city street at night, neon reflections on wet asphalt, realistic AAA game "
             "rendering")                 # third record (chunk 2) of tests/data/racing_captions.jsonl
@@ -1129,14 +1206,13 @@ CAPTION_FLOOR_VARIANTS = ("fp32", "fp64_acc")
 
 @dataclass(frozen=True)
 class VariantSpec:
-    """One model-path variant: scene, codec, steps / first steps, sink image or none, and the chunk before which the
+    """One model-path variant: scene, codec, steps / first steps, and the chunk before which the
     prompt switches to PROMPT_B (None: fixed prompt)."""
     name: str
     scene: str
     vae_backend: str
     steps: tuple
     first_steps: tuple
-    sink: bool
     switch_chunk: Optional[int]
     take: bool = False      # pixels from the scripted racing take (take_frames) instead of the synthetic pan
     capture: Optional[str] = None   # pixels (and racing captions) from a real online capture (capture_dir(capture))
@@ -1160,23 +1236,20 @@ class VariantSpec:
         return self.capture is not None and self.scene == "racing"
 
     def model_argv(self) -> list:
-        """matrix_game_mlx.scenes.model_args argv reproducing this variant (codec, steps, first steps, sink)."""
+        """matrix_game_mlx.scenes.model_args argv reproducing this variant (codec, steps, first steps)."""
         fmt = lambda steps: ",".join(str(s) for s in steps)  # noqa: E731
-        return (["--vae-backend", self.vae_backend, "--steps", fmt(self.steps), "--first-steps", fmt(self.first_steps)]
-                + ([] if self.sink else ["--no-sink-image"]))
+        return ["--vae-backend", self.vae_backend, "--steps", fmt(self.steps), "--first-steps", fmt(self.first_steps)]
 
 
 VARIANT_SPECS = {v.name: v for v in (
-    VariantSpec("racing_switch_realtime", "racing", "taehv", (1000,), (1000,), True, 2),
-    VariantSpec("racing_switch_quality", "racing", "wan", (1000, 500), (1000, 500), True, 2),
-    VariantSpec("castle_nosink_realtime", "castle", "taehv", (1000,), (1000,), False, None),
-    VariantSpec("racing_nosink_realtime", "racing", "taehv", (1000,), (1000,), False, None),
-    VariantSpec("castle_taehv_2step", "castle", "taehv", (1000, 500), (1000, 500), True, None),
-    VariantSpec("egypt_wan_custom_first", "ancient-egypt", "wan", (1000,), (1000, 750, 500, 250), True, None),
-    VariantSpec("racing_take_realtime", "racing", "taehv", (1000,), (1000,), True, None, take=True),
-    VariantSpec("racing_take_quality", "racing", "wan", (1000, 500), (1000, 500), True, None, take=True),
-    VariantSpec("racing_online_dynamic", "racing", "taehv", (1000,), (1000,), True, None, capture="racing-online"),
-    VariantSpec("castle_online_realtime", "castle", "taehv", (1000,), (1000,), True, None, capture="castle-online"),
+    VariantSpec("racing_switch_realtime", "racing", "taehv", (1000,), (1000,), 2),
+    VariantSpec("racing_switch_quality", "racing", "wan", (1000, 500), (1000, 500), 2),
+    VariantSpec("castle_taehv_2step", "castle", "taehv", (1000, 500), (1000, 500), None),
+    VariantSpec("egypt_wan_custom_first", "ancient-egypt", "wan", (1000,), (1000, 750, 500, 250), None),
+    VariantSpec("racing_take_realtime", "racing", "taehv", (1000,), (1000,), None, take=True),
+    VariantSpec("racing_take_quality", "racing", "wan", (1000, 500), (1000, 500), None, take=True),
+    VariantSpec("racing_online_dynamic", "racing", "taehv", (1000,), (1000,), None, capture="racing-online"),
+    VariantSpec("castle_online_realtime", "castle", "taehv", (1000,), (1000,), None, capture="castle-online"),
 )}
 ONLINE_PROMPT_INTERVAL = 1           # upstream serve --prompt-interval-chunks default
 
@@ -1196,13 +1269,13 @@ def captions_dir() -> Path:
 
 def variant_steps(v: VariantSpec, chunk: int) -> tuple:
     """Denoising timesteps of a chunk, as upstream CastleStream.push picks them: first_frame scenes use first_steps
-    on chunk 0 (no denoising when the sink latent is the chunk), kv_only scenes on cache positions < 2 (position =
-    chunk + 1 when a sink primes position 0)."""
+    on chunk 0 (no denoising: the sink latent is the chunk), kv_only scenes on cache positions < 2 (position =
+    chunk + 1: the sink always primes position 0, so only chunk 0)."""
     if v.scene_spec.sink_mode == "first_frame":
         if chunk == 0:
-            return () if v.sink else v.first_steps
+            return ()
         return v.steps
-    return v.first_steps if chunk + int(v.sink) < 2 else v.steps
+    return v.first_steps if chunk == 0 else v.steps
 
 
 def variant_n_renoise(v: VariantSpec, chunk: int) -> int:
@@ -1373,11 +1446,10 @@ def run_variant(torch, v: VariantSpec, stream, pixels, noises, renoises, prompt_
 
 
 def variant_inputs(prompt, prompt_b, sink, pixels, noises, renoises) -> dict:
-    """inputs.npz content of a variant (inverse of load_variant_inputs); prompt_b / sink None when absent; a capture
+    """inputs.npz content of a variant (inverse of load_variant_inputs); prompt_b None when absent; a capture
     variant's prompt_b is its per-chunk list (chunk_prompt_embeds_{i} where the prompt switches)."""
     inputs = dict(prompt_embeds=prompt)
-    if sink is not None:
-        inputs["sink_latent"] = sink
+    inputs["sink_latent"] = sink
     if isinstance(prompt_b, list):
         inputs.update({f"chunk_prompt_embeds_{i}": e for i, e in enumerate(prompt_b) if e is not None})
     elif prompt_b is not None:
@@ -1389,13 +1461,13 @@ def variant_inputs(prompt, prompt_b, sink, pixels, noises, renoises) -> dict:
 
 
 def load_variant_inputs(v: VariantSpec, inputs) -> tuple:
-    """(pixels [9, 3, H, W], initial noises, renoise lists, sink or None, prompt_b or None) from inputs.npz; for a
+    """(pixels [9, 3, H, W], initial noises, renoise lists, sink, prompt_b or None) from inputs.npz; for a
     capture variant the last item is the per-chunk list of set_prompt embeddings (None: unchanged)."""
     n = VARIANT_CHUNKS
     pixels = np.concatenate([inputs[f"pixels_{i}"] for i in range(n)])
     noises = [inputs[f"initial_noise_{i}"] for i in range(n)]
     renoises = [[inputs[f"renoise_{i}_{k}"] for k in range(variant_n_renoise(v, i))] for i in range(n)]
-    sink = inputs["sink_latent"] if v.sink else None
+    sink = inputs["sink_latent"]
     prompt_b = inputs["prompt_b_embeds"] if v.switch_chunk is not None else None
     if v.capture is not None:
         prompt_b = [inputs[f"chunk_prompt_embeds_{i}"] if f"chunk_prompt_embeds_{i}" in inputs.files else None
@@ -1405,8 +1477,8 @@ def load_variant_inputs(v: VariantSpec, inputs) -> tuple:
 
 def variant_reference(args, v: VariantSpec, out: Path, meta: dict, prompt, prompt_b, pixels, noises, renoises) -> None:
     """Upstream CastleStream of the variant (codec bf16, DiT as load_stream picks); writes inputs.npz (pan pixels,
-    initial noises, renoise_{i}_{k} draws, prompt_embeds, prompt_b_embeds for switch variants, torch sink_latent when
-    the variant has a sink) and chunks.npz (realtime layout)."""
+    initial noises, renoise_{i}_{k} draws, prompt_embeds, prompt_b_embeds for switch variants, torch sink_latent) and
+    chunks.npz (realtime layout)."""
     import torch
     torch.set_grad_enabled(False)
     from matrix_game.inference.stream import encode_sink_image
@@ -1417,15 +1489,13 @@ def variant_reference(args, v: VariantSpec, out: Path, meta: dict, prompt, promp
                                          capture_output=True, text=True).stdout.strip()
     with cpu_bf16_emulation(torch):
         codec, bridge = variant_codec(torch, v, args.device, pixels[:1], meta)
-        sink = None
-        if v.sink:
-            sink = encode_sink_image(codec, spec.sink_image, v.vae_backend,
-                                     first_frame=spec.sink_mode == "first_frame").float().cpu()
+        sink = encode_sink_image(codec, spec.sink_image, v.vae_backend,
+                                 first_frame=spec.sink_mode == "first_frame").float().cpu()
         log("loading torch DiT")
         stream, meta["device_dit"] = load_stream(torch, spec, args.device, bridge, prompt, sink, variant=v)
         log(f"DiT device: {meta['device_dit']}; codec {v.vae_backend} on "
             f"{meta.get('device_taehv') or meta.get('device_vae')}")
-        np.savez(out / "inputs.npz", **variant_inputs(prompt, prompt_b, None if sink is None else sink.numpy(), pixels,
+        np.savez(out / "inputs.npz", **variant_inputs(prompt, prompt_b, sink.numpy(), pixels,
                                                       noises, renoises))
         record, meta["chunk_seconds"] = {}, []
 
@@ -1476,7 +1546,7 @@ def variant_floor(out: Path) -> None:
 
     with cpu_bf16_emulation(torch, sdpa=False):
         stream, device_dit = load_stream(torch, spec, meta["device_dit"], bridge, inputs["prompt_embeds"],
-                                         None if sink is None else torch.from_numpy(sink), variant=v)
+                                         torch.from_numpy(sink), variant=v)
         if device_dit != meta["device_dit"]:
             raise RuntimeError(f"Floor DiT device {device_dit} != fixture DiT device {meta['device_dit']}")
         run_variant(torch, v, stream, pixels, noises, renoises, prompt_b, save)
@@ -1514,7 +1584,7 @@ def variant_main(args, v: VariantSpec) -> None:
     out.mkdir(parents=True, exist_ok=True)
     t_start = time.perf_counter()
     meta = dict(variant=v.name, scene=v.scene, vae_backend=v.vae_backend, steps=list(v.steps),
-                first_steps=list(v.first_steps), sink=v.sink, switch_chunk=v.switch_chunk, prompt_b=v.prompt_b,
+                first_steps=list(v.first_steps), switch_chunk=v.switch_chunk, prompt_b=v.prompt_b,
                 sink_mode=spec.sink_mode, sink_rope_mode=spec.sink_rope_mode, chunks=VARIANT_CHUNKS,
                 pan_step_px=PAN_STEP, noise_seed=VARIANT_NOISE_SEED, renoise_seed=VARIANT_RENOISE_SEED,
                 checkpoint=str(spec.checkpoint), upstream_commit=UPSTREAM_COMMIT,
@@ -1560,7 +1630,7 @@ def variant_main(args, v: VariantSpec) -> None:
     variant_floor(out)
 
 
-QUALITY_ONLY = ("long", "calls_only", "call_floors_only", "blocks_only")
+QUALITY_ONLY = ("calls_only", "call_floors_only", "blocks_only")
 
 
 def parse_args(argv=None):
@@ -1570,7 +1640,8 @@ def parse_args(argv=None):
                         help="quality: Wan VAE, steps (1000, 500); realtime: TAEHV taew2_2, steps (1000,)")
     parser.add_argument("--device", choices=("auto", "mps", "cpu"), default="auto")
     parser.add_argument("--chunks", type=int, default=3)
-    parser.add_argument("--long", action="store_true", help="Also run 25 chunks (pred and decoded only; quality)")
+    parser.add_argument("--long", action="store_true", help="Also run 25 chunks (pred and decoded only) and record the per-call fixture of chunk 22 "
+                        "(calls_long22, past the 21-latent window); both presets")
     parser.add_argument("--floor-only", action="store_true",
                         help="Only (re)generate floor_chunk_*.npz from the existing inputs.npz and meta.json")
     parser.add_argument("--calls-only", action="store_true",
@@ -1593,7 +1664,7 @@ def parse_args(argv=None):
     parser.add_argument("--print-variant-commands", action="store_true",
                         help="Print the captions command, then every variant's command (run order), then exit")
     args = parser.parse_args(argv)
-    others = [f"--{name.replace('_', '-')}" for name in (*QUALITY_ONLY, "floor_only", "taehv_only") if getattr(args, name)]
+    others = [f"--{name.replace('_', '-')}" for name in (*QUALITY_ONLY, "long", "floor_only", "taehv_only") if getattr(args, name)]
     if args.variant_floor_only and not args.variant:
         parser.error("--variant-floor-only requires --variant")
     if args.captions_only and args.variant:

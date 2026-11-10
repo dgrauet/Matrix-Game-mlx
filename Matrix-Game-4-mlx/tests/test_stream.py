@@ -83,7 +83,8 @@ def test_taehv_stream_three_pushes():
     vae, ref = _taehv(), _taehv()
     ref.core.update(vae.core.parameters())                       # identical random weights
     gen = _FakeGenerator()
-    stream = CastleStream(gen, vae, mx.zeros((1, 2, 4)), vae_backend="taehv", steps=(1000,), first_steps=(1000,))
+    stream = CastleStream(gen, vae, mx.zeros((1, 2, 4)), vae_backend="taehv", steps=(1000,), first_steps=(1000,),
+                         sink_latent=_sink())
     rng = np.random.default_rng(0)
     frame = 0
     for index, count in enumerate((1, 4, 4)):
@@ -114,8 +115,13 @@ def _run_pushes(stream, counts=(1, 4, 4), **push_kw):
     return chunks
 
 
+def _sink():
+    return mx.zeros(LATENT_SHAPE, mx.bfloat16)
+
+
 def _taehv_stream(gen=None, **kw):
     from matrix_game_mlx.inference.stream import CastleStream
+    kw.setdefault("sink_latent", _sink())                         # mandatory; kv_only (default) primes position 0
     return CastleStream(gen or _FakeGenerator(), _taehv(), mx.zeros((1, 2, 4)), vae_backend="taehv", steps=(1000,),
                         first_steps=(1000,), **kw)
 
@@ -179,10 +185,24 @@ class _FakeRuntime:
         self.events.append(("clear",))
 
 
+def test_first_frame_is_displayed_without_denoising_and_forwards_sink_rope_mode():
+    """Upstream tests/test_racing.py: a first_frame chunk 0 shows the sink latent, runs no denoising, makes exactly
+    one clean generator call at t=0, and forwards sink_rope_mode to the generator."""
+    gen = _FakeGenerator()
+    stream = _taehv_stream(gen, sink_mode="first_frame", sink_rope_mode="future")
+    assert gen.calls == []
+    chunk = _run_pushes(stream, (1,))[0]
+    assert chunk.denoising_steps == 0
+    assert len(gen.calls) == 1
+    assert float(gen.calls[0]["timestep"][0, 0]) == 0
+    assert gen.calls[0]["sink_rope_mode"] == "future"
+    stream.close()
+
+
 def test_stream_primes_runtime_and_clears_it_on_close():
     gen = _FakeGenerator()
     gen.model.castle_runtime = runtime = _FakeRuntime()
-    stream = _taehv_stream(gen, sink_rope_mode="absolute")
+    stream = _taehv_stream(gen, sink_rope_mode="absolute", sink_mode="first_frame")   # no priming call
     assert runtime.events == [("prime", gen, LATENT_SHAPE, 1, 1, stream.fsl, "absolute")] and not gen.calls
     _run_pushes(stream, (1,))
     stream.close()
@@ -195,7 +215,8 @@ def test_stream_primes_taehv_graph_after_clearing():
     vae, events = _taehv(), []
     vae.clear_cache = lambda: events.append("clear")
     vae.prime = lambda: events.append("prime")
-    CastleStream(_FakeGenerator(), vae, mx.zeros((1, 2, 4)), vae_backend="taehv", steps=(1000,), first_steps=(1000,))
+    CastleStream(_FakeGenerator(), vae, mx.zeros((1, 2, 4)), vae_backend="taehv", steps=(1000,), first_steps=(1000,),
+                 sink_latent=_sink())
     assert events == ["clear", "prime"]
 
 
@@ -270,7 +291,8 @@ def test_encode_sink_image_taehv_clears_dirty_state(tmp_path):
 
 def test_castle_stream_init_clears_dirty_taehv_state():
     vae, fresh = _dirty_pair()
-    CastleStream(_FakeGenerator(), vae, mx.zeros((1, 2, 4)), vae_backend="taehv", steps=(1000,), first_steps=(1000,))
+    CastleStream(_FakeGenerator(), vae, mx.zeros((1, 2, 4)), vae_backend="taehv", steps=(1000,), first_steps=(1000,),
+                 sink_latent=_sink())
     _assert_clean_and_equal_to_fresh(vae, fresh)
 
 
@@ -359,7 +381,35 @@ def test_taehv_decode_receives_vae_dtype_from_fp16_stream():
     decode = vae.decode_stream
     vae.decode_stream = lambda z: (seen.append(z.dtype), decode(z))[1]
     from matrix_game_mlx.inference.stream import CastleStream
-    stream = CastleStream(Half(), vae, mx.zeros((1, 2, 4)), vae_backend="taehv", steps=(1000,), first_steps=(1000,))
+    stream = CastleStream(Half(), vae, mx.zeros((1, 2, 4)), vae_backend="taehv", steps=(1000,), first_steps=(1000,),
+                          sink_latent=_sink())
     assert stream.dtype == mx.float16
     _run_pushes(stream, (1,))
     assert seen == [mx.bfloat16]
+
+
+@pytest.mark.parametrize("sink_mode, offset", [("kv_only", 1), ("first_frame", 0)])
+@pytest.mark.parametrize("mode, rows", [("fixed", 9000), ("absolute", 9000), ("future", 9011)])
+def test_stream_rope_table_covers_the_future_sink(mode, rows, sink_mode, offset):
+    """A fresh tiny model's RoPE table after CastleStream: max_latents + sink_offset = 9000 positions, plus the
+    sink's reach (11) under the future policy. A kv_only sink occupies cache position 0 (offset 1); a first_frame
+    sink is the first chunk itself (offset 0)."""
+    from tests.test_runtime import _stream_model
+    gen = _stream_model()
+    stream = CastleStream(gen, _taehv(), mx.zeros((1, 8, 32), mx.bfloat16), vae_backend="taehv", steps=(1000,),
+                          first_steps=(1000,), sink_rope_mode=mode, sink_mode=sink_mode, max_latents=9000 - offset,
+                          sink_latent=_sink())
+    assert stream.sink_offset == offset
+    assert gen.model.freqs[0].shape[0] == rows
+    stream.close()
+
+
+@pytest.mark.parametrize("mode", ["kv_only", "first_frame"])
+def test_missing_sink_is_rejected(mode):
+    with pytest.raises(ValueError, match="A sink latent is required"):
+        _taehv_stream(sink_mode=mode, sink_latent=None)
+
+
+def test_stream_rejects_unknown_sink_rope_mode():
+    with pytest.raises(ValueError, match="Invalid sink policy"):
+        _taehv_stream(sink_rope_mode="dual")

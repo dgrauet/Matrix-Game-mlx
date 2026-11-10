@@ -125,11 +125,12 @@ class ModelComponents:
         else:
             from matrix_game_mlx.inference.wrappers import WanVAE22Wrapper
             self.vae = WanVAE22Wrapper(str(shared["vae.safetensors"]), dtype=mx.bfloat16)
-        if args.sink_image is not None:
-            self.sink_latent = encode_sink_image(self.vae, args.sink_image, args.vae_backend,
-                                                 first_frame=args.sink_mode == "first_frame").astype(mx.bfloat16)
-            mx.eval(self.sink_latent)
-            self.sink_sha256 = sha256_file(args.sink_image)
+        if args.sink_image is None:
+            raise ValueError("A sink image is required")
+        self.sink_latent = encode_sink_image(self.vae, args.sink_image, args.vae_backend,
+                                             first_frame=args.sink_mode == "first_frame").astype(mx.bfloat16)
+        mx.eval(self.sink_latent)
+        self.sink_sha256 = sha256_file(args.sink_image)
 
     def stream(self, **kwargs):
         from matrix_game_mlx.inference.stream import CastleStream
@@ -152,9 +153,9 @@ class ModelComponents:
         return dict(scene=a.scene, scene_name=SCENES[a.scene]["name"], checkpoint=f"{self.component}.safetensors",
                     ckpt_keys=["generator_ema"], vae_backend=a.vae_backend, steps=list(a.steps),
                     first_steps=list(a.first_steps), sink_rope_mode=a.sink_rope_mode, sink_mode=a.sink_mode,
-                    sink_encoder=a.vae_backend, sink_source="image" if a.sink_image is not None else "generated_first_frame",
-                    sink_image=a.sink_image.name if a.sink_image is not None else None, sink_sha256=self.sink_sha256,
-                    prompt=a.prompt, hq_first_frame=a.sink_mode == "first_frame" and a.sink_image is not None,
+                    sink_encoder=a.vae_backend, sink_source="image",
+                    sink_image=a.sink_image.name, sink_sha256=self.sink_sha256,
+                    prompt=a.prompt, hq_first_frame=a.sink_mode == "first_frame",
                     prompt_mode=a.prompt_mode, prompt_interval_chunks=a.prompt_interval_chunks,
                     t5_runtime=a.t5_runtime, dit_parallel="single", dit_runtime=self.dit_runtime(),
                     attention_backend=self.attention_backend, vae_graph=getattr(a, "vae_graph", False),

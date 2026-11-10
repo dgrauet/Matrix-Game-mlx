@@ -3,6 +3,7 @@
 Streaming neural rendering for executable low-poly games.
 
 [Project website](https://matrix-game-v4-0.github.io/page/)
+| [Technical report](https://arxiv.org/abs/2610.27999)
 | [Models and game assets](https://huggingface.co/Skywork/Matrix-Game-4.0)
 
 The game engine owns gameplay, physics and input. A causal video model renders
@@ -11,14 +12,22 @@ layers outside the model. This release includes **Medieval Castle**, **Ancient
 Egypt**, and **City Racing**, with offline rendering and a single-user WebRTC
 browser demo. Racing includes time trials and pursuit, plus fixed/dynamic prompts.
 
-**2026-10-14:** We plan to release optimized inference code for NVIDIA GeForce
-RTX 50-series GPUs later this week.
+**2026-10-16:** Optimized inference for [RTX 5080](#rtx-5080) and
+[RTX 5070 Ti](#rtx-5070-ti) is now available. With fixed prompts and SageAttention,
+model throughput reaches up to **67 FPS on RTX 5080** and **58 FPS on RTX 5070 Ti**
+at 864 x 480 (steady state, excluding video I/O). Use `--preset rtx5080-sage` or
+`--preset rtx5070ti-sage`, respectively, with `--prompt-mode fixed`.
+
+**2026-10-15:** Optimized inference for NVIDIA GeForce RTX 5090 is now available.
+Use `--preset rtx5090`, or `--preset rtx5090-sage` with the optional SageAttention
+backend. See [RTX 5090](#rtx-5090) for setup and launch commands.
 
 ## Requirements
 
-- Model inference: Linux, NVIDIA GPU, Python 3.12. This release is tested on
-  A100 80 GB with PyTorch 2.12.0/CUDA 13.2. RTX 50-series optimizations are planned
-  as noted above.
+- Model inference: Linux, NVIDIA GPU, Python 3.12. The A100 80 GB deployment uses
+  PyTorch 2.12.0/CUDA 13.2. Dedicated RTX 5090, RTX 5080 and RTX 5070 Ti runtimes
+  are also included; use the environment below and select the matching preset
+  explicitly. RTX 5080 and RTX 5070 Ti support fixed prompts only.
 - Browser demo: the same Linux host also builds/runs the game and GStreamer.
   Safari and Chrome are the desktop client targets. No GPU is needed on the client.
 - Standalone game/recording: macOS or Linux, CMake, C++20, SDL2 and FFmpeg libraries.
@@ -42,7 +51,9 @@ python -m pip install -e '.[inference,server,download,test]'
 ```
 
 The optimized path requires matching PyTorch/Triton and a compatible NVIDIA
-driver. FlashAttention is optional; SDPA is the tested source deployment path.
+driver. A separate FlashAttention installation is optional. The `rtx5090`,
+`rtx5080` and `rtx5070ti` presets do not require SageAttention; their `-sage`
+variants require the additional [SageAttention build](#optional-sageattention).
 See [installation](docs/installation.md) for native and media dependencies.
 
 ## Resources
@@ -68,12 +79,12 @@ shared dependencies:
 ```bash
 matrix-game download --manifest releases/game-assets.json \
   --repo-id Skywork/Matrix-Game-4.0 --repo-type model \
-  --revision 4419accdb7bb7881234c5914de8cd915266e0325 \
+  --revision 2c53100457da7abcf0e966f75637c644d3423a63 \
   --scene ancient-egypt --resources resources
 
 matrix-game download --manifest releases/models.json \
   --repo-id Skywork/Matrix-Game-4.0 --repo-type model \
-  --revision 4419accdb7bb7881234c5914de8cd915266e0325 \
+  --revision 2c53100457da7abcf0e966f75637c644d3423a63 \
   --scene ancient-egypt --resources resources
 ```
 
@@ -95,7 +106,9 @@ dependencies.
 
 Start with the fast path: TAEHV encoding/decoding, one denoising step, a fixed
 scene prompt and the accelerated DiT runtime. Select it explicitly with
-`--preset realtime`, which supports both offline and online rendering:
+`--preset realtime` on A100, `--preset rtx5090` on RTX 5090, `--preset rtx5080`
+on RTX 5080, or `--preset rtx5070ti` on RTX 5070 Ti. These presets support offline
+and online rendering; hardware selection is not automatic.
 
 ```bash
 matrix-game render --scene ancient-egypt --input lowpoly.mp4 \
@@ -160,6 +173,10 @@ CUDA_VISIBLE_DEVICES=0 bash scripts/serve.sh \
   --scene ancient-egypt --resources resources --preset realtime --fps 40
 ```
 
+On RTX GPUs, replace `--preset realtime` with the matching `rtx5090`, `rtx5080`
+or `rtx5070ti` preset. See [RTX 5090](#rtx-5090), [RTX 5080](#rtx-5080) or
+[RTX 5070 Ti](#rtx-5070-ti) for the optional SageAttention variants.
+
 Open **http://127.0.0.1:8025/** on the server, or forward the required ports through
 SSH as described in [online deployment](docs/online.md). Add `--reference-only`
 to test controls, HUD, audio and transport without loading a model.
@@ -180,8 +197,50 @@ are cached, but frequent T5 updates reduce throughput.
 The scene profiles also select the reference-image behavior automatically:
 shooters use the reference as visual context and generate the first visible
 frame; racing displays its supplied reference as frame zero, then generates the
-following frames. See [City Racing](docs/racing.md) and
-[architecture](docs/architecture.md) for prompt and temporal-position details.
+following frames. See [City Racing](docs/racing.md),
+[architecture](docs/architecture.md) and [Future Sink](#future-sink-racing) for
+prompt and temporal-position details.
+
+## Future Sink (Racing)
+
+Racing shows its sink image as frame zero and keeps it in the KV cache as the
+visual reference for the whole session. With **future sink RoPE**, once the
+21-latent window is full (output frame 85 onwards), the sink's keys are
+re-rotated to 11 positions ahead of the current block, so the sink stays at a
+constant distance from the frames being generated. With the previous
+`absolute` policy the sink stays at position zero and its distance grows with
+the session. In 4001-frame renders of two test drives with the default sink
+image, `absolute` melted buildings and road surfaces after about 1800 to 2900
+frames on both `realtime` and `quality`; `future` did not.
+
+Future sink is the racing default, so no extra flag is needed. To choose the
+policy explicitly, pass `--sink-rope-mode` to `matrix-game render` or
+`scripts/serve.sh`. It works with every preset:
+
+```bash
+# Future sink (racing default)
+matrix-game render --scene racing --input lowpoly.mp4 --resources resources \
+  --preset realtime --prompt-mode fixed --sink-rope-mode future \
+  --output outputs/racing-future
+
+# Previous behavior, for comparison
+matrix-game render --scene racing --input lowpoly.mp4 --resources resources \
+  --preset realtime --prompt-mode fixed --sink-rope-mode absolute \
+  --output outputs/racing-absolute
+```
+
+| `--sink-rope-mode` | Sink keys once the window is full | Default for |
+| --- | --- | --- |
+| `future` | 11 positions ahead of the current block | Racing |
+| `fixed` | 21 positions behind the current block | Castle, Ancient Egypt |
+| `absolute` | Position zero; the distance grows with the session | None |
+
+Only the sink's keys move. Its values and the window frames keep their
+positions, the weights are unchanged, and the policies differ only from output
+frame 85 onwards. The offset is `FUTURE_SINK_OFFSET` in
+`matrix_game/inference/sink_policy.py`, and `render.json` records the policy as
+`sink_rope_mode`. A sink image is required: `--sink-image`, or
+`models/<scene>/sink.png` by default.
 
 ## A100 Performance
 
@@ -202,31 +261,94 @@ architecture and inference configuration and serve as a performance reference.
 
 ## RTX 5090
 
-`rtx5090` replaces the DiT runtime with FP8 linears, fused kernels and CUDA
-graphs (`matrix_game/inference/rtx5090`); `rtx5090-sage` also runs
-self-attention on SageAttention.
+Start with `--preset rtx5090` after the standard installation and resource
+downloads above. It uses the same scene checkpoints and shared resources; no
+separate quantized checkpoint is needed. DiT block linear weights are converted
+to FP8 at load time, and their activations are quantized during inference.
+Embeddings and the output head remain BF16.
+
+Both RTX 5090 presets select TAEHV encoding/decoding, one-step denoising, fused
+kernels and CUDA graphs. They differ in the self-attention backend:
+
+| Preset | Self-attention | Additional setup |
+| --- | --- | --- |
+| `rtx5090` | PyTorch SDPA | None beyond the standard installation |
+| `rtx5090-sage` | SageAttention for the full history window; SDPA while it fills | Patched SageAttention build below |
+
+Render an existing low-poly video or start the browser server:
 
 ```bash
 matrix-game render --scene ancient-egypt --input lowpoly.mp4 \
   --resources resources --preset rtx5090 --prompt-mode fixed \
-  --output outputs/egypt
+  --output outputs/egypt-rtx5090
 
 CUDA_VISIBLE_DEVICES=0 bash scripts/serve.sh \
-  --scene ancient-egypt --resources resources --preset rtx5090 --fps 40
+  --scene ancient-egypt --resources resources --preset rtx5090 \
+  --prompt-mode fixed --fps 40
 ```
 
-`rtx5090-sage` needs SageAttention 2.2.0 patched for CUDA-graph capture and
-built with CUDA 13.2:
+The browser server uses the same native-game and MediaMTX setup described above.
+The runtime warms up kernels and captures CUDA graphs before accepting a real
+session, so startup takes longer than steady-state rendering. `--fps 40` still
+controls the game capture cadence, not measured rendering throughput.
+
+### Optional SageAttention
+
+To use `--preset rtx5090-sage`, build SageAttention 2.2.0 with the supplied
+CUDA-graph patch and CUDA 13.2. Run these commands from `Matrix-Game-4/` in the
+same Python environment as the model:
 
 ```bash
-pip install "nvidia-cuda-nvcc==13.2.*" "nvidia-nvvm==13.2.*" "nvidia-cuda-crt==13.2.*" "nvidia-cuda-cccl==13.2.*" setuptools wheel ninja
+python -m pip install "nvidia-cuda-nvcc==13.2.*" "nvidia-nvvm==13.2.*" "nvidia-cuda-crt==13.2.*" "nvidia-cuda-cccl==13.2.*" setuptools wheel ninja
 export CUDA_HOME="$(python -c 'import nvidia, os; print(os.path.join(nvidia.__path__[0], "cu13"))')"
 mkdir -p ../cuda-link && ln -sf "$CUDA_HOME/lib/libcudart.so.13" ../cuda-link/libcudart.so
 git clone https://github.com/thu-ml/SageAttention.git ../SageAttention
 git -C ../SageAttention checkout eb615cf6cf4d221338033340ee2de1c37fbdba4a
 git -C ../SageAttention apply "$PWD/matrix_game/inference/rtx5090_sage/sageattention.patch"
-LIBRARY_PATH="$PWD/../cuda-link" MAX_JOBS=4 EXT_PARALLEL=2 pip install --no-build-isolation ../SageAttention
+LIBRARY_PATH="$PWD/../cuda-link" MAX_JOBS=4 EXT_PARALLEL=2 python -m pip install --no-build-isolation ../SageAttention
 ```
+
+Then replace `--preset rtx5090` with `--preset rtx5090-sage` in either command
+above. No SageAttention build is needed when using plain `rtx5090`.
+
+## RTX 5080
+
+Use `--preset rtx5080`, or `--preset rtx5080-sage` with the
+[SageAttention build](#optional-sageattention). Fixed prompts only (`--prompt-mode fixed`):
+with 16 GB, T5 encodes the prompt and is released before the DiT is loaded.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 bash scripts/serve.sh \
+  --scene ancient-egypt --resources resources --preset rtx5080-sage \
+  --prompt-mode fixed --fps 40
+```
+
+| Preset | Model FPS | GPU memory |
+| --- | --- | --- |
+| `rtx5080` | ~42 | ~9.6 GB |
+| `rtx5080-sage` | ~67 | ~12.8 GB |
+
+Model throughput on one RTX 5080 at 864 x 480, steady state, excluding video I/O.
+
+## RTX 5070 Ti
+
+Use `--preset rtx5070ti`, or `--preset rtx5070ti-sage` with the
+[SageAttention build](#optional-sageattention). Fixed prompts only, as on the RTX 5080.
+The block linears use INT8 (W8A8, no calibration), which is faster than FP8 at this
+model's GEMM shapes on this GPU; tuning is in `matrix_game/inference/rtx5070ti/config.py`.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 bash scripts/serve.sh \
+  --scene ancient-egypt --resources resources --preset rtx5070ti-sage \
+  --prompt-mode fixed --fps 40
+```
+
+| Preset | Model FPS | GPU memory |
+| --- | --- | --- |
+| `rtx5070ti` | ~41 | ~9.2 GB |
+| `rtx5070ti-sage` | ~58 | ~10.9 GB |
+
+Model throughput on one RTX 5070 Ti at 864 x 480, steady state, excluding video I/O.
 
 ## Layout
 
@@ -245,6 +367,22 @@ releases/                      # Resource manifests, not large binary assets
 See [architecture](docs/architecture.md) for the streaming contract and
 [testing](docs/testing.md) for validation commands. Only one active game session
 and one scene model per server process are supported.
+
+## Citation
+
+If you use Matrix-Game 4.0 in your research, please cite:
+
+```bibtex
+@misc{zhang2026matrixgame40harnessingvideo,
+      title={Matrix-Game 4.0: Harnessing Video Models for Real-Time Playable Game Worlds},
+      author={Jihai Zhang and Runjia Qian and Kaiqin Kong and Biao Jiang and Puyi Wang and Siru Chen and Tianle Li and Guanjie Chen and Junyi Wu and Chubin Chen and Yuanhang Li and Kaichen Huang and Haobo Zhang and Yangguang Li and Wei Yu and Guibin Chen and Yu Cheng and Yahui Zhou},
+      year={2026},
+      eprint={2610.27999},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2610.27999},
+}
+```
 
 ## Security and License
 

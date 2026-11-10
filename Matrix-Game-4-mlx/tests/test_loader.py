@@ -109,12 +109,34 @@ def test_config_keys_match_upstream(tmp_path, monkeypatch):
     assert loader.ModelComponents(model_args("racing", "quality", ["--t5-runtime", "native"]), pack=pack).config()["t5_runtime"] == "native"
 
 
-def test_no_sink_config(tmp_path, monkeypatch):
+@pytest.mark.parametrize("scene", ["racing", "castle"])
+def test_config_always_reports_an_image_sink(tmp_path, monkeypatch, scene):
     from matrix_game_mlx.scenes import model_args
     pack = _scene_pack(tmp_path, monkeypatch)
-    cfg = loader.ModelComponents(model_args("racing", "quality", ["--no-sink-image"]), pack=pack).config()
-    assert cfg["sink_source"] == "generated_first_frame" and cfg["sink_image"] is None and cfg["sink_sha256"] is None
-    assert cfg["hq_first_frame"] is False
+    components = loader.ModelComponents(model_args(scene, "quality"), pack=pack)
+    components.sink_sha256 = "abc"
+    cfg = components.config()
+    assert cfg["sink_source"] == "image" and cfg["sink_image"] == "sink.png" and cfg["sink_sha256"] == "abc"
+    assert cfg["hq_first_frame"] == (cfg["sink_mode"] == "first_frame")
+
+
+def test_components_require_a_sink_image(tmp_path, monkeypatch):
+    import mlx.core as mx
+    from matrix_game_mlx.inference import loading, wrappers
+    from matrix_game_mlx.scenes import model_args
+    pack = _scene_pack(tmp_path, monkeypatch)
+    embeds = mx.ones((1, 512, 4096), dtype=mx.bfloat16)
+    monkeypatch.setattr(wrappers, "WanTextEncoder", lambda *a: lambda prompts: {"prompt_embeds": embeds})
+    monkeypatch.setattr(loading, "build_dit", lambda *a, **k: types.SimpleNamespace(model=types.SimpleNamespace()))
+    monkeypatch.setattr(wrappers, "WanVAE22Wrapper", lambda *a, **k: object())
+    shared = tmp_path / "t5"
+    shared.write_bytes(b"")
+    monkeypatch.setattr(loader, "resolve_shared_files", lambda p, c=None: {
+        "t5_encoder.safetensors": shared, "google/umt5-xxl": shared, "vae.safetensors": shared})
+    args = model_args("castle", "quality")
+    args.sink_image = None
+    with pytest.raises(ValueError, match="A sink image is required"):
+        loader.ModelComponents(args, pack=pack).load()
 
 
 def test_codec_follows_vae_backend(tmp_path, monkeypatch):

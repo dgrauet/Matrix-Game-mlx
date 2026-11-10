@@ -81,8 +81,6 @@ def run(args) -> dict:
     from matrix_game_mlx.inference.loader import ModelComponents
     from matrix_game_mlx.scenes import resolve_model_arguments
     resolve_model_arguments(args)
-    if args.sink_image is None:
-        raise SystemExit("The input pan needs the scene sink image (do not pass --no-sink-image)")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     comp = ModelComponents(args)

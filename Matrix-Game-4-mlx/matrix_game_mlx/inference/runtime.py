@@ -33,6 +33,7 @@ import mlx.core as mx
 import numpy as np
 
 from matrix_game_mlx.inference.rope_kernel import RopeRotations
+from matrix_game_mlx.inference.sink_policy import SINK_ROPE_MODES, rotated_sink_position
 
 
 @dataclass(frozen=True)
@@ -158,8 +159,8 @@ def run_blocks(plans, x, e, rotations, sink_rotations, fused=False):
     """Run the DiT blocks over planned caches (upstream `run_blocks`).
 
     Unfused: exactly the native `CausalWanAttentionBlock` arithmetic, with RoPE from the GPU kernel and attention
-    over the cache in ring order (`cache[:, :end]`, or the re-roped sink + `cache[:, tokens:end]` in fixed-sink
-    steady state). Fused (upstream's structure): the LayerNorm + modulation, gate + residual (+ affine LayerNorm)
+    over the cache in ring order (`cache[:, :end]`, or the re-roped sink + `cache[:, tokens:end]` in sink
+    steady state, `fixed` or `future`). Fused (upstream's structure): the LayerNorm + modulation, gate + residual (+ affine LayerNorm)
     chains, the q / k RMSNorms and the FFN activation run as single kernels (`kernels.py`) with the native rounding;
     cross-attention is inlined as upstream does (same projections, norms and attention call as the native module).
     """
@@ -305,7 +306,7 @@ class CastleRuntime:
         from matrix_game_mlx.inference.rope_kernel import build_causal_rope_rotations
         from matrix_game_mlx.inference.wan.modules.causal_model import _check_rope_len
         device = mx.default_device()
-        if (unsupported or sink_rope_mode not in (None, "absolute", "fixed") or x.dtype != self.dtype
+        if (unsupported or sink_rope_mode not in (None,) + SINK_ROPE_MODES or x.dtype != self.dtype
                 or device.type != mx.gpu):
             raise ValueError(f"Unsupported runtime: extra={unsupported}, sink={sink_rope_mode}, "
                              f"dtype={x.dtype}, device={device}")
@@ -331,11 +332,13 @@ class CastleRuntime:
             if self.fused and not _fusable(block, e, self.dtype):
                 raise ValueError(f"Fused kernels expect {_dtype_name(self.dtype)} modulation, an affine "
                                  "cross-attention LayerNorm and RMS q/k norms")
-        _check_rope_len(model.freqs, position + 1)  # native's message for an exhausted RoPE table
-        rotations = build_causal_rope_rotations(model.freqs, 1, h, w, position)
         steady = position > window
-        fixed = steady and sink_rope_mode == "fixed"
-        sink_rotations = build_causal_rope_rotations(model.freqs, 1, h, w, position - window) if fixed else None
+        sink_position = rotated_sink_position(sink_rope_mode, position, window)
+        fixed = sink_position is not None
+        # native's message for an exhausted RoPE table, the sink's position included, before any rotation is built
+        _check_rope_len(model.freqs, max(position, sink_position or 0) + 1)
+        rotations = build_causal_rope_rotations(model.freqs, 1, h, w, position)
+        sink_rotations = build_causal_rope_rotations(model.freqs, 1, h, w, sink_position) if fixed else None
         plans = []
         for block, cache, cross in zip(model.blocks, kv, xc):
             start, end = plan_cache(cache, current_start, tokens, window, self.ring)

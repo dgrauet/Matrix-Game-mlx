@@ -204,6 +204,17 @@ def test_call_tol_rule_reproduces_m1_egypt_table():
     assert derived == M1_EGYPT_CALL_TOL
 
 
+def test_racing_records_the_long_chunk_22_call_fixture():
+    """Racing's only quality gate at chunk 22 (the first rotated sink position) is calls_long22, which exists only
+    when the fixtures were generated with --long. _call_cases is built from meta.json, so without this pin a racing
+    set regenerated without --long would drop that gate with no skip and no failure."""
+    if _meta("racing") is None:
+        pytest.skip(f"{_dir('racing')} missing or incomplete: generate it with "
+                    "python -m tests.parity.gen_fixtures --scene racing --long")
+    assert "calls_long22" in _meta("racing")["call_floors"]["calls"], (
+        "racing fixtures lack calls_long22: regenerate with python -m tests.parity.gen_fixtures --scene racing --long")
+
+
 @needs_weights
 @pytest.mark.parametrize("scene", SCENES)
 def test_sink_encoding_production_path(scene, comps):
@@ -236,12 +247,14 @@ def _ring_block(model, i, cache, cross, x, e0, context, start, sink_rope_mode):
     fused or not as the installed runtime."""
     from matrix_game_mlx.inference.rope_kernel import build_causal_rope_rotations
     from matrix_game_mlx.inference.runtime import Plan, plan_cache, run_blocks
+    from matrix_game_mlx.inference.sink_policy import rotated_sink_position
     block, (h, w) = model.blocks[i], (15, 27)
     window, tokens = _window_of(model), h * w
     position = start // tokens
-    fixed = position > window and sink_rope_mode == "fixed"
+    sink_position = rotated_sink_position(sink_rope_mode, position, window)
     rotations = build_causal_rope_rotations(model.freqs, 1, h, w, position)
-    sink_rotations = build_causal_rope_rotations(model.freqs, 1, h, w, position - window) if fixed else None
+    sink_rotations = (build_causal_rope_rotations(model.freqs, 1, h, w, sink_position)
+                      if sink_position is not None else None)
     s, end = plan_cache(cache, start, tokens, window, True)
     a = block.cross_attn
     cross["k"] = a.norm_k(a.k(context)).reshape(1, -1, a.num_heads, a.head_dim)
@@ -283,8 +296,16 @@ def test_block_parity(scene, comps, block_case, i):
 @pytest.mark.parametrize("scene,name,j", _call_cases())
 def test_call_parity(scene, comps, name, j):
     path = _dir(scene) / f"{name}.npz"
+    check_call_parity(comps, path, j, _meta(scene)["call_floors"]["calls"][name][j], f"{scene} {name}",
+                      f"python -m tests.parity.gen_fixtures --scene {scene} --calls-only")
+
+
+def check_call_parity(comps, path, j, floors, label, regen):
+    """Call j of the per-call fixture `path` through the MLX generator on torch's injected state, gated by
+    call_tol(floors) (shared by the quality and the realtime long-call tests; `regen` is the command cited when a
+    sink-writing fixture lacks its ksr entries)."""
     fx = np.load(path)                       # listed in meta.json call_floors: a missing file is a broken fixture set
-    tol = call_tol(_meta(scene)["call_floors"]["calls"][name][j], t_zero=not fx[f"c{j}_t"].any())
+    tol = call_tol(floors, t_zero=not fx[f"c{j}_t"].any())
     stream = comps.stream(seed=0)
     _inject_state(stream.kv, fx, stream.gen)                                   # torch's state at the chunk boundary
     _, pred = stream.gen(noisy_image_or_video=_to_mx(fx[f"c{j}_x"]),
@@ -322,9 +343,9 @@ def test_call_parity(scene, comps, name, j):
     if rows:
         for layer in KV_LAYERS:
             assert f"c{j}_ksr{layer}" in fx.files and f"ksr{layer}" in tol, \
-                f"call writes into the sink but {path.name} has no ksr{layer}: rerun gen_fixtures --scene {scene} --calls-only"
+                f"call writes into the sink but {path.name} has no ksr{layer}: rerun {regen}"
             m[f"ksr{layer}"] = rel_l2(stream.kv[layer]["k_sink_raw"], from_bits(fx[f"c{j}_ksr{layer}"]))
-    print(f"{scene} {name} call {j}: " + ", ".join(f"{k}={v:.3g}" for k, v in m.items()) + f" | tol {tol}")
+    print(f"{label} call {j}: " + ", ".join(f"{k}={v:.3g}" for k, v in m.items()) + f" | tol {tol}")
     assert m["pred"] <= tol["pred"], (m, tol)
     for layer in KV_LAYERS:
         assert max(m[f"k{layer}"], m[f"v{layer}"]) <= tol[f"l{layer}"], (m, tol)

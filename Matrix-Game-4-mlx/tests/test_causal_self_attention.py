@@ -18,7 +18,7 @@ def _copy_attn(a, b):
     a.norm_k.weight = mx.array(b.norm_k.weight.detach().numpy())
 
 
-@pytest.mark.parametrize("sink_rope_mode", ["fixed", "absolute"])
+@pytest.mark.parametrize("sink_rope_mode", ["fixed", "absolute", "future"])
 def test_kv_cache_rollout_30_chunks(sink_rope_mode):
     torch.manual_seed(0)
     dim, heads, W, S, grid = 128, 2, 4, 1, [[1, 2, 3]]
@@ -50,3 +50,26 @@ def test_kv_cache_rollout_30_chunks(sink_rope_mode):
             assert cache_a["local_end_index"] == int(cache_b["local_end_index"]), msg
             for name in ("k", "v", "k_sink_raw"):
                 assert_close(cache_a[name], cache_b[name], atol=1e-4, msg=f"{msg} {name}")
+
+
+def test_native_future_sink_keys_are_rotated_at_rope_frame_plus_offset(monkeypatch):
+    from matrix_game_mlx.inference.sink_policy import FUTURE_SINK_OFFSET
+    from matrix_game_mlx.inference.wan.modules import causal_model
+    dim, heads, W, S, fsl, grid = 128, 2, 4, 1, 6, [[1, 2, 3]]
+    attn = CausalWanSelfAttention(dim, heads, W, S, True, 1e-6)
+    fm, _ = _freqs(8192, dim // heads)
+    rng = np.random.default_rng(0)
+    cache = {"k": mx.zeros((1, W * fsl, heads, dim // heads)), "v": mx.zeros((1, W * fsl, heads, dim // heads)),
+             "global_end_index": 0, "local_end_index": 0, "k_sink_raw": mx.zeros((1, S * fsl, heads, dim // heads))}
+    seen, real = [], causal_model.rope_apply_frames
+
+    def spy(x, grid_sizes, freqs, frame_pos):
+        seen.append(list(frame_pos))
+        return real(x, grid_sizes, freqs, frame_pos)
+    monkeypatch.setattr(causal_model, "rope_apply_frames", spy)
+    for chunk in range(W + 3):
+        seen.clear()
+        x = mx.array(rng.standard_normal((1, fsl, dim)).astype(np.float32))
+        attn(x, mx.array([fsl]), grid, fm, None, kv_cache=cache, current_start=chunk * fsl, sink_rope_mode="future")
+        # one call re-ropes the sink once the window is full (chunk > W)
+        assert seen == ([[chunk + FUTURE_SINK_OFFSET]] if chunk > W else []), chunk

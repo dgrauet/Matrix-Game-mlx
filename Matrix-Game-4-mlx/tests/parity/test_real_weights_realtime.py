@@ -18,6 +18,10 @@ DiT is preset-independent and gated per block / per call by the quality suite (t
   single denoising step torch against its own SDPA variant already exceeds 2e-2 (egypt chunk 0: 2.3e-2), and the MLX
   gap is the DiT's alone (2.80e-2 with torch's exact control injected vs 2.75e-2 with MLX's TAEHV control). The other
   chunks are reported (-s).
+- Long chunk 22 per call (racing only, needs `gen_fixtures --scene racing --preset realtime --long`, skipped with that
+  command otherwise): torch's state at chunk 22 (past the 21-latent window, where the racing default `future` sink
+  mode re-rotates the sink) injected, then the denoise call and the clean pass through the MLX generator, each gated
+  by call_tol of its own torch kernel-variant floor (meta.json call_floors, as the quality per-call test).
 
 One scene's MLX DiT is held at a time (tests/conftest.py groups this module's items by scene); the quality module's
 DiT is freed by its own module-scoped fixture before this module loads.
@@ -32,7 +36,7 @@ import mlx.core as mx
 
 from tests.conftest import fixtures_dir, psnr, select_runtime, rel_l2, to_np
 from tests.parity.gen_fixtures import PRESET_SPECS, SCENE_SPECS, generation_command
-from tests.parity.test_real_weights import ceil_1sig, linear_cache
+from tests.parity.test_real_weights import ceil_1sig, check_call_parity, linear_cache
 
 pytestmark = [pytest.mark.needs_fixtures, pytest.mark.needs_weights]
 
@@ -205,3 +209,23 @@ def test_stream_end_to_end_realtime(scene, comps):
     finally:
         stream.close()
     assert not failures, failures
+
+
+LONG_NAME = "calls_long22"
+
+
+def _long_cases():
+    """Racing only: the first_frame scene (sink_offset 0) is the one whose default sink mode (`future`) acts at chunk 22."""
+    return [("racing", j) for j in range(2)]
+
+
+@pytest.mark.parametrize("scene,j", _long_cases())
+def test_realtime_call_parity_past_the_window(scene, j, request):
+    """Call j (0: denoise, 1: clean pass) of chunk 22 on torch's injected state; same body as test_call_parity."""
+    meta = _meta(scene, "call_floors")
+    if meta is None or LONG_NAME not in meta["call_floors"]["calls"]:
+        pytest.skip(f"{_dir(scene)} has no {LONG_NAME} per-call fixture: generate it with "
+                    f"{generation_command(scene, PRESET)} --long")
+    comps = request.getfixturevalue("comps")                       # the DiT loads only once the fixture is there
+    check_call_parity(comps, _dir(scene) / f"{LONG_NAME}.npz", j, meta["call_floors"]["calls"][LONG_NAME][j],
+                      f"{scene} realtime {LONG_NAME}", f"{generation_command(scene, PRESET)} --long")
