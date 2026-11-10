@@ -9,6 +9,7 @@ native's (ring order via `from_linear`) before every call, so rows the call does
 the written slot and the output carry the summation-order deviation. Free-running checks bound the drift over a rollout.
 """
 import gc
+import json
 import re
 import sys
 import types
@@ -571,9 +572,10 @@ def test_stream_second_session_matches_fresh_model(mode):
 
 @pytest.mark.needs_weights
 @pytest.mark.parametrize("mode", ("ring-fused", "apple"))
-def test_compiled_graph_is_bitwise_eager_on_real_weights(mode):
-    """Real castle weights, one steady fixed-sink position (denoise then cache-update call) on random full-window
-    caches: the compiled steady-window graph equals the eager runtime bit for bit, prediction and every K/V. Guards
+@pytest.mark.parametrize("scene, sink_rope_mode", (("castle", "fixed"), ("racing", "future")))
+def test_compiled_graph_is_bitwise_eager_on_real_weights(mode, scene, sink_rope_mode):
+    """Real castle (fixed sink) and racing (future sink: the sink is re-rotated to position 40) weights, one steady
+    position (denoise then cache-update call) on random full-window caches: the compiled steady-window graph equals the eager runtime bit for bit, prediction and every K/V. Guards
     an MLX upgrade: mx.compile is not bitwise for every op (README, Apple fast path parity). The DiT is built in
     `dit_dtype(mode)` (apple: float16); the prompt and control latent stay bf16, as the stream feeds them (the T5
     and the TAEHV are bf16), the latent and caches are in the DiT dtype."""
@@ -586,7 +588,9 @@ def test_compiled_graph_is_bitwise_eager_on_real_weights(mode):
     gc.collect()
     mx.clear_cache()
     dtype = dit_dtype(mode)
-    gen = build_dit(weights_dir(), "dit_castle", dtype=dtype)
+    pack = weights_dir()
+    component = json.loads((pack / "config.json").read_text())["scenes"][scene]["component"]
+    gen = build_dit(pack, component, dtype=dtype)
     install_runtime(gen, mode)
     runtime = gen.model.castle_runtime
     set_attention_window(gen, 21, 1)
@@ -608,7 +612,7 @@ def test_compiled_graph_is_bitwise_eager_on_real_weights(mode):
             cond = {"prompt_embeds": prompt, "control_latent": normal((1, 1, 48, 30, 54), mx.bfloat16)}
             _, pred = gen(noisy_image_or_video=normal((1, 1, 48, 30, 54)), conditional_dict=cond,
                           timestep=mx.full((1, 1), t), kv_cache=kv, crossattn_cache=xc, current_start=position * fsl,
-                          sink_rope_mode="fixed", drop_control=not control)
+                          sink_rope_mode=sink_rope_mode, drop_control=not control)
             mx.eval(pred, *[c[name] for c in kv for name in names])
             preds.append(pred)
         return preds, [[c[name] for name in names] for c in kv]
