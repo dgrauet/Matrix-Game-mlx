@@ -66,11 +66,12 @@ def test_compare_refuses_runs_with_other_inputs(tmp_path):
 def test_run_meta_records_dtype_and_window(mode, dtype, window):
     """A run's meta names the DiT dtype and the attention window the stream set (tiny DiT, stand-in codec)."""
     import mlx.core as mx
-    from matrix_game_mlx.inference.stream import CastleStream
+    from matrix_game_mlx.inference.stream import CastleStream, LATENT_SHAPE
     from tests.compare_runtimes import dit_meta
     from tests.test_runtime import _PoolVAE, _stream_model
     stream = CastleStream(_stream_model(mode=mode), _PoolVAE(), mx.zeros((1, 8, 32), mx.bfloat16),
-                          vae_backend="taehv", steps=(1000,), first_steps=(1000,))
+                          vae_backend="taehv", steps=(1000,), first_steps=(1000,),
+                          sink_latent=mx.zeros(LATENT_SHAPE, mx.bfloat16))
     assert dit_meta(stream) == {"dit_dtype": dtype, "window": window}
     stream.close()
 

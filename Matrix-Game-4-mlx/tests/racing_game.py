@@ -56,7 +56,7 @@ def download_command() -> str:
     """The assets download command (README "Racing assets"), targeting the resources directory in use."""
     return ("cd Matrix-Game-4-mlx && matrix-game-mlx download --manifest releases/game-assets.json "
             "--repo-id Skywork/Matrix-Game-4.0 --repo-type model "
-            "--revision 4419accdb7bb7881234c5914de8cd915266e0325 --scene racing "
+            "--revision 2c53100457da7abcf0e966f75637c644d3423a63 --scene racing "
             f"--resources {resources_dir()}")
 
 

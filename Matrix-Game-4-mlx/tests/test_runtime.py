@@ -493,8 +493,9 @@ def _stream_chunks(gen, chunks, seed=3):
     """A real CastleStream session on `gen`: `chunks` pushes of deterministic frames, then close()."""
     from matrix_game_mlx.inference.stream import CastleStream
     prompt = mx.array(np.random.default_rng(9).standard_normal((1, 8, 32)).astype(np.float32)).astype(mx.bfloat16)
+    # A first_frame sink (chunk 0 is the sink itself) keeps cache position == chunk index, as these tests count.
     stream = CastleStream(gen, _PoolVAE(), prompt, vae_backend="taehv", steps=(1000,), first_steps=(1000,),
-                          seed=seed)
+                          seed=seed, sink_latent=mx.zeros((1, 1, 48, 30, 54), mx.bfloat16), sink_mode="first_frame")
     key, frame, out = mx.random.key(11), 0, []
     for index in range(chunks):
         count = 1 if index == 0 else 4
@@ -535,7 +536,8 @@ def test_stream_wan_two_steps_with_fp16_dit(monkeypatch):
     monkeypatch.setattr(vae2_2, "count_conv3d", lambda module: 0)
     gen, vae = _stream_model(mode="apple"), _WanStubVAE()
     prompt = mx.zeros((1, 8, 32), mx.bfloat16)
-    stream = stream_module.CastleStream(gen, vae, prompt, vae_backend="wan", steps=(1000, 500), first_steps=(1000, 500))
+    stream = stream_module.CastleStream(gen, vae, prompt, vae_backend="wan", steps=(1000, 500), first_steps=(1000, 500),
+                                         sink_latent=mx.zeros((1, 1, 48, 30, 54), mx.bfloat16))
     assert stream.dtype == mx.float16
     frame = 0
     for count in (1, 4):

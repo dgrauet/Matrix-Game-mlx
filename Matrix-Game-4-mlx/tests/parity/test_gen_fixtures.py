@@ -27,7 +27,7 @@ def test_ensure_accelerate_is_reentrant():
 def test_scene_specs():
     from tests.parity.gen_fixtures import SCENE_SPECS
     assert set(SCENE_SPECS) == {"ancient-egypt", "castle", "racing"}
-    assert (SCENE_SPECS["racing"].sink_mode, SCENE_SPECS["racing"].sink_rope_mode) == ("first_frame", "absolute")
+    assert (SCENE_SPECS["racing"].sink_mode, SCENE_SPECS["racing"].sink_rope_mode) == ("first_frame", "future")
     assert SCENE_SPECS["racing"].src_dir == "driving_game"
     assert (SCENE_SPECS["castle"].sink_mode, SCENE_SPECS["castle"].sink_rope_mode) == ("kv_only", "fixed")
     assert SCENE_SPECS["castle"].src_dir == "fps-castle" and SCENE_SPECS["castle"].fixture_dir == "castle_quality"
@@ -214,27 +214,25 @@ def test_device_bridge_moves_latents_to_the_codec():
 
 
 VARIANTS = {
-    "racing_switch_realtime": ("racing", "taehv", (1000,), (1000,), True, 2),
-    "racing_switch_quality": ("racing", "wan", (1000, 500), (1000, 500), True, 2),
-    "castle_nosink_realtime": ("castle", "taehv", (1000,), (1000,), False, None),
-    "racing_nosink_realtime": ("racing", "taehv", (1000,), (1000,), False, None),
-    "castle_taehv_2step": ("castle", "taehv", (1000, 500), (1000, 500), True, None),
-    "egypt_wan_custom_first": ("ancient-egypt", "wan", (1000,), (1000, 750, 500, 250), True, None),
-    "racing_take_realtime": ("racing", "taehv", (1000,), (1000,), True, None),
-    "racing_take_quality": ("racing", "wan", (1000, 500), (1000, 500), True, None),
-    "racing_online_dynamic": ("racing", "taehv", (1000,), (1000,), True, None),
-    "castle_online_realtime": ("castle", "taehv", (1000,), (1000,), True, None),
+    "racing_switch_realtime": ("racing", "taehv", (1000,), (1000,), 2),
+    "racing_switch_quality": ("racing", "wan", (1000, 500), (1000, 500), 2),
+    "castle_taehv_2step": ("castle", "taehv", (1000, 500), (1000, 500), None),
+    "egypt_wan_custom_first": ("ancient-egypt", "wan", (1000,), (1000, 750, 500, 250), None),
+    "racing_take_realtime": ("racing", "taehv", (1000,), (1000,), None),
+    "racing_take_quality": ("racing", "wan", (1000, 500), (1000, 500), None),
+    "racing_online_dynamic": ("racing", "taehv", (1000,), (1000,), None),
+    "castle_online_realtime": ("castle", "taehv", (1000,), (1000,), None),
 }
 
 
 def test_variant_specs():
-    """Exactly the registered variants, with their codec / steps / first steps / sink / prompt-switch chunk."""
+    """Exactly the registered variants, with their codec / steps / first steps / prompt-switch chunk."""
     from tests.parity.gen_fixtures import VARIANT_SPECS
     assert set(VARIANT_SPECS) == set(VARIANTS)
-    for name, (scene, backend, steps, first, sink, switch) in VARIANTS.items():
+    for name, (scene, backend, steps, first, switch) in VARIANTS.items():
         v = VARIANT_SPECS[name]
-        assert (v.name, v.scene, v.vae_backend, v.steps, v.first_steps, v.sink, v.switch_chunk) == \
-            (name, scene, backend, steps, first, sink, switch)
+        assert (v.name, v.scene, v.vae_backend, v.steps, v.first_steps, v.switch_chunk) == \
+            (name, scene, backend, steps, first, switch)
 
 
 def test_prompt_b_text():
@@ -282,8 +280,8 @@ def test_variant_out_dir():
 
 
 def test_variant_denoising_schedule():
-    """Upstream CastleStream.push step choice: first_frame uses first_steps on chunk 0 (none with a sink: the sink is
-    the chunk), kv_only on positions < 2 (position = chunk + 1 with a sink)."""
+    """Upstream CastleStream.push step choice: first_frame uses first_steps on chunk 0 (none: the sink is the
+    chunk), kv_only on positions < 2 (position = chunk + 1: the sink always primes position 0)."""
     from tests.parity.gen_fixtures import (VARIANT_SPECS, variant_generator_calls, variant_n_renoise,
                                            variant_steps)
     egypt = VARIANT_SPECS["egypt_wan_custom_first"]
@@ -294,8 +292,6 @@ def test_variant_denoising_schedule():
     assert [len(variant_steps(racing, i)) for i in range(3)] == [0, 2, 2]
     assert [variant_generator_calls(racing, i) for i in range(3)] == [1, 3, 3]
     assert [variant_n_renoise(racing, i) for i in range(3)] == [0, 1, 1]
-    assert [len(variant_steps(VARIANT_SPECS["racing_nosink_realtime"], i)) for i in range(3)] == [1, 1, 1]
-    assert [len(variant_steps(VARIANT_SPECS["castle_nosink_realtime"], i)) for i in range(3)] == [1, 1, 1]
     assert [variant_n_renoise(VARIANT_SPECS["castle_taehv_2step"], i) for i in range(3)] == [1, 1, 1]
 
 
@@ -303,16 +299,14 @@ def test_variant_first_and_gated_chunks():
     from tests.parity.gen_fixtures import VARIANT_SPECS, gated_chunks
     assert gated_chunks(VARIANT_SPECS["racing_switch_realtime"]) == (1, 2)    # chunk 0 is the sink itself
     assert gated_chunks(VARIANT_SPECS["racing_switch_quality"]) == (1, 2)
-    assert gated_chunks(VARIANT_SPECS["racing_nosink_realtime"]) == (0,)      # no sink: chunk 0 is denoised
-    assert gated_chunks(VARIANT_SPECS["castle_nosink_realtime"]) == (0,)
     assert gated_chunks(VARIANT_SPECS["egypt_wan_custom_first"]) == (0,)
 
 
 def test_variant_model_argv():
     """The MLX model arguments of a variant: every field explicit, so the preset default never decides."""
     from tests.parity.gen_fixtures import VARIANT_SPECS
-    assert VARIANT_SPECS["castle_nosink_realtime"].model_argv() == \
-        ["--vae-backend", "taehv", "--steps", "1000", "--first-steps", "1000", "--no-sink-image"]
+    assert VARIANT_SPECS["racing_switch_realtime"].model_argv() == \
+        ["--vae-backend", "taehv", "--steps", "1000", "--first-steps", "1000"]
     assert VARIANT_SPECS["egypt_wan_custom_first"].model_argv() == \
         ["--vae-backend", "wan", "--steps", "1000", "--first-steps", "1000,750,500,250"]
     assert VARIANT_SPECS["egypt_wan_custom_first"].preset == "quality"
@@ -328,8 +322,8 @@ def test_variant_model_args_resolve_to_spec():
     from matrix_game_mlx.scenes import model_args
     for v in VARIANT_SPECS.values():
         a = model_args(v.scene, v.preset, v.model_argv())
-        assert (a.vae_backend, a.steps, a.first_steps, a.sink_image is not None) == \
-            (v.vae_backend, v.steps, v.first_steps, v.sink), v.name
+        assert (a.vae_backend, a.steps, a.first_steps) == (v.vae_backend, v.steps, v.first_steps), v.name
+        assert a.sink_image is not None, v.name
 
 
 def test_variant_noise_draws_are_deterministic():
@@ -353,23 +347,23 @@ def test_caption_texts():
 
 
 def test_variant_inputs_round_trip(tmp_path):
-    """inputs.npz as variant_reference writes it reads back through load_variant_inputs (sink / prompt B optional)."""
+    """inputs.npz as variant_reference writes it reads back through load_variant_inputs (prompt B optional)."""
     from tests.parity.gen_fixtures import (LATENT_SHAPE, VARIANT_SPECS, load_variant_inputs, variant_inputs,
                                            variant_noises)
     pixels = np.zeros((9, 3, 4, 4), np.float32) + np.arange(9, dtype=np.float32)[:, None, None, None]
-    for name, has_sink, has_b in (("racing_switch_quality", True, True), ("castle_nosink_realtime", False, False),
-                                  ("egypt_wan_custom_first", True, False)):
+    for name, has_b in (("racing_switch_quality", True), ("castle_taehv_2step", False),
+                        ("egypt_wan_custom_first", False)):
         v = VARIANT_SPECS[name]
         noises, renoises = variant_noises(v)
         prompt, prompt_b = np.ones((1, 512, 8), np.float32), (np.full((1, 512, 8), 2, np.float32) if has_b else None)
-        sink = np.full(LATENT_SHAPE, 3, np.float32) if has_sink else None
+        sink = np.full(LATENT_SHAPE, 3, np.float32)
         np.savez(tmp_path / f"{name}.npz", **variant_inputs(prompt, prompt_b, sink, pixels, noises, renoises))
         got = load_variant_inputs(v, np.load(tmp_path / f"{name}.npz"))
         assert np.array_equal(got[0], pixels)
         assert all(np.array_equal(a, b) for a, b in zip(got[1], noises))
         assert [len(r) for r in got[2]] == [len(r) for r in renoises]
         assert all(np.array_equal(a, b) for ra, rb in zip(got[2], renoises) for a, b in zip(ra, rb))
-        assert (got[3] is None) == (not has_sink) and (got[4] is None) == (not has_b)
+        assert np.array_equal(got[3], sink) and (got[4] is None) == (not has_b)
 
 
 class _FakeStream:

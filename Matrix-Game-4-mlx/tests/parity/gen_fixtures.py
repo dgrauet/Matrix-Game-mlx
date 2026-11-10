@@ -25,11 +25,11 @@ run. `--taehv-only` regenerates taehv_calls.npz / taehv_floor.npz / meta taehv_f
     python -m tests.parity.gen_fixtures --scene racing --preset realtime
 (`--print-commands [--preset P]` prints them.)
 
-Variants (`--variant NAME`, VARIANT_SPECS: prompt switch, no sink, free codec / step composition) write
+Variants (`--variant NAME`, VARIANT_SPECS: prompt switch, free codec / step composition) write
 `$MG4_FIXTURES_DIR/<NAME>/` in the realtime layout, 3 chunks: inputs.npz (pan pixels, initial noises, renoise_{i}_{k}
-draws, prompt_embeds and, for switch variants, prompt_b_embeds from upstream umT5 bf16 CPU, the torch sink_latent
-when the variant has a sink), chunks.npz, floor_chunk_{i}.npz (native bf16 CPU SDPA DiT floor, plus the Wan control)
-and meta.json (variant, vae_backend, steps, first_steps, sink, switch_chunk, prompt_b, floor with control_rel_l2).
+draws, prompt_embeds and, for switch variants, prompt_b_embeds from upstream umT5 bf16 CPU, the torch sink_latent),
+chunks.npz, floor_chunk_{i}.npz (native bf16 CPU SDPA DiT floor, plus the Wan control)
+and meta.json (variant, vae_backend, steps, first_steps, switch_chunk, prompt_b, floor with control_rel_l2).
 The racing_take_* variants take their pixels from the scripted racing take (take_frames: first 9 frames of
 reference.mkv, preprocessed as offline.py does; sink = the scene sink image) and record take_session and
 take_reference_sha256 in meta.json. Switch variants call the upstream CastleStream.set_prompt(prompt B) before switch_chunk.
@@ -437,8 +437,7 @@ def ensure_accelerate(torch) -> None:
 
 
 def make_stream(spec: SceneSpec, gen, vae, prompt, sink, preset: str = "quality", variant=None):
-    """Upstream CastleStream of a preset (first_steps == steps), or of a VariantSpec (its codec, steps, first steps;
-    `sink` None for the no-sink variants)."""
+    """Upstream CastleStream of a preset (first_steps == steps), or of a VariantSpec (its codec, steps, first steps)."""
     from matrix_game.inference.stream import CastleStream
     if variant is None:
         p = PRESET_SPECS[preset]
@@ -500,8 +499,8 @@ def load_stream(torch, spec: SceneSpec, device_pref: str, vae, prompt_np: np.nda
     ensure_accelerate(torch)
     gen = build_dit(str(CONFIG_DIR), str(spec.checkpoint), is_causal=True, dtype="bfloat16", timestep_shift=5)
     gen = gen.eval().requires_grad_(False)
-    if spec.sink_mode == "first_frame" or sink is None:
-        # No sink-priming forward at construction (first_frame sink mode, or no sink), so there is no MPS smoke call:
+    if spec.sink_mode == "first_frame":
+        # No sink-priming forward at construction (first_frame sink mode), so there is no MPS smoke call:
         # stay on CPU (as the egypt fixtures)
         if device_pref == "mps":
             raise RuntimeError(f"--device mps is unsupported for {spec.scene} without a kv_only sink: no sink-priming "
@@ -1118,7 +1117,7 @@ def realtime_main(args, spec: SceneSpec, out: Path) -> None:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Variants: prompt switch, no sink, free codec / step composition (realtime layout, 3 chunks), and captions.
+# Variants: prompt switch, free codec / step composition (realtime layout, 3 chunks), and captions.
 
 PROMPT_B = ("a racing game on a rainy city street at night, neon reflections on wet asphalt, realistic AAA game "
             "rendering")                 # third record (chunk 2) of tests/data/racing_captions.jsonl
@@ -1129,14 +1128,13 @@ CAPTION_FLOOR_VARIANTS = ("fp32", "fp64_acc")
 
 @dataclass(frozen=True)
 class VariantSpec:
-    """One model-path variant: scene, codec, steps / first steps, sink image or none, and the chunk before which the
+    """One model-path variant: scene, codec, steps / first steps, and the chunk before which the
     prompt switches to PROMPT_B (None: fixed prompt)."""
     name: str
     scene: str
     vae_backend: str
     steps: tuple
     first_steps: tuple
-    sink: bool
     switch_chunk: Optional[int]
     take: bool = False      # pixels from the scripted racing take (take_frames) instead of the synthetic pan
     capture: Optional[str] = None   # pixels (and racing captions) from a real online capture (capture_dir(capture))
@@ -1160,23 +1158,20 @@ class VariantSpec:
         return self.capture is not None and self.scene == "racing"
 
     def model_argv(self) -> list:
-        """matrix_game_mlx.scenes.model_args argv reproducing this variant (codec, steps, first steps, sink)."""
+        """matrix_game_mlx.scenes.model_args argv reproducing this variant (codec, steps, first steps)."""
         fmt = lambda steps: ",".join(str(s) for s in steps)  # noqa: E731
-        return (["--vae-backend", self.vae_backend, "--steps", fmt(self.steps), "--first-steps", fmt(self.first_steps)]
-                + ([] if self.sink else ["--no-sink-image"]))
+        return ["--vae-backend", self.vae_backend, "--steps", fmt(self.steps), "--first-steps", fmt(self.first_steps)]
 
 
 VARIANT_SPECS = {v.name: v for v in (
-    VariantSpec("racing_switch_realtime", "racing", "taehv", (1000,), (1000,), True, 2),
-    VariantSpec("racing_switch_quality", "racing", "wan", (1000, 500), (1000, 500), True, 2),
-    VariantSpec("castle_nosink_realtime", "castle", "taehv", (1000,), (1000,), False, None),
-    VariantSpec("racing_nosink_realtime", "racing", "taehv", (1000,), (1000,), False, None),
-    VariantSpec("castle_taehv_2step", "castle", "taehv", (1000, 500), (1000, 500), True, None),
-    VariantSpec("egypt_wan_custom_first", "ancient-egypt", "wan", (1000,), (1000, 750, 500, 250), True, None),
-    VariantSpec("racing_take_realtime", "racing", "taehv", (1000,), (1000,), True, None, take=True),
-    VariantSpec("racing_take_quality", "racing", "wan", (1000, 500), (1000, 500), True, None, take=True),
-    VariantSpec("racing_online_dynamic", "racing", "taehv", (1000,), (1000,), True, None, capture="racing-online"),
-    VariantSpec("castle_online_realtime", "castle", "taehv", (1000,), (1000,), True, None, capture="castle-online"),
+    VariantSpec("racing_switch_realtime", "racing", "taehv", (1000,), (1000,), 2),
+    VariantSpec("racing_switch_quality", "racing", "wan", (1000, 500), (1000, 500), 2),
+    VariantSpec("castle_taehv_2step", "castle", "taehv", (1000, 500), (1000, 500), None),
+    VariantSpec("egypt_wan_custom_first", "ancient-egypt", "wan", (1000,), (1000, 750, 500, 250), None),
+    VariantSpec("racing_take_realtime", "racing", "taehv", (1000,), (1000,), None, take=True),
+    VariantSpec("racing_take_quality", "racing", "wan", (1000, 500), (1000, 500), None, take=True),
+    VariantSpec("racing_online_dynamic", "racing", "taehv", (1000,), (1000,), None, capture="racing-online"),
+    VariantSpec("castle_online_realtime", "castle", "taehv", (1000,), (1000,), None, capture="castle-online"),
 )}
 ONLINE_PROMPT_INTERVAL = 1           # upstream serve --prompt-interval-chunks default
 
@@ -1196,13 +1191,13 @@ def captions_dir() -> Path:
 
 def variant_steps(v: VariantSpec, chunk: int) -> tuple:
     """Denoising timesteps of a chunk, as upstream CastleStream.push picks them: first_frame scenes use first_steps
-    on chunk 0 (no denoising when the sink latent is the chunk), kv_only scenes on cache positions < 2 (position =
-    chunk + 1 when a sink primes position 0)."""
+    on chunk 0 (no denoising: the sink latent is the chunk), kv_only scenes on cache positions < 2 (position =
+    chunk + 1: the sink always primes position 0, so only chunk 0)."""
     if v.scene_spec.sink_mode == "first_frame":
         if chunk == 0:
-            return () if v.sink else v.first_steps
+            return ()
         return v.steps
-    return v.first_steps if chunk + int(v.sink) < 2 else v.steps
+    return v.first_steps if chunk == 0 else v.steps
 
 
 def variant_n_renoise(v: VariantSpec, chunk: int) -> int:
@@ -1395,7 +1390,7 @@ def load_variant_inputs(v: VariantSpec, inputs) -> tuple:
     pixels = np.concatenate([inputs[f"pixels_{i}"] for i in range(n)])
     noises = [inputs[f"initial_noise_{i}"] for i in range(n)]
     renoises = [[inputs[f"renoise_{i}_{k}"] for k in range(variant_n_renoise(v, i))] for i in range(n)]
-    sink = inputs["sink_latent"] if v.sink else None
+    sink = inputs["sink_latent"]
     prompt_b = inputs["prompt_b_embeds"] if v.switch_chunk is not None else None
     if v.capture is not None:
         prompt_b = [inputs[f"chunk_prompt_embeds_{i}"] if f"chunk_prompt_embeds_{i}" in inputs.files else None
@@ -1405,8 +1400,8 @@ def load_variant_inputs(v: VariantSpec, inputs) -> tuple:
 
 def variant_reference(args, v: VariantSpec, out: Path, meta: dict, prompt, prompt_b, pixels, noises, renoises) -> None:
     """Upstream CastleStream of the variant (codec bf16, DiT as load_stream picks); writes inputs.npz (pan pixels,
-    initial noises, renoise_{i}_{k} draws, prompt_embeds, prompt_b_embeds for switch variants, torch sink_latent when
-    the variant has a sink) and chunks.npz (realtime layout)."""
+    initial noises, renoise_{i}_{k} draws, prompt_embeds, prompt_b_embeds for switch variants, torch sink_latent) and
+    chunks.npz (realtime layout)."""
     import torch
     torch.set_grad_enabled(False)
     from matrix_game.inference.stream import encode_sink_image
@@ -1417,15 +1412,13 @@ def variant_reference(args, v: VariantSpec, out: Path, meta: dict, prompt, promp
                                          capture_output=True, text=True).stdout.strip()
     with cpu_bf16_emulation(torch):
         codec, bridge = variant_codec(torch, v, args.device, pixels[:1], meta)
-        sink = None
-        if v.sink:
-            sink = encode_sink_image(codec, spec.sink_image, v.vae_backend,
-                                     first_frame=spec.sink_mode == "first_frame").float().cpu()
+        sink = encode_sink_image(codec, spec.sink_image, v.vae_backend,
+                                 first_frame=spec.sink_mode == "first_frame").float().cpu()
         log("loading torch DiT")
         stream, meta["device_dit"] = load_stream(torch, spec, args.device, bridge, prompt, sink, variant=v)
         log(f"DiT device: {meta['device_dit']}; codec {v.vae_backend} on "
             f"{meta.get('device_taehv') or meta.get('device_vae')}")
-        np.savez(out / "inputs.npz", **variant_inputs(prompt, prompt_b, None if sink is None else sink.numpy(), pixels,
+        np.savez(out / "inputs.npz", **variant_inputs(prompt, prompt_b, sink.numpy(), pixels,
                                                       noises, renoises))
         record, meta["chunk_seconds"] = {}, []
 
@@ -1476,7 +1469,7 @@ def variant_floor(out: Path) -> None:
 
     with cpu_bf16_emulation(torch, sdpa=False):
         stream, device_dit = load_stream(torch, spec, meta["device_dit"], bridge, inputs["prompt_embeds"],
-                                         None if sink is None else torch.from_numpy(sink), variant=v)
+                                         torch.from_numpy(sink), variant=v)
         if device_dit != meta["device_dit"]:
             raise RuntimeError(f"Floor DiT device {device_dit} != fixture DiT device {meta['device_dit']}")
         run_variant(torch, v, stream, pixels, noises, renoises, prompt_b, save)
@@ -1514,7 +1507,7 @@ def variant_main(args, v: VariantSpec) -> None:
     out.mkdir(parents=True, exist_ok=True)
     t_start = time.perf_counter()
     meta = dict(variant=v.name, scene=v.scene, vae_backend=v.vae_backend, steps=list(v.steps),
-                first_steps=list(v.first_steps), sink=v.sink, switch_chunk=v.switch_chunk, prompt_b=v.prompt_b,
+                first_steps=list(v.first_steps), switch_chunk=v.switch_chunk, prompt_b=v.prompt_b,
                 sink_mode=spec.sink_mode, sink_rope_mode=spec.sink_rope_mode, chunks=VARIANT_CHUNKS,
                 pan_step_px=PAN_STEP, noise_seed=VARIANT_NOISE_SEED, renoise_seed=VARIANT_RENOISE_SEED,
                 checkpoint=str(spec.checkpoint), upstream_commit=UPSTREAM_COMMIT,

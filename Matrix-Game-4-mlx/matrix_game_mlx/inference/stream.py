@@ -75,11 +75,12 @@ class CastleStream:
         self.vae_backend = vae_backend
         self.dtype = generator.model.patch_embedding.weight.dtype
         self.shape = LATENT_SHAPE
-        if sink_latent is not None and (tuple(sink_latent.shape) != self.shape
-                                       or not mx.issubdtype(sink_latent.dtype, mx.floating)
-                                       or not bool(mx.all(mx.isfinite(sink_latent)))):
+        if sink_latent is None:
+            raise ValueError("A sink latent is required; the generated first frame is not used as the sink")
+        if (tuple(sink_latent.shape) != self.shape or not mx.issubdtype(sink_latent.dtype, mx.floating)
+                or not bool(mx.all(mx.isfinite(sink_latent)))):
             raise ValueError("Sink must be one finite floating-point latent frame")
-        self.sink_offset = int(sink_latent is not None and sink_mode == "kv_only")
+        self.sink_offset = int(sink_mode == "kv_only")
         self.index = self.frame = 0
         self.failed = self.closed = False
         if max_latents < 1:

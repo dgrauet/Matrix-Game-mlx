@@ -17,6 +17,8 @@ def fake_pack(tmp_path, monkeypatch):
     cfg = {"scenes": {s: {"component": f"dit_{s}", "inference": f"{s}.json", "sink_image": f"{s}_sink.png"}
                       for s in scenes.SCENES}}
     (pack / "config.json").write_text(json.dumps(cfg))
+    for name in scenes.SCENES:
+        (pack / f"{name}_sink.png").write_bytes(b"")          # the pack ships the sink images
     monkeypatch.delenv(WEIGHTS_ENV, raising=False)
     monkeypatch.setattr("matrix_game_mlx.inference.loader.pack_dir", lambda components=None: pack)
     return pack
@@ -93,15 +95,65 @@ def test_prompt_override_and_sink_policy(fake_pack):
     assert model_args("castle", "quality", ["--prompt", "a b"]).prompt == "a b"
     assert model_args("castle", "quality").prompt == scenes.SCENES["castle"]["prompt"]
     a = model_args("racing", "quality")
-    assert (a.sink_mode, a.sink_rope_mode) == ("first_frame", "absolute")
+    assert (a.sink_mode, a.sink_rope_mode) == ("first_frame", "future")
     assert a.sink_image == fake_pack / "racing_sink.png"
     assert a.asset_root.parts[-2:] == ("resources", "racing")
     a = model_args("castle", "quality")
     assert (a.sink_mode, a.sink_rope_mode) == ("kv_only", "fixed")
     assert a.asset_root.parts[-2:] == ("resources", "game")
-    assert model_args("castle", "quality", ["--no-sink-image"]).sink_image is None
+
+
+@pytest.mark.parametrize("scene, argv, mode", [("racing", [], "future"),
+                                               ("racing", ["--sink-rope-mode", "absolute"], "absolute"),
+                                               ("castle", [], "fixed"),
+                                               ("castle", ["--sink-rope-mode", "future"], "future")])
+def test_sink_rope_mode_flag(scene, argv, mode):
+    assert model_args(scene, "quality", argv).sink_rope_mode == mode
+
+
+def test_unknown_sink_rope_mode_rejected():
     with pytest.raises(SystemExit):
-        model_args("castle", "quality", ["--sink-image", "a.png", "--no-sink-image"])
+        model_args("racing", "quality", ["--sink-rope-mode", "dual"])
+
+
+def test_no_sink_image_flag_is_gone():
+    with pytest.raises(SystemExit):
+        model_args("castle", "quality", ["--no-sink-image"])
+
+
+@pytest.mark.parametrize("preset", ["rtx5080", "rtx5080-sage", "rtx5070ti", "rtx5070ti-sage"])
+def test_new_rtx_presets_are_cuda_only(preset):
+    for argv in ([], ["--prompt-mode", "dynamic"]):
+        with pytest.raises(ValueError, match=f"--preset {preset} is CUDA-only"):
+            model_args("racing", preset, argv)
+
+
+@pytest.mark.parametrize("runtime", ["rtx5080", "rtx5070ti-sage"])
+def test_new_rtx_runtimes_are_cuda_only(runtime):
+    for argv in ([], ["--prompt-mode", "dynamic"]):
+        with pytest.raises(ValueError, match="is CUDA-only; the MLX port runs"):
+            model_args("racing", "quality", ["--dit-runtime", runtime, *argv])
+
+
+def test_missing_pack_sink_image_is_reported(tmp_path, monkeypatch, fake_pack):
+    pack = tmp_path / "local"
+    pack.mkdir()
+    (pack / "config.json").write_text((fake_pack / "config.json").read_text())
+    (fake_pack / "castle_sink.png").unlink()
+    for name in ("dit_castle.safetensors", "split_model.json"):
+        (pack / name).write_bytes(b"")
+    monkeypatch.setenv(WEIGHTS_ENV, str(pack))
+    with pytest.raises(FileNotFoundError, match="Missing resources:") as raised:
+        model_args("castle", "quality", require_model=True)
+    assert str(raised.value).splitlines()[1:] == [str(fake_pack / "castle_sink.png")]
+    (fake_pack / "castle_sink.png").write_bytes(b"")
+    assert model_args("castle", "quality", require_model=True).sink_image == fake_pack / "castle_sink.png"
+
+
+def test_missing_explicit_sink_image_is_reported(tmp_path):
+    with pytest.raises(FileNotFoundError, match="Missing resources:") as raised:
+        model_args("castle", "quality", ["--sink-image", str(tmp_path / "nope.png")], require_model=True)
+    assert str(raised.value).splitlines()[1:] == [str(tmp_path / "nope.png")]
 
 
 def test_missing_resources_only_with_local_pack(tmp_path, monkeypatch, fake_pack):

@@ -91,7 +91,7 @@ and checked with:
 
 ```bash
 matrix-game-mlx download --manifest releases/game-assets.json --repo-id Skywork/Matrix-Game-4.0 \
-  --repo-type model --revision 4419accdb7bb7881234c5914de8cd915266e0325 --scene ancient-egypt --resources resources
+  --repo-type model --revision 2c53100457da7abcf0e966f75637c644d3423a63 --scene ancient-egypt --resources resources
 matrix-game-mlx verify --manifest releases/game-assets.json --scene ancient-egypt --resources resources
 ```
 
@@ -123,7 +123,7 @@ with `matrix-game` renamed to `matrix-game-mlx` and `--resources` pointing at th
 
 ```bash
 matrix-game-mlx download --manifest releases/game-assets.json --repo-id Skywork/Matrix-Game-4.0 \
-  --repo-type model --revision 4419accdb7bb7881234c5914de8cd915266e0325 --scene racing \
+  --repo-type model --revision 2c53100457da7abcf0e966f75637c644d3423a63 --scene racing \
   --resources ../Matrix-Game-4/resources
 matrix-game-mlx verify --manifest releases/game-assets.json --scene racing \
   --resources ../Matrix-Game-4/resources
@@ -273,7 +273,7 @@ shooter build needs no asset flag; the racing build is described under "City rac
 ```bash
 for scene in castle ancient-egypt racing; do
   matrix-game-mlx download --manifest releases/game-assets.json --repo-id Skywork/Matrix-Game-4.0 --repo-type model \
-    --revision 4419accdb7bb7881234c5914de8cd915266e0325 --scene $scene --resources ../Matrix-Game-4/resources
+    --revision 2c53100457da7abcf0e966f75637c644d3423a63 --scene $scene --resources ../Matrix-Game-4/resources
 done
 cd ../Matrix-Game-4 && bash scripts/build_game.sh && bash scripts/build_racing.sh -DRACING_ASSET_ROOT="$PWD/resources/racing"; cd -
 ```

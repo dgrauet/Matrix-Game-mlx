@@ -29,5 +29,5 @@ def test_frames_to_tensor_and_back():
 
 def test_scenes():
     assert set(SCENES) == {"castle", "ancient-egypt", "racing"}
-    assert scene_sink_policy("racing") == ("first_frame", "absolute")
+    assert scene_sink_policy("racing") == ("first_frame", "future")
     assert scene_sink_policy("ancient-egypt") == ("kv_only", "fixed")

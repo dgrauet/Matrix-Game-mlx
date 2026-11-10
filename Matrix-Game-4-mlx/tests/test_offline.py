@@ -16,6 +16,8 @@ def fake_pack(request, tmp_path_factory, monkeypatch):
     cfg = {"scenes": {s: {"component": f"dit_{s}", "inference": f"{s}.json", "sink_image": f"{s}_sink.png"}
                       for s in scenes.SCENES}}
     (pack / "config.json").write_text(json.dumps(cfg))
+    for name in scenes.SCENES:
+        (pack / f"{name}_sink.png").write_bytes(b"")          # the pack ships the sink images
     monkeypatch.delenv("MATRIX_GAME_4_MLX_WEIGHTS_DIR", raising=False)
     monkeypatch.setattr("matrix_game_mlx.inference.loader.pack_dir", lambda components=None: pack)
     return pack
