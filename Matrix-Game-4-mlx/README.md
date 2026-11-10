@@ -653,8 +653,8 @@ The fast path may differ from `native` only by floating-point summation order, n
 
 - GPU RoPE, fused kernels, the compiled graph, the memo, `--vae-graph` and `--t5-runtime graph` are each **bitwise**
   their eager / native counterpart (tests in `tests/test_rope_kernel.py`, `test_kernels.py`, `test_runtime.py`,
-  `test_taehv.py`, `test_caption_encoder.py`; on real castle weights, one steady fixed-sink position (denoise +
-  cache update) on `ring-fused` and `apple`, the compiled DiT graph equals the eager one bit for bit, prediction and
+  `test_taehv.py`, `test_caption_encoder.py`; on real weights, one steady position (denoise +
+  cache update; castle `fixed` and racing `future`) on `ring-fused` and `apple`, the compiled DiT graph equals the eager one bit for bit, prediction and
   every K/V).
 - The one numeric difference is the ring's attention key order, which changes SDPA's summation order. Among the
   parity tests it shows only in the `--long` chunk-22 per-call tests, past the window, where ring slots are permuted:
@@ -690,7 +690,7 @@ The fast path may differ from `native` only by floating-point summation order, n
 sink image, stream seed 0, 48 chunks) once per runtime, one process each, then compares chunk by chunk (pred rel L2
 of `ring-fused` against `native`, decoded-frame PSNR with peak-to-peak 2, as the parity tests). Every chunk before
 the first ring eviction (stream position 21: castle chunk 20, its sink being position 0; racing chunk 21) is bitwise
-equal (racing runs the `future` sink, which acts from the same position). From there on each runtime conditions on its own outputs, so the per-call summation-order difference grows:
+equal (racing runs the `future` sink, which acts from the next position, 22). From there on each runtime conditions on its own outputs, so the per-call summation-order difference grows:
 
 | Scene | Chunks | pred rel L2, median / max | decoded PSNR, median / min |
 | --- | --- | --- | --- |
@@ -808,7 +808,7 @@ max |x| peaks at 790 (castle's sink pass at stream creation; 728 in a chunk) aga
 The fp16 linear outputs that enter a fused kernel (q / k projections, self- and cross-attention outputs, FFN
 hidden pre-activation and FFN output) peak at 208 (castle's FFN output; FFN hidden 57) against a limit of
 65504 / 4, also fixed before the run: fp16 overflow is about 300x away.
-The compiled fp16 graph is bitwise its eager run on real castle weights (one steady fixed-sink position, denoise
+The compiled fp16 graph is bitwise its eager run on real weights (one steady position, castle `fixed` and racing `future`, denoise
 and cache update: prediction and every K/V; `tests/test_runtime.py`).
 
 Free running (`tests/compare_runtimes.py`, as under "Free-running streams past the window": 48 chunks, the parity pan,
@@ -843,8 +843,9 @@ one-level input change on `native` (and of `ring-fused`) within 4 chunks and sta
 differences more slowly, ends far above both: over chunks 21 to 47 its pred rel L2 median is 0.45 (`apple`) and
 0.52 (`apple-fast`) against 0.097 for the perturbation. `apple-fast` is bitwise `apple` until its window acts (castle
 chunk 10, racing chunk 11, both stream position 11) and diverges from it afterwards (racing: chunk 10 is 0.278 against
-`native` for both runtimes, chunk 11 is 0.301 for `apple` and 0.298 for `apple-fast`; chunks 21 to 47 pred rel L2 against
-`native` median / max, castle 0.62 / 0.80, racing 0.52 / 0.64 against `apple`'s 0.45 / 0.52). The racing
+`native` for both runtimes, chunk 11 is 0.301 for `apple` and 0.298 for `apple-fast`; chunks 21 to 47 pred rel L2 of `apple-fast` against
+`apple` median / max, castle 0.59 / 0.80, racing 0.51 / 0.63; for reference, against `native` racing `apple-fast` is 0.52 / 0.64
+and `apple` 0.45 / 0.52). The racing
 `apple-fast` window acts under the `future` sink: from position 12 on it re-rotates the sink to position + 11 (see
 Known deviations). These are distances between
 trajectories, not quality scores: the same pan through the same model takes another path, and the comparison does
@@ -984,7 +985,7 @@ so the gap is the DiT's alone, which is preset-independent and gated per call an
   function is keyed on the model, shapes, sink mode and write spans (not buffer addresses), takes every KV / text
   cache tensor as an input and returns the updated K/V, and reads the block weights as implicit inputs. Compilation
   keeps the traced arithmetic (the fused kernels and SDPA are opaque to it): a 60-chunk rollout is bitwise compiled
-  vs eager (`tests/test_runtime.py`), and on real castle weights one steady fixed-sink position (denoise + cache
+  vs eager (`tests/test_runtime.py`), and on real weights one steady position (castle `fixed`, racing `future`; denoise + cache
   update) gives bitwise equal predictions and K/V (compiled vs eager, `ring-fused` and `apple`). `mx.compile` on MLX 0.31.1 is not bitwise for every op
   (a division by a non-power-of-two constant, `mean()`; see `--t5-runtime graph` below), so the DiT graph's
   equality is a measured result, not assumed. `CastleStream` calls `prime` before gameplay and `clear` on `close()`, as
@@ -1033,7 +1034,7 @@ so the gap is the DiT's alone, which is preset-independent and gated per call an
 - `apple-fast` attends over **11 latents** instead of upstream's 21: the sink, the current latent and the 9 latents
   before it (the 21 window: 19; each realtime latent is 4 video frames), and the KV caches are sized for 11. So from
   stream position 11 on it sees less history than `apple`. It is bitwise `apple` until then and diverges from it
-  afterwards (chunks 21 to 47 pred rel L2 against `native`, median: castle 0.62, racing 0.52). The window is a
+  afterwards (chunks 21 to 47 pred rel L2 against `apple`, median: castle 0.59, racing 0.51). The window is a
   fixed property of the runtime; there is no window flag (upstream has none). On racing it also changes where the
   `future` sink acts: `apple-fast` applies `FUTURE_SINK_OFFSET = 11` once its own 11-latent window is full (stream
   position above 11, `rotated_sink_position(mode, position, window)` handed the runtime's window), where upstream's
