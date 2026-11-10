@@ -204,6 +204,17 @@ def test_call_tol_rule_reproduces_m1_egypt_table():
     assert derived == M1_EGYPT_CALL_TOL
 
 
+def test_racing_records_the_long_chunk_22_call_fixture():
+    """Racing's only quality gate at chunk 22 (the first rotated sink position) is calls_long22, which exists only
+    when the fixtures were generated with --long. _call_cases is built from meta.json, so without this pin a racing
+    set regenerated without --long would drop that gate with no skip and no failure."""
+    if _meta("racing") is None:
+        pytest.skip(f"{_dir('racing')} missing or incomplete: generate it with "
+                    "python -m tests.parity.gen_fixtures --scene racing --long")
+    assert "calls_long22" in _meta("racing")["call_floors"]["calls"], (
+        "racing fixtures lack calls_long22: regenerate with python -m tests.parity.gen_fixtures --scene racing --long")
+
+
 @needs_weights
 @pytest.mark.parametrize("scene", SCENES)
 def test_sink_encoding_production_path(scene, comps):

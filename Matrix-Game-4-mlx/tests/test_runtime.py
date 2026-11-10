@@ -798,7 +798,8 @@ def test_future_sink_keeps_cached_keys_before_the_window_is_full(weights, monkey
 
 @pytest.mark.parametrize("runtime", ["native", "ring-fused", "apple", "apple-fast"])
 def test_future_sink_exhausted_rope_table_raises(weights, runtime):
-    """A table of R rows: position R - 5 fits (position + 1 <= R) but the sink at position + 11 does not."""
+    """A table of R rows: position R - 5 fits (position + 1 <= R) but the sink at position + 11 does not; position R - 12
+    (sink on the last row) still runs."""
     rows = 100
     window = RUNTIME_SPECS[runtime].window if runtime == "apple-fast" else 21
     model = _model(_runtime_weights(weights, runtime) if runtime != "native" else weights,
@@ -815,6 +816,12 @@ def test_future_sink_exhausted_rope_table_raises(weights, runtime):
     with pytest.raises(ValueError, match="RoPE table has"):
         _call(model, _inputs(rng, 1)[0], 937.5, rng.standard_normal((1, 8, 32)).astype(np.float32), kv, xc, position,
               "future")
+    # Boundary: position R - 12 puts the sink on the last row of the table (R - 1): it must run, not raise.
+    position = rows - 12
+    kv, xc = _filled_caches(position, window, dtype)
+    out = _call(model, _inputs(rng, 1)[0], 937.5, rng.standard_normal((1, 8, 32)).astype(np.float32), kv, xc, position,
+                "future")
+    assert bool(mx.all(mx.isfinite(out[0])))
 
 
 def test_graph_compiled_under_fixed_replays_bitwise_under_future(weights):

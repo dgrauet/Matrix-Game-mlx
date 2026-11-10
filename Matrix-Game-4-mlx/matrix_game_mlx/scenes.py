@@ -82,7 +82,6 @@ def resolve_model_arguments(args, require_model=True):
     _reject_unsupported(args)
     if require_model and local and not (Path(local) / "config.json").is_file():
         raise FileNotFoundError("Missing resources:\n" + str(Path(local) / "config.json"))
-    explicit_sink = args.sink_image
     configure_scene(args)
     if args.prompt_mode == "dynamic" and args.scene != "racing":
         raise ValueError("Dynamic captions are currently supported for racing only")
@@ -101,8 +100,6 @@ def resolve_model_arguments(args, require_model=True):
         raise ValueError("VAE graph requires TAEHV")
     if require_model:
         files = []
-        if explicit_sink is not None:
-            files.append(explicit_sink)  # an explicit --sink-image is always checked
         if local:
             pack = Path(local)
             component = json.loads((pack / "config.json").read_text())["scenes"][args.scene]["component"]

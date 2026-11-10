@@ -156,8 +156,16 @@ def test_missing_explicit_sink_image_is_reported(tmp_path):
     assert str(raised.value).splitlines()[1:] == [str(tmp_path / "nope.png")]
 
 
+def test_hub_mode_still_checks_the_sink_image(fake_pack):
+    """No local model dir (Hub): the unconditional sink check still reports a missing pack sink image."""
+    (fake_pack / "castle_sink.png").unlink()
+    with pytest.raises(FileNotFoundError, match="Missing resources:") as raised:
+        model_args("castle", "quality", require_model=True)
+    assert str(raised.value).splitlines()[1:] == [str(fake_pack / "castle_sink.png")]
+
+
 def test_missing_resources_only_with_local_pack(tmp_path, monkeypatch, fake_pack):
-    model_args("castle", "quality", require_model=True)  # Hub-style pack: nothing checked locally
+    model_args("castle", "quality", require_model=True)  # Hub-style pack: no model files checked locally (the sink image is: see the next test)
     empty = tmp_path / "empty"
     empty.mkdir()
     monkeypatch.setenv(WEIGHTS_ENV, str(empty))

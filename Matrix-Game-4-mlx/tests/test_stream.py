@@ -185,6 +185,20 @@ class _FakeRuntime:
         self.events.append(("clear",))
 
 
+def test_first_frame_is_displayed_without_denoising_and_forwards_sink_rope_mode():
+    """Upstream tests/test_racing.py: a first_frame chunk 0 shows the sink latent, runs no denoising, makes exactly
+    one clean generator call at t=0, and forwards sink_rope_mode to the generator."""
+    gen = _FakeGenerator()
+    stream = _taehv_stream(gen, sink_mode="first_frame", sink_rope_mode="future")
+    assert gen.calls == []
+    chunk = _run_pushes(stream, (1,))[0]
+    assert chunk.denoising_steps == 0
+    assert len(gen.calls) == 1
+    assert float(gen.calls[0]["timestep"][0, 0]) == 0
+    assert gen.calls[0]["sink_rope_mode"] == "future"
+    stream.close()
+
+
 def test_stream_primes_runtime_and_clears_it_on_close():
     gen = _FakeGenerator()
     gen.model.castle_runtime = runtime = _FakeRuntime()

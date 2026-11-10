@@ -159,8 +159,8 @@ def run_blocks(plans, x, e, rotations, sink_rotations, fused=False):
     """Run the DiT blocks over planned caches (upstream `run_blocks`).
 
     Unfused: exactly the native `CausalWanAttentionBlock` arithmetic, with RoPE from the GPU kernel and attention
-    over the cache in ring order (`cache[:, :end]`, or the re-roped sink + `cache[:, tokens:end]` in fixed-sink
-    steady state). Fused (upstream's structure): the LayerNorm + modulation, gate + residual (+ affine LayerNorm)
+    over the cache in ring order (`cache[:, :end]`, or the re-roped sink + `cache[:, tokens:end]` in sink
+    steady state, `fixed` or `future`). Fused (upstream's structure): the LayerNorm + modulation, gate + residual (+ affine LayerNorm)
     chains, the q / k RMSNorms and the FFN activation run as single kernels (`kernels.py`) with the native rounding;
     cross-attention is inlined as upstream does (same projections, norms and attention call as the native module).
     """

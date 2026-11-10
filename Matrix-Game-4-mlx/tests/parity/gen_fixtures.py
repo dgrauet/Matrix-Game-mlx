@@ -73,7 +73,7 @@ LATENT_SHAPE = (1, 1, 48, 30, 54)
 STEPS = (1000, 500)
 PAN_STEP = 8
 LONG_CHUNKS = 25
-LONG_CALL_CHUNK = 22    # position 23 > 21-frame window: rolling eviction (and fixed-sink re-RoPE for kv_only/fixed) run
+LONG_CALL_CHUNK = 22    # cache position 22 (racing, first_frame) or 23 (castle, kv_only: sink at position 0) > 21-frame window: rolling eviction and sink re-RoPE run
 KV_LAYERS = (0, 29)
 
 
@@ -1446,11 +1446,10 @@ def run_variant(torch, v: VariantSpec, stream, pixels, noises, renoises, prompt_
 
 
 def variant_inputs(prompt, prompt_b, sink, pixels, noises, renoises) -> dict:
-    """inputs.npz content of a variant (inverse of load_variant_inputs); prompt_b / sink None when absent; a capture
+    """inputs.npz content of a variant (inverse of load_variant_inputs); prompt_b None when absent; a capture
     variant's prompt_b is its per-chunk list (chunk_prompt_embeds_{i} where the prompt switches)."""
     inputs = dict(prompt_embeds=prompt)
-    if sink is not None:
-        inputs["sink_latent"] = sink
+    inputs["sink_latent"] = sink
     if isinstance(prompt_b, list):
         inputs.update({f"chunk_prompt_embeds_{i}": e for i, e in enumerate(prompt_b) if e is not None})
     elif prompt_b is not None:
@@ -1462,7 +1461,7 @@ def variant_inputs(prompt, prompt_b, sink, pixels, noises, renoises) -> dict:
 
 
 def load_variant_inputs(v: VariantSpec, inputs) -> tuple:
-    """(pixels [9, 3, H, W], initial noises, renoise lists, sink or None, prompt_b or None) from inputs.npz; for a
+    """(pixels [9, 3, H, W], initial noises, renoise lists, sink, prompt_b or None) from inputs.npz; for a
     capture variant the last item is the per-chunk list of set_prompt embeddings (None: unchanged)."""
     n = VARIANT_CHUNKS
     pixels = np.concatenate([inputs[f"pixels_{i}"] for i in range(n)])
