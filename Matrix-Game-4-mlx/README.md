@@ -10,7 +10,7 @@ ancient-egypt, castle and racing scenes.
 | Milestone | Scope | Status |
 | --- | --- | --- |
 | M1 | ancient-egypt, quality preset (Wan VAE, steps `1000,500`), offline CLI, real-weight parity | Done: parity-validated; a 19 s recorded take (909 frames, 48 FPS) rendered in 1 h 52 min (29.4 s/chunk, peak 24.4 GB) |
-| M2 | castle and racing (first-frame sink, absolute RoPE, racing RNG role), fixtures for both | Done: parity-validated, same methodology as ancient-egypt (racing RNG role transcribed from upstream, not parity-validated: parity injects noise on both sides); acceptance renders: 97-frame pan renders of castle (37.7 s/chunk) and racing (27.3 s/chunk), peak 24.4 GB |
+| M2 | castle and racing (first-frame sink, racing RNG role; racing's sink RoPE was `absolute` then, `future` since the sync to upstream `51913b2`), fixtures for both | Done: parity-validated, same methodology as ancient-egypt (racing RNG role transcribed from upstream, not parity-validated: parity injects noise on both sides); acceptance renders: 97-frame pan renders of castle (37.7 s/chunk) and racing (27.3 s/chunk), peak 24.4 GB |
 | M3 | realtime preset: TAEHV encode/decode (`taehv.py`), one-step schedule, upstream `native` DiT runtime | Done: parity-validated on the three scenes (`<scene>_realtime` fixtures, torch bf16 CPU reference); acceptance renders: 97-frame pans of egypt (3.57 s/chunk), castle (3.58 s/chunk) and racing (3.51 s/chunk), peak 14.96 GB (~1.1 processed frames/s, M2 Pro 32 GB) |
 | Apple fast path | `--dit-runtime ring-fused` on MLX (GPU RoPE, ring KV, fused kernels, compiled steady graph), `--vae-graph`, `--t5-runtime graph` | Done: every parity slice passes on both runtimes with thresholds unchanged; castle realtime `serve` 0.95 -> 1.13 `online_fps` (see "Apple fast path") |
 | Apple presets | Port-only `--preset apple` (float16 DiT) and `--preset apple-fast` (float16, 11-latent attention window) for `render` and `serve` | Done: a priori fixture gates pass on the three scenes (not upstream-exact); castle `serve` `online_fps` 1.13 (realtime, `ring-fused`) -> 1.25 (`apple`) and 1.43 (`apple-fast`) (see "Apple presets") |
@@ -50,18 +50,19 @@ The offline default preset is `quality`, as upstream's offline renderer. Weights
 | --- | --- |
 | `--scene {ancient-egypt,castle,racing}` | Supported |
 | `--preset {realtime,quality,baseline}` | Supported (default `quality`) |
-| `--preset {rtx5090,rtx5090-sage}` | Rejected: CUDA-only presets |
+| `--preset {rtx5090,rtx5090-sage,rtx5080,rtx5080-sage,rtx5070ti,rtx5070ti-sage}` | Rejected: CUDA-only presets |
 | `--preset {apple,apple-fast}` | Port-only speed presets: the realtime base (TAEHV, steps `1000`, `--vae-graph` on) with `--dit-runtime` defaulting to the preset's name, as upstream resolves `rtx5090`. They leave upstream exactness (float16 DiT; `apple-fast` also an 11-latent attention window); see "Apple presets" |
 | `--vae-backend {wan,taehv}` | Supported (default from the preset: `taehv` for realtime, `wan` otherwise) |
 | `--dit-runtime {native,ring-fused}` | Supported on every preset; default from the preset as upstream (`ring-fused` for realtime, the preset's name for `apple` / `apple-fast`, `native` otherwise). `ring-fused` is the Apple fast path (ring KV cache, GPU RoPE kernel, fused block-glue kernels); see Known deviations |
 | `--dit-runtime {apple,apple-fast}` | Port-only: `ring-fused` with the DiT in float16 (`apple-fast`: self-attention window of 11 latents instead of 21, sink and current latent included). Accepted on every preset, as upstream accepts `--dit-runtime rtx5090`; the default only under `--preset apple` / `apple-fast`. See "Apple presets" and Known deviations |
-| `--dit-runtime` other values (`kernels`, `cudagraph`, `ring`, `ring-graph`, `rtx5090`, `rtx5090-sage`) | Rejected: CUDA-only; the MLX port runs `native`, `ring-fused`, `apple` or `apple-fast` |
+| `--dit-runtime` other values (`kernels`, `cudagraph`, `ring`, `ring-graph`, `rtx5090`, `rtx5090-sage`, `rtx5080`, `rtx5080-sage`, `rtx5070ti`, `rtx5070ti-sage`) | Rejected: CUDA-only; the MLX port runs `native`, `ring-fused`, `apple` or `apple-fast` |
 | `--steps`, `--first-steps` | Supported (comma-separated timesteps, strictly decreasing from 1000) |
 | `--vae-graph`, `--no-vae-graph` | Supported; default on for realtime + TAEHV, as upstream (`VAE graph requires TAEHV` otherwise). The streaming TAEHV encoder/decoder run as `mx.compile`d graphs instead of CUDA graphs, bitwise eager (see Known deviations) |
 | `--prompt-mode {fixed,dynamic}`, `--prompt`, `--prompt-interval-chunks` | Supported; dynamic is racing only (see below) |
 | `--captions FILE` | Supported, dynamic mode only (required there) |
 | `--t5-runtime {native,graph}` | Supported (default `graph`, as upstream); `graph` runs the dynamic-caption encoder as one `mx.compile`d graph instead of a CUDA graph, bitwise `native` (see Known deviations) |
-| `--sink-image PATH`, `--no-sink-image` | Supported (mutually exclusive) |
+| `--sink-image PATH` | Supported. The sink image is mandatory, as upstream: `--no-sink-image` is gone |
+| `--sink-rope-mode {absolute,fixed,future}` | Supported, as upstream. Default from the scene: `future` for racing, `fixed` for castle and ancient-egypt; the flag overrides it on every scene (racing with `absolute` is the old behaviour). See "Scenes" |
 | `--resources DIR` | Accepted; `render` does not read weights or the sink image from it (those come from the MLX pack). It sets the game-asset root and is the default `download --resources` target |
 | `--asset-root DIR` | Accepted: overrides the game-asset root derived from `--resources`; `render` does not read it |
 | `--input CLIP` / `--take DIR`, `--output DIR`, `--seed N` | Supported |
@@ -341,9 +342,9 @@ the browser (1.1 GB). `ps` RSS undercounts MLX by 5 to 14 GB, so it is not used.
 | castle `--preset apple-fast`, no browser | `apple-fast` | 4 | 2.78 s | 1.46 | 1.43 | 15.2 GB | 0 |
 | racing realtime, fixed caption | `native` | 24 | 3.77 s | 1.09 | 1.01 | 16.5 GB | 0 |
 | racing realtime, fixed caption | `native` | 4 | 3.75 s | 1.09 | 1.01 | 16.6 GB | 0 |
-| **racing realtime, fixed caption, no browser** | **`ring-fused`** | 4 | **3.35 s** | **1.24** | **1.15** | 16.6 GB | 0 |
-| racing `--preset apple`, fixed caption, no browser | `apple` | 4 | 2.98 s | 1.38 | 1.28 | 16.6 GB | 0 |
-| racing `--preset apple-fast`, fixed caption, no browser | `apple-fast` | 4 | 2.72 s | 1.49 | 1.46 | 14.6 GB | 0 |
+| **racing realtime, fixed caption, no browser** | **`ring-fused`** | 4 | **3.26 s** | **1.25** | **1.13** | 16.6 GB | 0 |
+| racing `--preset apple`, fixed caption, no browser | `apple` | 4 | 2.76 s | 1.46 | 1.33 | 16.6 GB | 0 |
+| racing `--preset apple-fast`, fixed caption, no browser | `apple-fast` | 4 | 2.61 s | 1.56 | 1.52 | 15.5 GB | 0 |
 | racing realtime, dynamic captions, no browser | `native` | 24 | 4.0 s, then 31 to 35 s | 0.34 | 0.14 | 25.5 GB | +3.8 GB |
 | racing realtime, dynamic captions, browser | `native` | 24 | 5.4 s, then 14 to 34 s | 0.55 (21 chunks) | n/a | 25.5 GB | +3.1 GB |
 | racing realtime, dynamic captions, no browser | `ring-fused` | 4 | 17.6 s median, max 54.7 s | 0.19 | 0.10 | 25.5 GB | +3.8 GB |
@@ -352,13 +353,17 @@ the browser (1.1 GB). `ps` RSS undercounts MLX by 5 to 14 GB, so it is not used.
 
 `ring-fused` has been the realtime default since the Apple fast path (see "Apple fast path"). The `apple` and
 `apple-fast` rows are the port-only presets (float16 DiT, `apple-fast` with an 11-latent window; see "Apple presets"),
-single sessions on macOS 27.2, same machine and MLX; their chunk max is 3.33 s / 2.82 s (castle) and 3.24 s /
-2.76 s (racing), and their first encoded frame came after 8.5 s / 7.2 s (castle) and 6.5 s / 5.6 s (racing).
+single sessions on macOS 27.2, same machine and MLX; their chunk max is 3.33 s / 2.82 s (castle) and 3.05 s /
+2.80 s (racing), and their first encoded frame came after 8.5 s / 7.2 s (castle) and 6.1 s / 5.6 s (racing).
 `apple-fast`'s KV window fills 10 chunks earlier than the 21-latent one (castle: steady from chunk 11 instead of
-21), so its chunk max stays within 1.5 % of its median. The `native` rows were
-measured before it; `--dit-runtime native` still selects that path. The `ring-fused` rows are single sessions on
+21), so its castle chunk max stays within 1.5 % of its median. The racing `ring-fused`, `apple` and `apple-fast`
+rows were measured again for the `future` sink (racing's default since the sync to upstream `51913b2`, which
+re-rotates the sink's keys on every call once the stream position passes the window: 21, or 11 for `apple-fast`) and
+replace the earlier rows, taken with the `absolute` sink. The two racing `native` fixed-caption rows and the
+dynamic-caption rows were not repeated: they were measured with the `absolute` sink. The `native` rows were
+measured before the Apple fast path; `--dit-runtime native` still selects that path. The `ring-fused` rows are single sessions on
 macOS 27.2 (same machine and MLX). Over the chunks with a full KV window (chunk 21 on), the `ring-fused` chunk median
-is 3.53 s (castle), 3.63 s (castle with browser) and 3.48 s (racing). The quality `ring-fused` row was measured
+is 3.53 s (castle) and 3.63 s (castle with browser); racing's last four chunks (window full) average 3.53 s. The quality `ring-fused` row was measured
 alone; its swap is the system-wide growth of `vm.swapusage` (4.65 GB was already in use before the run; an earlier
 run gave 27.3 s and +2.6 GB with 4.46 GB in use) and its footprint equals `native`'s. The dynamic-captions
 `ring-fused` row (new defaults: `--t5-runtime graph`, `--vae-graph`; a new caption every chunk,
@@ -368,7 +373,7 @@ it does not compare with this column.
 
 Time to the first encoded frame, `native`: realtime 3.6 to 7.8 s (10.5 s for the castle no-browser row, 13.5 s with
 dynamic captions), quality 12.4 s (13.3 s in the end-to-end test). `ring-fused`: castle realtime 8.2 s, racing
-realtime 6.6 s (21.6 s with dynamic captions), castle quality 16.4 s (16.6 s in an earlier run), including the compiled graphs' warm-up at stream creation; all well inside
+realtime 6.7 s (21.6 s with dynamic captions), castle quality 16.4 s (16.6 s in an earlier run), including the compiled graphs' warm-up at stream creation; all well inside
 `serve`'s deadline (45 s realtime, 300 s quality). With `native`, realtime chunk medians are about 3.3 s over a
 14-chunk session and 3.8 s over 32 (the KV window fills at chunk 19).
 The `--fps` flag does not change the generation rate: the model sets the pace and the game waits for it, so
@@ -658,10 +663,16 @@ The fast path may differ from `native` only by floating-point summation order, n
 | --- | --- | --- | --- |
 | ancient-egypt chunk 22, call 0 | 0.0381 | 0.0308 | 0.07 |
 | ancient-egypt chunk 22, call 1 | 0.0202 | 0.0200 | 0.04 |
-| racing chunk 22, call 0 | 0.0129 | 0.0119 | 0.02 |
-| racing chunk 22, call 1 | 0.0102 | 0.0108 | 0.02 |
+| racing chunk 22, call 0 | 0.0124 | 0.0116 | 0.02 |
+| racing chunk 22, call 1 | 0.0104 | 0.00982 | 0.02 |
+| racing realtime chunk 22, call 0 | 0.0124 | 0.0145 | 0.03 |
 
-  Every other printed metric is identical on both runtimes: per-call pred and layer 0/29 KV of chunks 0 to 2 on the
+  Racing runs the `future` sink, so its chunk-22 calls re-rotate the sink to position + 11; the racing rows are the
+  values under `future` (quality: `racing_quality --long`; realtime: the `--long` reference of `racing_realtime`, one
+  denoising call, whose second call is the clean pass at t=0 and has pred exactly 0 on both runtimes, tolerance 0).
+  The tolerances are the unchanged `call_tol` rule on the regenerated floors. Quality: call 0 pred 0.02, layer 0 3e-4,
+  layer 29 0.05 (0.04 under the `absolute` reference); call 1 pred 0.02, 3e-4, 0.04; call 2 (t=0) pred 0, 5e-4, 0.03.
+  Realtime (new `--long` reference): call 0 pred 0.03, 3e-4, 0.06; call 1 (t=0) pred 0, 5e-4, 0.03. Every other printed metric is identical on both runtimes: per-call pred and layer 0/29 KV of chunks 0 to 2 on the
   three scenes, the 90 block errors (max 0.55 to 0.56 of the gate on both), the end-to-end quality stream (chunk 0
   pred 1.71e-2 / 1.41e-2 / 0, decoded 44.9 / 43.7 / 56.4 dB), and the realtime and variant chunk metrics. These are
   all **pre-window** fixtures (chunks 0 to 2, before the first ring eviction, where ring and linear slot orders
@@ -679,7 +690,7 @@ The fast path may differ from `native` only by floating-point summation order, n
 sink image, stream seed 0, 48 chunks) once per runtime, one process each, then compares chunk by chunk (pred rel L2
 of `ring-fused` against `native`, decoded-frame PSNR with peak-to-peak 2, as the parity tests). Every chunk before
 the first ring eviction (stream position 21: castle chunk 20, its sink being position 0; racing chunk 21) is bitwise
-equal. From there on each runtime conditions on its own outputs, so the per-call summation-order difference grows:
+equal (racing runs the `future` sink, which acts from the same position). From there on each runtime conditions on its own outputs, so the per-call summation-order difference grows:
 
 | Scene | Chunks | pred rel L2, median / max | decoded PSNR, median / min |
 | --- | --- | --- | --- |
@@ -689,16 +700,17 @@ equal. From there on each runtime conditions on its own outputs, so the per-call
 | castle | 30 to 39 | 0.47 / 0.54 | 19.0 / 17.0 dB |
 | castle | 40 to 47 | 0.58 / 0.62 | 18.1 / 16.1 dB |
 | racing | 0 to 20 | 0 (bitwise) | identical |
-| racing | 21 to 29 | 0.047 / 0.085 | 39.8 / 34.5 dB |
-| racing | 30 to 39 | 0.065 / 0.092 | 37.0 / 33.9 dB |
-| racing | 40 to 47 | 0.096 / 0.14 | 34.0 / 31.1 dB |
+| racing | 21 (first eviction) | 0.0115 | 50.3 dB |
+| racing | 21 to 29 | 0.060 / 0.10 | 37.0 / 32.7 dB |
+| racing | 30 to 39 | 0.062 / 0.12 | 37.2 / 33.5 dB |
+| racing | 40 to 47 | 0.10 / 0.15 | 33.7 / 30.6 dB |
 
 Over chunks 21 to 47: castle 0.47 / 0.62 (median / max pred rel L2), 19.4 / 16.1 dB (median / min PSNR); racing
-0.072 / 0.14, 36.1 / 31.1 dB. These numbers are the measured cost of the ring's key order in a free-running stream, reported, not
+0.081 / 0.15, 35.2 / 30.6 dB (the racing rows are measured under the `future` sink, per-chunk values in the same tool's output). These numbers are the measured cost of the ring's key order in a free-running stream, reported, not
 gated. For scale, the same tool measures how far each stream carries a small input change on one runtime: `native`
 against `native` with one input frame raised by one 8-bit level at the first eviction chunk (`--perturb-frame 77`
-castle, `81` racing) gives, over chunks 21 to 47, castle 0.46 / 0.59 and 19.7 / 17.0 dB, racing 0.070 / 0.20 and
-36.4 / 29.0 dB: the same size as the runtime difference. The divergence is the free-running stream's own
+castle, `81` racing) gives, over chunks 21 to 47, castle 0.46 / 0.59 and 19.7 / 17.0 dB, racing 0.097 / 0.15 and
+33.7 / 29.1 dB: the same size as the runtime difference. The divergence is the free-running stream's own
 sensitivity (castle amplifies small differences much faster than racing, as in the quality preset, where torch
 against its own kernel variant already reaches 0.478 pred rel L2 at castle chunk 1), not a defect specific to the
 ring. To reproduce (each run loads the real DiT: one at a time):
@@ -758,7 +770,11 @@ chunks average 2662 ms against 3606 ms for `ring-fused` (−26 %). In `serve` (c
 | Scene | `ring-fused` | `apple` | `apple-fast` |
 | --- | --- | --- | --- |
 | castle: chunk median, `model_fps`, `online_fps`, footprint | 3.29 s, 1.24, 1.13, 16.2 GB | 2.98 s, 1.36, 1.25, 16.2 GB | 2.78 s, 1.46, 1.43, 15.2 GB |
-| racing (fixed caption) | 3.35 s, 1.24, 1.15, 16.6 GB | 2.98 s, 1.38, 1.28, 16.6 GB | 2.72 s, 1.49, 1.46, 14.6 GB |
+| racing (fixed caption, `future` sink) | 3.26 s, 1.25, 1.13, 16.6 GB | 2.76 s, 1.46, 1.33, 16.6 GB | 2.61 s, 1.56, 1.52, 15.5 GB |
+
+Racing, `tests.bench_dit --scene racing --preset realtime --chunks 32` (same harness, `future` sink): chunk median 3158 /
+2645 / 2488 ms, steady chunk (window full) 3423 / 2887 / 2507 ms, MLX peak
+14.86 / 14.86 / 13.37 GB.
 
 fp16 does not lower the footprint (same MLX peak, 14.86 GB); the shorter window does (smaller KV caches). No fixed-caption session
 swapped. Racing with dynamic captions stays memory-bound, as under "Memory": `--preset apple --prompt-mode dynamic`
@@ -787,7 +803,7 @@ Every gate passes:
 
 Control rel L2 is at most 8.3e-3. `apple-fast` equals `apple` bitwise on every fixture chunk (the window only acts
 from position 11; the fixtures stop at chunk 2), which the test asserts. fp16 safety: 32 free-running chunks per
-scene and per runtime (eager, the parity pan, seed 0) keep every pred and K/V finite, and the residual stream's
+scene and per runtime (eager, the parity pan, seed 0; racing under `future`) keep every pred and K/V finite, and the residual stream's
 max |x| peaks at 790 (castle's sink pass at stream creation; 728 in a chunk) against a limit of 65504 / 16 = 4094.
 The fp16 linear outputs that enter a fused kernel (q / k projections, self- and cross-attention outputs, FFN
 hidden pre-activation and FFN output) peak at 208 (castle's FFN output; FFN hidden 57) against a limit of
@@ -811,26 +827,30 @@ python3 -m tests.compare_runtimes --compare out/native out/apple --json out/comp
 | castle | `apple-fast` | 0 to 20 | 0.57 / 0.66 | 16.3 / 15.3 dB |
 | castle | `apple-fast` | 21 to 47 | 0.62 / 0.80 | 16.4 / 13.5 dB |
 | racing | `apple` | 0 to 20 | 0.28 / 0.45 | 26.0 / 21.8 dB |
-| racing | `apple` | 21 to 47 | 0.47 / 0.57 | 21.1 / 19.1 dB |
-| racing | `apple-fast` | 0 to 20 | 0.28 / 0.45 | 26.0 / 21.0 dB |
-| racing | `apple-fast` | 21 to 47 | 0.53 / 0.65 | 19.4 / 17.1 dB |
+| racing | `apple` | 21 to 47 | 0.45 / 0.52 | 21.3 / 19.8 dB |
+| racing | `apple-fast` | 0 to 20 | 0.28 / 0.45 | 26.0 / 20.9 dB |
+| racing | `apple-fast` | 21 to 47 | 0.52 / 0.64 | 18.7 / 17.0 dB |
 | castle | `ring-fused` (above) | 21 to 47 | 0.47 / 0.62 | 19.4 / 16.1 dB |
-| racing | `ring-fused` (above) | 21 to 47 | 0.072 / 0.14 | 36.1 / 31.1 dB |
+| racing | `ring-fused` (above) | 21 to 47 | 0.081 / 0.15 | 35.2 / 30.6 dB |
 | castle | `native`, input frame 77 +1 level | 21 to 47 | 0.46 / 0.59 | 19.7 / 17.0 dB |
-| racing | `native`, input frame 81 +1 level | 21 to 47 | 0.070 / 0.20 | 36.4 / 29.0 dB |
+| racing | `native`, input frame 81 +1 level | 21 to 47 | 0.097 / 0.15 | 33.7 / 29.1 dB |
 
 Unlike `ring-fused`, which is bitwise `native` until the first ring eviction, fp16 differs from the first denoised
 chunk on (castle chunk 0: 0.020, 44.0 dB; chunk 1: 0.096, 35.9 dB; racing chunk 1: 0.022, 49.3 dB, its chunk 0 being
 the sink, bitwise), and each runtime then conditions on its own outputs, so the difference compounds over all 48
 chunks while the perturbation baseline starts at chunk 20 (castle) or 21 (racing). Castle reaches the size of a
 one-level input change on `native` (and of `ring-fused`) within 4 chunks and stays somewhat above it (chunks 21 to 47: pred rel L2 median 0.59 vs 0.46, PSNR median / min 17.1 / 16.0 dB vs 19.7 / 17.0 dB). Racing, which amplifies small
-differences much more slowly, ends far above both: over chunks 21 to 47 its pred rel L2 median is 0.47 (`apple`) and
-0.53 (`apple-fast`) against 0.070 for the perturbation. `apple-fast` is bitwise `apple` until its window acts (castle
-chunk 10, racing chunk 11, both stream position 11) and diverges from it afterwards, by as much as fp16 does from
-bf16 (chunks 21 to 47: castle 0.59 / 0.80, racing 0.49 / 0.60 pred rel L2 median / max). These are distances between
+differences more slowly, ends far above both: over chunks 21 to 47 its pred rel L2 median is 0.45 (`apple`) and
+0.52 (`apple-fast`) against 0.097 for the perturbation. `apple-fast` is bitwise `apple` until its window acts (castle
+chunk 10, racing chunk 11, both stream position 11) and diverges from it afterwards (racing: chunk 10 is 0.278 against
+`native` for both runtimes, chunk 11 is 0.301 for `apple` and 0.298 for `apple-fast`; chunks 21 to 47 pred rel L2 against
+`native` median / max, castle 0.62 / 0.80, racing 0.52 / 0.64 against `apple`'s 0.45 / 0.52). The racing
+`apple-fast` window acts under the `future` sink: from position 12 on it re-rotates the sink to position + 11 (see
+Known deviations). These are distances between
 trajectories, not quality scores: the same pan through the same model takes another path, and the comparison does
-not say which path looks better. The `native` runs were redone for this table (the perturbation runs were not: the
-`native` path is unchanged since they were measured).
+not say which path looks better. The castle `native` runs were redone for this table (the castle perturbation run was not: that
+path is unchanged since it was measured); every racing run of this table, the perturbation run included, was redone
+under the `future` sink for the sync to upstream `51913b2`.
 
 ## Numerics
 
@@ -860,12 +880,25 @@ torch kernel-variant floor, and a strict end-to-end check on chunk 0 (racing: ch
 | --- | --- | --- |
 | ancient-egypt | fixed sink | chunk 0 pred rel L2 1.71e-2, decoded 44.9 dB |
 | castle | fixed sink | chunk 0 pred 1.41e-2, 43.7 dB; blocks at most 0.56x gate. Chunk 1 (reported) 0.455 vs torch-vs-torch 0.478 |
-| racing | first_frame sink, absolute sink RoPE | chunk 0 = sink latent, bitwise, 56.4 dB; chunk 1 pred 2.47e-2 (gate 4.6e-2 = 1.5x torch floor 3.07e-2), 45.8 dB; blocks at most 0.56x gate |
+| racing | first_frame sink, `future` sink RoPE (default; `--sink-rope-mode absolute` is the old policy) | chunk 0 = sink latent, bitwise, 56.4 dB; chunk 1 pred 2.47e-2 (gate 4.6e-2 = 1.5x torch floor 3.07e-2), 45.8 dB; blocks at most 0.56x gate |
 
 - Castle amplifies bf16 rounding faster than ancient-egypt: at chunk 1 MLX stays within torch's own spread.
 - Racing's chunk 0 is the sink latent itself (no denoising). Its chunk 1 pred is gated at 1.5x the torch floor
   because torch's own spread exceeds 2e-2 there. Chunk 2 (reported) is 4.5e-2, 39.6 dB. The `--long` chunk 22,
-  past the 21-latent window (eviction with absolute RoPE), passes its per-call gates.
+  past the 21-latent window (eviction, sink keys rotated to position + 11), passes its per-call gates (table under
+  "Apple fast path").
+- Racing's sink policy follows upstream `51913b2`: `future` by default, where the sink's keys are rotated to
+  position + 11 (`FUTURE_SINK_OFFSET`) on every call once the stream position passes the 21-latent window, as
+  upstream's `matrix_game/inference/sink_policy.py` (mirrored in `inference/sink_policy.py`); before that the sink
+  stays at position 0, so the pre-window racing fixtures, regenerated at `51913b2`, are bitwise equal to those taken at
+  `5446525` (chunks before position 22 of all 7 racing fixture directories, `long_chunk_0` to `long_chunk_21` of
+  `racing_quality` included). It runs on `native`, `ring-fused`, `apple` and `apple-fast`, compiled graph included:
+  on real racing weights the compiled graph equals the eager one bit for bit under `future` on `ring-fused` and
+  `apple`. Upstream reports that in 4001- and 6001-frame racing rollouts `future` kept buildings intact where
+  `absolute` melted them. The port was not tested at that length. Side by side on the 720-frame recorded take
+  (`take-001`, realtime, `ring-fused`, one render per policy), both policies degrade by frame 700 with colour
+  artefacts on the buildings, and `future` keeps the outlines of the buildings somewhat better: a visual impression,
+  not a metric, so the upstream result is neither reproduced nor refuted here.
 
 ### Realtime preset
 
@@ -983,6 +1016,10 @@ so the gap is the DiT's alone, which is preset-independent and gated per call an
   non-array state, the two facts it relies on (it carries only the MemBlock arrays and emits every frame).
   `CastleStream` primes it at stream creation, as upstream. Measured: −15 ms per chunk (encode 46 -> 39 ms,
   decode 79 -> 71 ms, castle realtime on M2 Pro).
+- Racing's default `sink_rope_mode` is `future`, as upstream `51913b2` (shooters `fixed`); `--sink-rope-mode` overrides it
+  on every scene and an unknown mode, or a runtime that cannot run one, raises. The sink image is mandatory
+  (`--no-sink-image` and the `castle_nosink_realtime` / `racing_nosink_realtime` fixture variants are gone). The CUDA-only
+  `rtx5080*` and `rtx5070ti*` presets and runtimes are accepted by argparse and rejected as CUDA-only, as `rtx5090`.
 - `--preset apple` / `apple-fast` and `--dit-runtime apple` / `apple-fast` are port-only (upstream's hardware
   presets are the CUDA-only `rtx5090` / `rtx5090-sage`); they resolve as upstream resolves `rtx5090` (realtime base,
   `--dit-runtime` defaulting to the preset's name). See "Apple presets" for the measurements behind each item below.
@@ -991,13 +1028,18 @@ so the gap is the DiT's alone, which is preset-independent and gated per call an
   range up to 65504 instead of bf16's float32 range. The bf16 pack is converted at load, one tensor at a time. The
   realtime gated chunks pass a priori gates (pred rel L2 ≤ max(6e-2, 2 x the realtime gate), PSNR ≥ 30 dB); free
   running, the stream departs from `native` from the first denoised chunk (castle chunk 0: pred rel L2 0.020; racing
-  chunk 1: 0.022) and compounds (chunks 21 to 47: castle 0.59, racing 0.47 median). The residual stream's max |x|
+  chunk 1: 0.022) and compounds (chunks 21 to 47: castle 0.59, racing 0.45 median). The residual stream's max |x|
   measured 790, against 65504 / 16.
 - `apple-fast` attends over **11 latents** instead of upstream's 21: the sink, the current latent and the 9 latents
   before it (the 21 window: 19; each realtime latent is 4 video frames), and the KV caches are sized for 11. So from
   stream position 11 on it sees less history than `apple`. It is bitwise `apple` until then and diverges from it
-  afterwards (chunks 21 to 47 pred rel L2 median: castle 0.59, racing 0.49). The window is a
-  fixed property of the runtime; there is no window flag (upstream has none).
+  afterwards (chunks 21 to 47 pred rel L2 against `native`, median: castle 0.62, racing 0.52). The window is a
+  fixed property of the runtime; there is no window flag (upstream has none). On racing it also changes where the
+  `future` sink acts: `apple-fast` applies `FUTURE_SINK_OFFSET = 11` once its own 11-latent window is full (stream
+  position above 11, `rotated_sink_position(mode, position, window)` handed the runtime's window), where upstream's
+  runtimes act above 21. Upstream has no 11-latent runtime, so this is not validated by upstream and there is no torch
+  gate for it; it is covered by a bitwise tiny-model test against a `native`-style reference at window 11, the fp16
+  safety test (32 free-running chunks under `future`, finite) and the free-running comparison above.
 - Casts at the bf16 / fp16 boundaries under the apple runtimes: T5 and TAEHV (and the Wan VAE) stay bf16; the DiT
   casts the bf16 prompt embeddings and control latent to fp16 where it consumes them, the stream casts the bf16 sink
   latent to fp16 (racing's reference-first chunk 0 is that cast, bitwise) and the fp16 pred to the VAE dtype before
@@ -1007,7 +1049,7 @@ so the gap is the DiT's alone, which is preset-independent and gated per call an
 
 ## Parity methodology
 
-The upstream PyTorch code in `../Matrix-Game-4/` is the oracle. Unit and module tests compare against it
+The upstream PyTorch code in `../Matrix-Game-4/` (reference commit `51913b2`) is the oracle. Unit and module tests compare against it
 directly (single module fp32 `max_abs < 1e-3`, block `< 5e-3`). Real-weight parity
 (`tests/parity/test_real_weights.py`) compares the MLX stream with torch fixtures on three levels:
 
@@ -1018,7 +1060,8 @@ directly (single module fp32 `max_abs < 1e-3`, block `< 5e-3`). Real-weight pari
   against itself. The rest of the cache (history, sink, rolled window), the end indices and `k_sink_raw`
   must match exactly (except the `k_sink_raw` rows that racing's chunk-0 clean pass writes: gated at 1.5x the floor
   on layers 0/29, only checked to have changed on the others). A `--long` chunk 22 runs past the 21-frame window (rolling eviction, and re-RoPE of the
-  fixed sink or eviction with absolute RoPE for racing).
+  sink: at `position - window` for the fixed sink, at `position + 11` for racing's `future` sink; `racing_realtime` has the same
+  `--long` reference).
 - **Per block.** For the first denoising call of chunk 0 (chunk 1 for racing, whose chunk 0 has none), each of the 30 blocks gets torch's exact input, `e0`,
   context and sink KV; its output must be within 1.5x the largest torch-variant rel L2 on that block. This
   catches a systematic divergence that per-call noise would hide.
@@ -1043,7 +1086,7 @@ MATRIX_GAME_4_MLX_WEIGHTS_DIR=... python -m tests.parity.gen_fixtures --scene ca
 | `--scene {ancient-egypt,castle,racing}` | Scene to generate (default ancient-egypt) |
 | `--device {auto,mps,cpu}` | Torch device; `auto` tries MPS first. The DiT falls back to CPU (MPS has no float64), the VAE stays on MPS |
 | `--chunks N` | Number of chunks (default 3) |
-| `--long` | Also run 25 chunks (pred and decoded) and the chunk-22 per-call fixture |
+| `--long` | Also run 25 chunks (pred and decoded) and the chunk-22 per-call fixture, on both presets (the realtime per-call fixture is the long chunk only, `calls_long22.npz`; `--scene racing --preset realtime --long`) |
 | `--floor-only` | Regenerate only the torch floor chunks from the saved inputs |
 | `--calls-only` | Regenerate only the per-call fixtures |
 | `--call-floors-only` | Re-measure only the torch kernel-variant floors of the per-call fixtures |
@@ -1073,9 +1116,12 @@ Variant fixtures (the CLI's new options) are generated with `--variant NAME`, an
 | `--variant racing_switch_realtime` / `racing_switch_quality` | Dynamic prompt switch (prompt A to prompt B) (`test_real_weights_variants.py`) |
 | `--variant racing_take_realtime` / `racing_take_quality` | The first 9 frames of a real recorded racing take (scene sink image, fixed prompt); needs the take (`MG4_RACING_TAKE`) (`test_real_weights_variants.py`) |
 | `--variant racing_online_dynamic` / `castle_online_realtime` | The first 9 frames of a real `serve` session capture (`python -m tests.parity.capture_online --scene racing\|castle`, into `$MG4_RESOURCES/online-captures/<scene>-online/`); racing replays the engine captions with the upstream dynamic-prompt rule (`set_prompt` on every caption change) (`test_real_weights_variants.py`) |
-| `--variant castle_nosink_realtime` / `racing_nosink_realtime` | `--no-sink-image` |
 | `--variant castle_taehv_2step` | TAEHV with a custom 2-step schedule |
 | `--variant egypt_wan_custom_first` | Wan VAE with custom `--first-steps` |
+
+The `castle_nosink_realtime` and `racing_nosink_realtime` variants are retired, as upstream dropped `--no-sink-image`
+(their cached directories are not used any more). Racing fixtures are generated under the scene's default `future` sink
+(`meta.json` records `sink_rope_mode`).
 
 A realtime fixture set takes about 10 min per scene and is about 200 MB; `--taehv-only` (~20 s) and `--floor-only` are
 partial modes.
