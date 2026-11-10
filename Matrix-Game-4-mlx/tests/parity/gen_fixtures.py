@@ -17,8 +17,11 @@ control_i, pred_i, decoded_i, kv_k_layer0_i, kv_k_layer29_i, n_denoising_i), tae
 streaming-encoded control_i and teacher-forced decoded_i, decode_stream of the end-to-end preds), taehv_floor.npz
 (the same TAEHV sequence with the torch fp32 CPU and bf16 MPS variants), floor_chunk_{i}.npz (end-to-end floor:
 native bf16 CPU SDPA, as quality) and meta.json (taehv_floors, floor). The DiT is preset-independent and already
-gated per block / per call by the quality fixtures, so realtime has no per-call or per-block fixtures and no long
-run. `--taehv-only` regenerates taehv_calls.npz / taehv_floor.npz / meta taehv_floors from inputs.npz and chunks.npz
+gated per block / per call by the quality fixtures, so realtime has no per-call or per-block fixtures at chunks 0-2.
+`--long` (both presets) adds 25 chunks (long_inputs.npz, long_chunk_{i}.npz, meta long_chunks) and calls_long22.npz,
+the torch state and both calls (denoise, clean pass) of chunk 22, past the 21-latent window where the sink
+re-rotation acts, with its kernel-variant floors in meta call_floors. Racing: `--scene racing --preset realtime --long`.
+`--taehv-only` regenerates taehv_calls.npz / taehv_floor.npz / meta taehv_floors from inputs.npz and chunks.npz
 (seconds); `--floor-only` the end-to-end floor. Commands (one scene at a time, ~10-15 min each, mostly the CPU DiT):
     python -m tests.parity.gen_fixtures --scene ancient-egypt --preset realtime
     python -m tests.parity.gen_fixtures --scene castle --preset realtime
@@ -51,6 +54,7 @@ import hashlib
 import json
 import subprocess
 import time
+import types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -68,6 +72,7 @@ UPSTREAM_COMMIT = "51913b2"
 LATENT_SHAPE = (1, 1, 48, 30, 54)
 STEPS = (1000, 500)
 PAN_STEP = 8
+LONG_CHUNKS = 25
 LONG_CALL_CHUNK = 22    # position 23 > 21-frame window: rolling eviction (and fixed-sink re-RoPE for kv_only/fixed) run
 KV_LAYERS = (0, 29)
 
@@ -618,13 +623,17 @@ class CallRecorder:
         return self.gen.parameters()
 
 
-def record_push(torch, spec, stream, index, pixels, frame_start, noise, renoise):
-    """One upstream push with every generator call recorded; returns (chunk, state before, control, calls)."""
+def record_push(torch, spec, stream, index, pixels, frame_start, noise, renoise, steps=STEPS):
+    """One upstream push with every generator call recorded; returns (chunk, state before, control, calls).
+    `renoise` may be None when `steps` (one denoising step: realtime) draw none."""
+    need = n_renoise(spec, index, steps)
+    if need and renoise is None:
+        raise ValueError(f"Chunk {index} draws {need} renoise tensor(s) with steps {steps}: no renoise given")
     state = kv_state(stream.kv)
     real, recorder = stream.gen, CallRecorder(stream.gen, stream.kv)
     stream.gen = recorder
     try:
-        with injected_renoise(torch, [torch.from_numpy(renoise)][:n_renoise(spec, index)]) as left:
+        with injected_renoise(torch, [torch.from_numpy(renoise)] if need else []) as left:
             chunk = stream.push(torch.from_numpy(pixels), frame_start=frame_start, initial_noise=torch.from_numpy(noise))
     finally:
         stream.gen = real
@@ -686,50 +695,131 @@ def call_floor(torch, spec: SceneSpec, gen, prompt, fixture) -> list:
     return out
 
 
+def write_long_inputs(spec: SceneSpec, out: Path, with_renoise: bool) -> dict:
+    """Write long_inputs.npz (LONG_CHUNKS chunks of pan pixels, initial noises and, for quality, renoise draws) and
+    return it. The draws are the same for both presets (initial noise i is draw 2i of seed 4321); a one-step preset
+    simply never draws a renoise."""
+    long_pixels = pan_frames(spec, 1 + 4 * (LONG_CHUNKS - 1))
+    long_rng = np.random.default_rng(4321)
+    long_noise = [long_rng.standard_normal(LATENT_SHAPE, dtype=np.float32) for _ in range(2 * LONG_CHUNKS)]
+    long_inputs = {}
+    for i, (a, b) in enumerate(chunk_slices(LONG_CHUNKS)):
+        long_inputs[f"pixels_{i}"], long_inputs[f"initial_noise_{i}"] = long_pixels[a:b], long_noise[2 * i]
+        if with_renoise:
+            long_inputs[f"renoise_{i}"] = long_noise[2 * i + 1]
+    np.savez(out / "long_inputs.npz", **long_inputs)
+    return long_inputs
+
+
+def long_reference(torch, spec: SceneSpec, out: Path, meta: dict, stream, codec, sink, preset: PresetSpec) -> None:
+    """LONG_CHUNKS chunks (pred and decoded: long_chunk_{i}.npz) of a fresh stream of `preset` on the DiT of `stream`
+    (its `gen` is the run_chunks recorder); long_inputs.npz as write_long_inputs."""
+    quality = preset.vae_backend == "wan"
+    long_inputs = write_long_inputs(spec, out, with_renoise=quality)
+    stream = make_stream(spec, stream.gen.gen, codec, stream.prompt, sink, preset.name)
+
+    def save_long(i, chunk, preds, seconds):
+        np.savez_compressed(out / f"long_chunk_{i}.npz", pred=to_np(chunk.latent), decoded=to_np(chunk.pixels))
+        log(f"long chunk {i}: {seconds:.1f}s")
+
+    t0 = time.perf_counter()
+    run_chunks(torch, spec, stream, np.concatenate([long_inputs[f"pixels_{i}"] for i in range(LONG_CHUNKS)]),
+               [long_inputs[f"initial_noise_{i}"] for i in range(LONG_CHUNKS)],
+               [long_inputs[f"renoise_{i}"] for i in range(LONG_CHUNKS)] if quality else None, LONG_CHUNKS, save_long,
+               preset.steps)
+    meta["long_chunks"], meta["long_seconds"] = LONG_CHUNKS, time.perf_counter() - t0
+
+
+def advance_encoder(torch, stream, pixels: np.ndarray) -> None:
+    """Advance the stream's streaming encoder history on one chunk's pixels, as CastleStream.push does (Wan feature
+    cache or TAEHV encode_stream), without running the DiT."""
+    if stream.vae_backend == "wan":
+        stream_encode(torch, stream.vae, pixels, stream.encoder_features)
+        return
+    p = next(stream.vae.parameters())
+    stream.vae.encode_stream(torch.from_numpy(pixels).permute(1, 0, 2, 3).unsqueeze(0).to(p.device, p.dtype))
+
+
+def stub_decoder(torch, stream) -> None:
+    """Replace the stream's decoder by zeros of the right cadence (decoding is not under test and its state does
+    not feed the DiT)."""
+    if stream.vae_backend == "wan":
+        stream.decoder = types.SimpleNamespace(push=lambda z: torch.zeros(4, 3, 480, 864))
+        return
+
+    class NoDecode:
+        def __init__(self, vae):
+            self.vae = vae
+
+        def parameters(self):
+            return self.vae.parameters()
+
+        def encode_stream(self, x, *args, **kw):
+            return self.vae.encode_stream(x, *args, **kw)
+
+        def decode_stream(self, z, *args, **kw):
+            return types.SimpleNamespace(sample=torch.zeros(1, 3, 4, 480, 864))
+
+        def clear_cache(self):
+            self.vae.clear_cache()
+
+    stream.vae = NoDecode(stream.vae)
+
+
 def call_fixtures(out: Path) -> None:
-    """Per-call fixtures: torch state at each chunk boundary (chunks 0-2 and long chunk LONG_CALL_CHUNK), every
-    generator call's inputs and outputs, and the torch kernel-variant floor of each call (meta.json)."""
-    import types
+    """Per-call fixtures: torch state at each chunk boundary (quality: chunks 0-2; both presets: long chunk
+    LONG_CALL_CHUNK), every generator call's inputs and outputs, and the torch kernel-variant floor of each call
+    (meta.json). Realtime records the long chunk only: its DiT is gated per call at chunks 0-2 by the quality
+    fixtures, and only the long chunk runs past the window (sink re-rotation of the racing `future` mode)."""
     import torch
-    from huggingface_hub import hf_hub_download
-    from matrix_game.inference.wrappers import WanVAE22Wrapper
     torch.set_grad_enabled(False)
     meta = json.loads((out / "meta.json").read_text())
-    spec = spec_of(meta)
+    spec, preset = spec_of(meta), PRESET_SPECS[meta.get("preset", "quality")]
     inputs = np.load(out / "inputs.npz")
     t0 = time.perf_counter()
-    vae = WanVAE22Wrapper(vae_path=hf_hub_download(VAE_REPO, VAE_FILE, revision=VAE_REVISION)).eval()
-    vae = vae.requires_grad_(False).to(meta["device_vae"], torch.bfloat16)
+    if preset.vae_backend == "wan":
+        from huggingface_hub import hf_hub_download
+        from matrix_game.inference.wrappers import WanVAE22Wrapper
+        vae = WanVAE22Wrapper(vae_path=hf_hub_download(VAE_REPO, VAE_FILE, revision=VAE_REVISION)).eval()
+        codec = vae.requires_grad_(False).to(meta["device_vae"], torch.bfloat16)
+    else:
+        codec = DeviceBridge(load_taehv(torch, meta["device_taehv"]))
     sink = torch.from_numpy(inputs["sink_latent"])
     names = []
     with cpu_bf16_emulation(torch):
-        stream, _ = load_stream(torch, spec, meta["device_dit"], vae, inputs["prompt_embeds"], sink)
-        for i, (a, b) in enumerate(chunk_slices(meta["chunks"])):
-            chunk, state, control, calls = record_push(torch, spec, stream, i, inputs[f"pixels_{i}"], a,
-                                                       inputs[f"initial_noise_{i}"], inputs[f"renoise_{i}"])
-            if not np.array_equal(to_np(chunk.latent), np.load(out / f"chunk_{i}.npz")["pred"]):
-                raise RuntimeError(f"Recorded chunk {i} does not reproduce the fixture bitwise")
-            save_calls(out / f"calls_chunk{i}.npz", state, control, calls)
-            names.append(f"calls_chunk{i}")
-            log(f"per-call fixture chunk {i}: {len(calls)} calls")
+        stream, _ = load_stream(torch, spec, meta["device_dit"], codec, inputs["prompt_embeds"], sink, preset.name)
+        if preset.vae_backend == "wan":
+            for i, (a, b) in enumerate(chunk_slices(meta["chunks"])):
+                chunk, state, control, calls = record_push(torch, spec, stream, i, inputs[f"pixels_{i}"], a,
+                                                           inputs[f"initial_noise_{i}"], inputs[f"renoise_{i}"])
+                if not np.array_equal(to_np(chunk.latent), np.load(out / f"chunk_{i}.npz")["pred"]):
+                    raise RuntimeError(f"Recorded chunk {i} does not reproduce the fixture bitwise")
+                save_calls(out / f"calls_chunk{i}.npz", state, control, calls)
+                names.append(f"calls_chunk{i}")
+                log(f"per-call fixture chunk {i}: {len(calls)} calls")
+        elif not (out / "long_inputs.npz").exists():
+            raise FileNotFoundError(f"{out / 'long_inputs.npz'}: the realtime per-call fixture is the long chunk "
+                                    "only; generate the set with --long")
         if (out / "long_inputs.npz").exists():
             # For first_frame scenes chunk 0 is the clean pass on the stored sink pred at current_start=0.
             # The KV state at a chunk boundary only depends on the sink priming and each chunk's clean pass (the
             # denoising writes land in the slot that pass overwrites), so replaying the stored long preds through
-            # the clean pass rebuilds it; the encoder cache advances on the same pixels.
+            # the clean pass rebuilds it; the encoder history advances on the same pixels (Wan feature cache or
+            # TAEHV streaming encoder, as the preset's stream does).
             long_inputs = np.load(out / "long_inputs.npz")
-            stream = make_stream(spec, stream.gen, vae, stream.prompt, sink)
+            stream = make_stream(spec, stream.gen, codec, stream.prompt, sink, preset.name)
             for i, (a, b) in enumerate(chunk_slices(LONG_CALL_CHUNK)):
-                stream_encode(torch, vae, long_inputs[f"pixels_{i}"], stream.encoder_features)
+                advance_encoder(torch, stream, long_inputs[f"pixels_{i}"])
                 pred = torch.from_numpy(np.load(out / f"long_chunk_{i}.npz")["pred"]).to(stream.dtype)
                 stream.gen(noisy_image_or_video=pred, conditional_dict={"prompt_embeds": stream.prompt},
                            timestep=torch.zeros(1, 1), drop_control=True, kv_cache=stream.kv, crossattn_cache=stream.xc,
                            current_start=(i + stream.sink_offset) * stream.fsl, sink_rope_mode=stream.sink_rope_mode)
                 stream.index, stream.frame = i + 1, b
-            stream.decoder = types.SimpleNamespace(push=lambda z: torch.zeros(4, 3, 480, 864))   # not under test
+            stub_decoder(torch, stream)                                       # not under test
             i = LONG_CALL_CHUNK
+            renoise = long_inputs[f"renoise_{i}"] if f"renoise_{i}" in long_inputs.files else None
             chunk, state, control, calls = record_push(torch, spec, stream, i, long_inputs[f"pixels_{i}"], stream.frame,
-                                                       long_inputs[f"initial_noise_{i}"], long_inputs[f"renoise_{i}"])
+                                                       long_inputs[f"initial_noise_{i}"], renoise, preset.steps)
             if not np.array_equal(to_np(chunk.latent), np.load(out / f"long_chunk_{i}.npz")["pred"]):
                 raise RuntimeError(f"Rebuilt long state does not reproduce long chunk {i} bitwise")
             save_calls(out / f"calls_long{i}.npz", state, control, calls)
@@ -874,24 +964,7 @@ def _torch_run(args, spec, out, meta, prompt, pixels, noises, renoises):
     meta["run_seconds"] = time.perf_counter() - t0
 
     if args.long:
-        n_long = 25
-        long_pixels = pan_frames(spec, 1 + 4 * (n_long - 1))
-        long_rng = np.random.default_rng(4321)
-        long_noise = [long_rng.standard_normal(LATENT_SHAPE, dtype=np.float32) for _ in range(2 * n_long)]
-        long_inputs = {}
-        for i, (a, b) in enumerate(chunk_slices(n_long)):
-            long_inputs[f"pixels_{i}"] = long_pixels[a:b]
-            long_inputs[f"initial_noise_{i}"], long_inputs[f"renoise_{i}"] = long_noise[2 * i], long_noise[2 * i + 1]
-        np.savez(out / "long_inputs.npz", **long_inputs)
-        stream = make_stream(spec, stream.gen.gen, vae, stream.prompt, sink)
-
-        def save_long(i, chunk, preds, seconds):
-            np.savez_compressed(out / f"long_chunk_{i}.npz", pred=to_np(chunk.latent), decoded=to_np(chunk.pixels))
-            log(f"long chunk {i}: {seconds:.1f}s")
-
-        t0 = time.perf_counter()
-        run_chunks(torch, spec, stream, long_pixels, long_noise[0::2], long_noise[1::2], n_long, save_long)
-        meta["long_chunks"], meta["long_seconds"] = n_long, time.perf_counter() - t0
+        long_reference(torch, spec, out, meta, stream, vae, sink, PRESET_SPECS["quality"])
 
     return sink
 
@@ -1090,6 +1163,8 @@ def realtime_reference(args, spec: SceneSpec, out: Path, meta: dict, prompt, pix
         meta["forward_seconds"] = run_chunks(torch, spec, stream, pixels, noises, None, args.chunks, save_chunk,
                                              preset.steps)
         meta["run_seconds"] = time.perf_counter() - t0
+        if args.long:
+            long_reference(torch, spec, out, meta, stream, DeviceBridge(taehv), sink, preset)
     np.savez_compressed(out / "chunks.npz", **record)
 
 
@@ -1114,6 +1189,9 @@ def realtime_main(args, spec: SceneSpec, out: Path) -> None:
     gc.collect()                                 # one torch DiT alive at a time
     taehv_fixtures(out)
     floor_reference(out)
+    if args.long:
+        gc.collect()
+        call_fixtures(out)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1553,7 +1631,7 @@ def variant_main(args, v: VariantSpec) -> None:
     variant_floor(out)
 
 
-QUALITY_ONLY = ("long", "calls_only", "call_floors_only", "blocks_only")
+QUALITY_ONLY = ("calls_only", "call_floors_only", "blocks_only")
 
 
 def parse_args(argv=None):
@@ -1563,7 +1641,8 @@ def parse_args(argv=None):
                         help="quality: Wan VAE, steps (1000, 500); realtime: TAEHV taew2_2, steps (1000,)")
     parser.add_argument("--device", choices=("auto", "mps", "cpu"), default="auto")
     parser.add_argument("--chunks", type=int, default=3)
-    parser.add_argument("--long", action="store_true", help="Also run 25 chunks (pred and decoded only; quality)")
+    parser.add_argument("--long", action="store_true", help="Also run 25 chunks (pred and decoded only) and record the per-call fixture of chunk 22 "
+                        "(calls_long22, past the 21-latent window); both presets")
     parser.add_argument("--floor-only", action="store_true",
                         help="Only (re)generate floor_chunk_*.npz from the existing inputs.npz and meta.json")
     parser.add_argument("--calls-only", action="store_true",
@@ -1586,7 +1665,7 @@ def parse_args(argv=None):
     parser.add_argument("--print-variant-commands", action="store_true",
                         help="Print the captions command, then every variant's command (run order), then exit")
     args = parser.parse_args(argv)
-    others = [f"--{name.replace('_', '-')}" for name in (*QUALITY_ONLY, "floor_only", "taehv_only") if getattr(args, name)]
+    others = [f"--{name.replace('_', '-')}" for name in (*QUALITY_ONLY, "long", "floor_only", "taehv_only") if getattr(args, name)]
     if args.variant_floor_only and not args.variant:
         parser.error("--variant-floor-only requires --variant")
     if args.captions_only and args.variant:

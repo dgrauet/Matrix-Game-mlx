@@ -285,8 +285,16 @@ def test_block_parity(scene, comps, block_case, i):
 @pytest.mark.parametrize("scene,name,j", _call_cases())
 def test_call_parity(scene, comps, name, j):
     path = _dir(scene) / f"{name}.npz"
+    check_call_parity(comps, path, j, _meta(scene)["call_floors"]["calls"][name][j], f"{scene} {name}",
+                      f"python -m tests.parity.gen_fixtures --scene {scene} --calls-only")
+
+
+def check_call_parity(comps, path, j, floors, label, regen):
+    """Call j of the per-call fixture `path` through the MLX generator on torch's injected state, gated by
+    call_tol(floors) (shared by the quality and the realtime long-call tests; `regen` is the command cited when a
+    sink-writing fixture lacks its ksr entries)."""
     fx = np.load(path)                       # listed in meta.json call_floors: a missing file is a broken fixture set
-    tol = call_tol(_meta(scene)["call_floors"]["calls"][name][j], t_zero=not fx[f"c{j}_t"].any())
+    tol = call_tol(floors, t_zero=not fx[f"c{j}_t"].any())
     stream = comps.stream(seed=0)
     _inject_state(stream.kv, fx, stream.gen)                                   # torch's state at the chunk boundary
     _, pred = stream.gen(noisy_image_or_video=_to_mx(fx[f"c{j}_x"]),
@@ -324,9 +332,9 @@ def test_call_parity(scene, comps, name, j):
     if rows:
         for layer in KV_LAYERS:
             assert f"c{j}_ksr{layer}" in fx.files and f"ksr{layer}" in tol, \
-                f"call writes into the sink but {path.name} has no ksr{layer}: rerun gen_fixtures --scene {scene} --calls-only"
+                f"call writes into the sink but {path.name} has no ksr{layer}: rerun {regen}"
             m[f"ksr{layer}"] = rel_l2(stream.kv[layer]["k_sink_raw"], from_bits(fx[f"c{j}_ksr{layer}"]))
-    print(f"{scene} {name} call {j}: " + ", ".join(f"{k}={v:.3g}" for k, v in m.items()) + f" | tol {tol}")
+    print(f"{label} call {j}: " + ", ".join(f"{k}={v:.3g}" for k, v in m.items()) + f" | tol {tol}")
     assert m["pred"] <= tol["pred"], (m, tol)
     for layer in KV_LAYERS:
         assert max(m[f"k{layer}"], m[f"v{layer}"]) <= tol[f"l{layer}"], (m, tol)

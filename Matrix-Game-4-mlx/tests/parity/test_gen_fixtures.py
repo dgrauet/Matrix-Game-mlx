@@ -127,6 +127,55 @@ def test_preset_out_dir():
         parse_args(["--preset", "fast"])
 
 
+def test_realtime_long_is_accepted_and_scoped():
+    """--long is a realtime option too (25 chunks, calls_long22 at LONG_CALL_CHUNK); the other quality-only flags
+    stay rejected for realtime."""
+    from tests.conftest import fixtures_dir
+    from tests.parity.gen_fixtures import LONG_CALL_CHUNK, parse_args, scene_out_dir
+    args = parse_args(["--scene", "racing", "--preset", "realtime", "--long"])
+    assert (args.preset, args.long) == ("realtime", True)
+    assert scene_out_dir(args) == fixtures_dir() / "racing_realtime"
+    assert LONG_CALL_CHUNK == 22
+    assert parse_args(["--long"]).long                                         # quality unchanged
+    for flag in ("--calls-only", "--call-floors-only", "--blocks-only"):
+        with pytest.raises(SystemExit):
+            parse_args(["--preset", "realtime", flag])
+
+
+def test_long_inputs_share_the_quality_draws(tmp_path, monkeypatch):
+    """Realtime long inputs are the quality ones without the renoise draws (same initial noises, same pixels)."""
+    from tests.parity import gen_fixtures as gf
+    monkeypatch.setattr(gf, "pan_frames", lambda spec, n: np.zeros((n, 1, 1, 1), np.float32))
+    spec = gf.SCENE_SPECS["racing"]
+    q, r = tmp_path / "q", tmp_path / "r"
+    q.mkdir(), r.mkdir()
+    gf.write_long_inputs(spec, q, with_renoise=True)
+    gf.write_long_inputs(spec, r, with_renoise=False)
+    fq, fr = np.load(q / "long_inputs.npz"), np.load(r / "long_inputs.npz")
+    assert gf.LONG_CHUNKS == 25
+    assert not any(k.startswith("renoise_") for k in fr.files) and all(f"renoise_{i}" in fq.files for i in range(25))
+    for i in range(25):
+        for key in (f"pixels_{i}", f"initial_noise_{i}"):
+            np.testing.assert_array_equal(fq[key], fr[key])
+
+
+def test_record_push_without_renoise_draws():
+    """A one-step preset records a push without renoise draws; a missing draw the steps need raises."""
+    from tests.parity.gen_fixtures import SCENE_SPECS, record_push
+    spec = SCENE_SPECS["racing"]
+
+    class Stream:
+        kv, gen = [], None
+
+        def push(self, pixels, **kw):
+            raise StopIteration
+
+    with pytest.raises(StopIteration):                                         # got past the renoise preparation
+        record_push(torch, spec, Stream(), 1, np.zeros(1, np.float32), 0, np.zeros(1, np.float32), None, (1000,))
+    with pytest.raises(ValueError, match="renoise"):
+        record_push(torch, spec, Stream(), 1, np.zeros(1, np.float32), 0, np.zeros(1, np.float32), None)
+
+
 def test_realtime_preset_spec():
     """Realtime: one denoising step at t=1000 (first chunk too), TAEHV codec, never a renoise draw."""
     from tests.parity.gen_fixtures import PRESET_SPECS, SCENE_SPECS, STEPS, n_denoising_calls, n_renoise
